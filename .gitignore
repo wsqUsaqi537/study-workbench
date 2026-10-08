@@ -1,0 +1,33 @@
+node_modules/
+release/
+*.log
+.DS_Store
+*.exe
+*.zip
+*.app/
+
+# 本机开发指导与工作记录
+DEVELOPMENT.local.md
+CLAUDE.md
+AGENTS.md
+CONTINUATION.md
+*.local.md
+.codex/
+.agents/
+
+# 私人配置与用户数据
+.env
+.env.*
+.npmrc
+*.pem
+*.key
+settings.json
+settings.json.tmp
+tasks.json
+tasks.json.tmp
+profile.json
+profile.json.tmp
+
+# 本地预览与构建中间文件
+界面预览*.png
+*.blockmap

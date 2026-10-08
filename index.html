@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f2eb">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'">
+  <title>学习工作台</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#overview" data-nav="overview" aria-label="学习工作台首页">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>学习工作台</strong><small>STUDY, WITH INTENTION</small></span>
+      </a>
+
+      <div class="side-label">工作区</div>
+      <nav class="primary-nav" aria-label="工作区">
+        <button class="nav-item is-active" type="button" data-nav="overview"><span class="nav-icon icon-home" aria-hidden="true">⌂</span><span>学习概览</span></button>
+        <button class="nav-item" type="button" data-nav="today"><span class="nav-icon icon-today" aria-hidden="true">◷</span><span>今日安排</span><span id="todayBadge" class="nav-count">0</span></button>
+        <button class="nav-item" type="button" data-nav="plans"><span class="nav-icon icon-plan" aria-hidden="true">▤</span><span>全部计划</span></button>
+        <button class="nav-item" type="button" data-nav="materials"><span class="nav-icon icon-book" aria-hidden="true">▧</span><span>材料库</span></button>
+      </nav>
+
+      <div class="task-heading">
+        <div class="side-label">我的计划 <span id="taskCount">0</span></div>
+        <button class="icon-button side-add" type="button" data-action="new-task" aria-label="新建学习计划" title="新建计划">＋</button>
+      </div>
+      <div id="sidebarTasks" class="sidebar-tasks" aria-label="学习计划列表"></div>
+
+      <div class="sidebar-bottom">
+        <div class="sidebar-note">
+          <span class="note-orbit" aria-hidden="true">✳</span>
+          <p>把大目标，<br>拆成今天的一小步。</p>
+        </div>
+        <button class="nav-item settings-link" type="button" data-action="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span>API 设置</span><span id="apiDot" class="api-dot" aria-label="API 未配置"></span></button>
+        <div class="sidebar-foot"><span class="status-leaf" aria-hidden="true">●</span> 本地优先 · 数据保存在此设备</div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>学习工作台</span><span class="crumb-slash">/</span><strong id="crumbCurrent">学习概览</strong></div>
+        <div class="topbar-right">
+          <div class="today-date"><span class="date-dot" aria-hidden="true"></span><span id="headerDate"></span></div>
+          <div id="headerStatus" class="header-status"><span class="status-pulse"></span><span>正在准备工作台</span></div>
+          <button id="profileButton" class="top-avatar" type="button" data-action="profile" aria-label="打开我的设置" title="我的">学</button>
+        </div>
+      </header>
+      <div id="appView" class="view-host" tabindex="-1"></div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <dialog id="createDialog" class="app-dialog create-dialog" aria-labelledby="createTitle">
+    <form id="createForm" novalidate>
+      <div class="dialog-topline"><span class="eyebrow">从目标开始</span><button class="dialog-close" type="button" data-close="createDialog" aria-label="关闭">×</button></div>
+      <h2 id="createTitle">新建学习计划</h2>
+      <p class="dialog-intro">告诉工作台你想学什么，我们会把它拆成每天可完成的练习。</p>
+      <div id="createError" class="form-message error-message" role="alert" hidden></div>
+      <div class="field-grid">
+        <label class="field field-wide"><span>学习主题 <i>*</i></span><input name="title" type="text" maxlength="120" placeholder="例如：用 Python 完成数据分析入门" required autocomplete="off"></label>
+        <label class="field field-wide"><span>你的目标 <i>*</i></span><textarea name="goal" rows="3" maxlength="2000" placeholder="完成这段学习后，你希望能做到什么？" required></textarea></label>
+        <label class="field"><span>当前基础</span><select name="level"><option value="beginner">刚刚开始</option><option value="intermediate">有一些基础</option><option value="advanced">希望深入掌握</option></select></label>
+        <label class="field"><span>学习方式</span><select name="learningMode"><option value="exam">ExamPass · 考试</option><option value="balanced" selected>ExamPass · 平衡</option><option value="deep">ExamPass · 深度学习</option></select></label>
+        <label class="field"><span>开始日期</span><input name="startDate" type="date" required></label>
+        <label class="field"><span>学习周期</span><span class="input-suffix"><input name="days" type="number" min="2" max="180" value="14" required><em>天</em></span></label>
+        <label class="field"><span>每天投入</span><span class="input-suffix"><input name="minutesPerDay" type="number" min="15" max="480" value="60" required><em>分钟</em></span></label>
+      </div>
+      <section class="goal-discussion" aria-labelledby="discussionTitle">
+        <div class="discussion-heading"><div><span class="section-kicker">可选 · ExamPass 需求澄清</span><h3 id="discussionTitle">先讨论学习目标</h3></div><span class="discussion-mark" aria-hidden="true">↗</span></div>
+        <p class="discussion-intro">让模型围绕你的目标补齐范围、先修知识和预期成果。也可以跳过讨论，直接生成计划。</p>
+        <div id="clarifyMessages" class="clarify-messages" aria-live="polite" aria-label="学习目标讨论记录"></div>
+        <div id="confirmedBrief" class="confirmed-brief" hidden></div>
+        <div id="clarifyError" class="form-message" role="status" aria-live="polite" hidden></div>
+        <label class="field discussion-input"><span>补充说明或回复</span><textarea id="clarifyInput" rows="2" maxlength="4000" placeholder="例如：我会参加期末考试，希望多安排真题练习。"></textarea></label>
+        <div class="discussion-actions"><span class="discussion-hint">讨论内容仅用于本次计划。</span><button id="clarifySubmit" class="button button-small button-outline" type="button">开始讨论目标</button><button id="confirmBrief" class="button button-small button-primary" type="button" hidden>确认学习范围</button></div>
+      </section>
+      <section class="attachment-box" aria-labelledby="attachmentTitle">
+        <div class="attachment-heading"><div><span class="section-kicker">可选</span><h3 id="attachmentTitle">学习材料</h3></div><button class="button button-small button-outline" type="button" data-action="import-create">＋ 添加材料</button></div>
+        <p>读取 PDF、DOCX、PPTX 中的文字。旧版 DOC/PPT 请先转换；扫描件暂不识别。</p>
+        <div id="createMaterials" class="attachment-list"></div>
+      </section>
+      <label id="createConsentWrap" class="consent-row" hidden><input id="createConsent" type="checkbox"><span><strong>我同意发送本次添加的材料文字</strong><small>生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。</small></span></label>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="createDialog">取消</button><button id="createSubmit" class="button button-primary" type="submit"><span class="button-label">生成学习计划</span><span class="button-spinner" aria-hidden="true"></span></button></div>
+    </form>
+  </dialog>
+
+  <dialog id="profileDialog" class="app-dialog profile-dialog" aria-labelledby="profileTitle">
+    <form id="profileForm" novalidate>
+      <div class="dialog-topline"><span class="eyebrow">让工作台更像你</span><button class="dialog-close" type="button" data-close="profileDialog" aria-label="关闭">×</button></div>
+      <h2 id="profileTitle">我的</h2>
+      <p class="dialog-intro">设置头像和昵称，在这里收到属于你的问候。</p>
+      <div id="profileError" class="form-message error-message" role="alert" hidden></div>
+      <div class="profile-avatar-row">
+        <span id="profileAvatarPreview" class="profile-avatar-preview" aria-label="头像预览">学</span>
+        <div><button id="chooseProfileAvatar" class="button button-small button-outline" type="button">选择头像</button><button id="removeProfileAvatar" class="button button-small button-quiet" type="button" hidden>移除头像</button><p class="field-hint">PNG、JPG 或 WebP，最大 5 MB；居中裁成圆形展示。</p></div>
+        <input id="profileAvatarFile" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+      </div>
+      <label class="field"><span>昵称</span><input id="profileNickname" name="nickname" type="text" maxlength="30" placeholder="你希望工作台如何称呼你？" autocomplete="nickname"><small class="field-hint">最多 30 个字符，留空则不显示称呼。</small></label>
+      <p class="profile-local-note">头像和昵称仅保存在此设备，不会发送给模型服务。</p>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="profileDialog">取消</button><button id="saveProfile" class="button button-primary" type="submit">保存</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="settingsDialog" class="app-dialog settings-dialog" aria-labelledby="settingsTitle">
+    <form id="settingsForm" novalidate>
+      <div class="dialog-topline"><span class="eyebrow">连接模型服务</span><button class="dialog-close" type="button" data-close="settingsDialog" aria-label="关闭">×</button></div>
+      <h2 id="settingsTitle">API 设置</h2>
+      <p class="dialog-intro">连接兼容 OpenAI Chat Completions 的服务后，才能创建计划、生成知识清单和 AI 测验。配置保存在本地。</p>
+      <div id="settingsMessage" class="form-message" role="status" aria-live="polite" hidden></div>
+      <label class="field"><span>API 地址 <i>*</i></span><input id="apiEndpoint" name="endpoint" type="url" placeholder="https://api.example.com/v1/chat/completions" maxlength="2000" autocomplete="url"></label>
+      <p class="field-hint">可填写完整接口地址或服务基础地址。远程地址需使用 HTTPS。</p>
+      <label class="field"><span>模型名称 <i>*</i></span><input id="apiModel" name="model" type="text" placeholder="填写服务支持的模型标识" maxlength="200" autocomplete="off"></label>
+      <label class="field"><span>API Key</span><input id="apiKey" name="key" type="password" placeholder="" maxlength="4000" autocomplete="new-password"><small id="keyState" class="key-state"></small></label>
+      <label id="clearKeyRow" class="check-row" hidden><input id="clearKey" type="checkbox"><span>清除已保存的 API Key</span></label>
+      <div class="settings-footnote"><span class="lock-mark" aria-hidden="true">◈</span><span>应用优先使用系统加密保存 Key；若系统加密不可用，会提示 Key 仅保留在本次运行。界面只读取是否已配置，不会读取已保存的 Key。</span></div>
+      <div class="dialog-actions settings-actions"><button id="testConnection" class="button button-outline" type="button">保存并测试连接</button><span class="action-spacer"></span><button class="button button-quiet" type="button" data-close="settingsDialog">取消</button><button id="saveSettings" class="button button-primary" type="submit">保存设置</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="editDayDialog" class="app-dialog edit-dialog" aria-labelledby="editDayTitle">
+    <form id="editDayForm" novalidate>
+      <div class="dialog-topline"><span class="eyebrow" id="editDayEyebrow">每日计划</span><button class="dialog-close" type="button" data-close="editDayDialog" aria-label="关闭">×</button></div>
+      <h2 id="editDayTitle">编辑这一天</h2>
+      <p class="dialog-intro">调整标题和任务内容，保存后会同步更新这份计划。</p>
+      <div id="editDayError" class="form-message error-message" role="alert" hidden></div>
+      <input id="editDayIndex" type="hidden">
+      <label class="field"><span>当天标题</span><input id="editDayName" type="text" maxlength="300" required></label>
+      <label class="field"><span>学习任务 <small>每行一项</small></span><textarea id="editDayTasks" rows="7" maxlength="20000" required></textarea></label>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="editDayDialog">取消</button><button class="button button-primary" type="submit">保存修改</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="materialDialog" class="app-dialog material-dialog" aria-labelledby="materialTitle">
+    <div class="dialog-topline"><span class="eyebrow">材料预览</span><button class="dialog-close" type="button" data-close="materialDialog" aria-label="关闭">×</button></div>
+    <h2 id="materialTitle">材料名称</h2>
+    <div class="material-meta" id="materialMeta"></div>
+    <pre id="materialText" class="material-text"></pre>
+    <div class="dialog-actions"><button class="button button-primary" type="button" data-close="materialDialog">完成</button></div>
+  </dialog>
+</body>
+</html>
