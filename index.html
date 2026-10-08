@@ -66,13 +66,13 @@
         <label class="field field-wide"><span>学习主题 <i>*</i></span><input name="title" type="text" maxlength="120" placeholder="例如：用 Python 完成数据分析入门" required autocomplete="off"></label>
         <label class="field field-wide"><span>你的目标 <i>*</i></span><textarea name="goal" rows="3" maxlength="2000" placeholder="完成这段学习后，你希望能做到什么？" required></textarea></label>
         <label class="field"><span>当前基础</span><select name="level"><option value="beginner">刚刚开始</option><option value="intermediate">有一些基础</option><option value="advanced">希望深入掌握</option></select></label>
-        <label class="field"><span>学习方式</span><select name="learningMode"><option value="exam">ExamPass · 考试</option><option value="balanced" selected>ExamPass · 平衡</option><option value="deep">ExamPass · 深度学习</option></select></label>
+        <label class="field"><span>学习方式</span><select name="learningMode"><option value="exam">备考</option><option value="balanced" selected>平衡</option><option value="deep">深度学习</option></select></label>
         <label class="field"><span>开始日期</span><input name="startDate" type="date" required></label>
         <label class="field"><span>学习周期</span><span class="input-suffix"><input name="days" type="number" min="2" max="180" value="14" required><em>天</em></span></label>
         <label class="field"><span>每天投入</span><span class="input-suffix"><input name="minutesPerDay" type="number" min="15" max="480" value="60" required><em>分钟</em></span></label>
       </div>
       <section class="goal-discussion" aria-labelledby="discussionTitle">
-        <div class="discussion-heading"><div><span class="section-kicker">可选 · ExamPass 需求澄清</span><h3 id="discussionTitle">先讨论学习目标</h3></div><span class="discussion-mark" aria-hidden="true">↗</span></div>
+        <div class="discussion-heading"><div><span class="section-kicker">可选 · 需求讨论</span><h3 id="discussionTitle">先讨论学习目标</h3></div><span class="discussion-mark" aria-hidden="true">↗</span></div>
         <p class="discussion-intro">让模型围绕你的目标补齐范围、先修知识和预期成果。也可以跳过讨论，直接生成计划。</p>
         <div id="clarifyMessages" class="clarify-messages" aria-live="polite" aria-label="学习目标讨论记录"></div>
         <div id="confirmedBrief" class="confirmed-brief" hidden></div>

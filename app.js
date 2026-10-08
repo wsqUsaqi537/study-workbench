@@ -284,8 +284,8 @@
     const modeLabel = task.plan?.mode === 'ai' ? 'AI 计划' : '历史计划';
     const warnings = Array.isArray(task.plan?.warnings) ? task.plan.warnings.filter(item => typeof item === 'string' && item.trim()) : [];
     const knowledge = Array.isArray(task.plan?.knowledge) && task.plan.knowledge.length
-      ? `<section class="plan-knowledge" aria-label="ExamPass 知识清单"><div class="knowledge-heading"><span class="panel-kicker">EXAMPASS / 知识清单</span><strong>${task.plan.knowledge.length} 个知识点</strong></div><div class="knowledge-list">${task.plan.knowledge.map(item => `<article class="knowledge-item"><div class="knowledge-item-heading"><strong>${escapeHTML(item.title || '未命名知识点')}</strong><span class="knowledge-priority ${item.priority === '重点' ? 'is-focus' : ''}">${escapeHTML(item.priority || '了解')}</span></div><p>${escapeHTML(item.explanation || '')}</p>${item.source ? `<small>来源：${escapeHTML(item.source)}</small>` : ''}</article>`).join('')}</div></section>`
-      : '<section class="plan-knowledge plan-knowledge-history"><span class="panel-kicker">EXAMPASS / 知识清单</span><p>这份旧计划没有单独保存 ExamPass 知识清单，原有学习日程仍可查看。</p></section>';
+      ? `<section class="plan-knowledge" aria-label="知识清单"><div class="knowledge-heading"><span class="panel-kicker">KNOWLEDGE / 知识清单</span><strong>${task.plan.knowledge.length} 个知识点</strong></div><div class="knowledge-list">${task.plan.knowledge.map(item => `<article class="knowledge-item"><div class="knowledge-item-heading"><strong>${escapeHTML(item.title || '未命名知识点')}</strong><span class="knowledge-priority ${item.priority === '重点' ? 'is-focus' : ''}">${escapeHTML(item.priority || '了解')}</span></div><p>${escapeHTML(item.explanation || '')}</p>${item.source ? `<small>来源：${escapeHTML(item.source)}</small>` : ''}</article>`).join('')}</div></section>`
+      : '<section class="plan-knowledge plan-knowledge-history"><span class="panel-kicker">KNOWLEDGE / 知识清单</span><p>这份旧计划没有单独保存知识清单，原有学习日程仍可查看。</p></section>';
     const body = expanded ? `${knowledge}<div class="plan-days">${days.map((day, index) => dayRow(task, day, index)).join('')}</div>` : '';
     const warningMarkup = warnings.length ? `<div class="plan-warnings" role="note"><strong>生成提示</strong><ul>${warnings.map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : '';
     const quizNeedsAI = task.quiz && task.quiz.mode !== 'ai' && !task.quiz.result;
@@ -401,7 +401,7 @@
     $$('[data-nav]').forEach(button => { button.disabled = locked; });
     $$('[data-action]').forEach(button => { button.disabled = locked && !['settings', 'profile'].includes(button.dataset.action); });
     if (locked) {
-      viewHost.innerHTML = `<section class="service-locked"><div class="service-lock-mark" aria-hidden="true">◈</div><span class="eyebrow">MODEL SERVICE REQUIRED</span><h1>先配置模型服务</h1><p>配置模型地址、名称和 API Key 后，才能创建学习计划、生成 ExamPass 知识清单和进行 AI 测验。</p><p class="service-lock-note">本地旧计划会在配置完成后重新显示，不会因为当前未配置而删除。</p><button class="button button-primary" type="button" data-action="settings">打开 API 设置</button></section>`;
+      viewHost.innerHTML = `<section class="service-locked"><div class="service-lock-mark" aria-hidden="true">◈</div><span class="eyebrow">MODEL SERVICE REQUIRED</span><h1>先配置模型服务</h1><p>配置模型地址、名称和 API Key 后，才能创建学习计划、生成知识清单和进行 AI 测验。</p><p class="service-lock-note">本地旧计划会在配置完成后重新显示，不会因为当前未配置而删除。</p><button class="button button-primary" type="button" data-action="settings">打开 API 设置</button></section>`;
       return;
     }
     if (currentView === 'overview') viewHost.innerHTML = renderOverview();
@@ -608,7 +608,7 @@
     if (!input.startDate || !dateObject(input.startDate)) return setMessage(errorElement, '请选择有效的开始日期。'), false;
     if (!Number.isInteger(input.days) || input.days < 2 || input.days > 180) return setMessage(errorElement, '学习周期需要在 2 到 180 天之间。'), false;
     if (!Number.isInteger(input.minutesPerDay) || input.minutesPerDay < 15 || input.minutesPerDay > 480) return setMessage(errorElement, '每天投入需要在 15 到 480 分钟之间。'), false;
-    if (!['exam', 'balanced', 'deep'].includes(input.learningMode)) return setMessage(errorElement, '请选择有效的 ExamPass 学习方式。'), false;
+    if (!['exam', 'balanced', 'deep'].includes(input.learningMode)) return setMessage(errorElement, '请选择有效的学习方式。'), false;
     return true;
   }
 
@@ -682,7 +682,7 @@
       const plan = await api.generatePlan(requestInput);
       if (sessionId !== createSessionId || epoch !== configEpoch || !apiEnabled() || snapshot !== createInputSnapshot() || createActivity?.id !== requestId) return;
       if (!plan || !Array.isArray(plan.days) || plan.days.length !== input.days) throw new Error('服务返回的计划天数与学习周期不一致，请重试。');
-      if (!Array.isArray(plan.knowledge) || plan.knowledge.length < 1 || plan.knowledge.length > 30) throw new Error('服务没有返回有效的 ExamPass 知识清单，请检查模型配置后重试。');
+      if (!Array.isArray(plan.knowledge) || plan.knowledge.length < 1 || plan.knowledge.length > 30) throw new Error('服务没有返回有效的知识清单，请检查模型配置后重试。');
       const task = { id: makeId(), ...input, ...(briefSnapshot ? { brief: briefSnapshot } : {}), plan, createdAt: new Date().toISOString() };
       if (hasMaterialText(task)) sessionConsent.add(task.id);
       const saved = await saveTask(task, 'plan-detail', epoch);

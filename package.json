@@ -1,6 +1,6 @@
 {
   "name": "study-workbench",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "将学习材料转为每日学习计划的本地桌面应用",
   "author": "Study Workbench",

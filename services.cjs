@@ -76,7 +76,7 @@ function validateInput(input) {
   requireString(input.title, '学习主题', 1, 300);
   requireString(input.goal, '学习目标', 1, 4000);
   if (input.learningMode !== undefined && !LEARNING_MODES.has(input.learningMode)) {
-    fail('学习模式必须为 exam、balanced 或 deep。');
+    fail('学习方式必须选择备考、平衡或深度学习。');
   }
   if (input.brief !== undefined) validateBrief(input.brief);
   if (!LEVELS.has(input.level)) fail('学习基础必须选择 beginner、intermediate 或 advanced。');
