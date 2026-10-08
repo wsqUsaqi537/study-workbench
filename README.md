@@ -6,8 +6,8 @@
 
 前往 [下载页面](https://github.com/wsqUsaqi537/study-workbench/releases/latest)，选择适合你电脑的安装包：
 
-- **Mac（M 系列芯片）**：下载 ZIP，解压后将“学习工作台”拖入“应用程序”。
-- **Windows（x64）**：下载 EXE，双击并按安装向导完成安装。
+- **Mac（M 系列芯片）**：[下载 ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v0.2.2/study-workbench-0.2.2-mac-arm64.zip)，解压后将“学习工作台”拖入“应用程序”。
+- **Windows（x64）**：[下载 EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v0.2.2/study-workbench-0.2.2-windows-x64.exe)，双击并按安装向导完成安装。
 
 当前版本为 0.2.2。安装包暂未签名或公证；Windows 版尚未实机验证。
 
