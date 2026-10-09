@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('studyApp', Object.freeze({
   },
   clarifyGoal: (payload) => ipcRenderer.invoke('learning:clarify', payload),
   generatePlan: (input) => ipcRenderer.invoke('plan:generate', input),
+  generateLesson: (payload) => ipcRenderer.invoke('tutoring:lesson', payload),
+  answerQuestion: (payload) => ipcRenderer.invoke('tutoring:question', payload),
   generateAssessment: (task, selector) => ipcRenderer.invoke('assessment:generate', { task, selector }),
   gradeAssessment: (payload) => ipcRenderer.invoke('assessment:grade', payload),
   proposeAdjustment: (payload) => ipcRenderer.invoke('plan:adjust', payload),

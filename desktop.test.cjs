@@ -138,6 +138,8 @@ function responseFor(purpose, payload) {
       ? { reply: '你希望覆盖变量、循环和函数，并完成记账小程序，对吗？', ready: false, brief: null }
       : { reply: '学习范围已经整理好，请确认。', ready: true, brief: expectedBrief };
   }
+  if (purpose === '讲解当前日学习内容') return { text: '概念：变量保存信息。\n例子：记录一笔账目。\n易错点：混淆数字与文本。\n练习：写出一笔记录。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+  if (purpose === '解释当前测验题和评分反馈') return { text: '把记录拆分后，先校验输入，再汇总数值；用一个简单例子逐步检查。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
   if (purpose === '生成学习计划') return makeModelPlan(payload);
   if (purpose === '生成每日小测') return { questions: makeAssessmentQuestions('daily') };
   if (purpose === '生成周期测验') return { questions: makeAssessmentQuestions('final') };
@@ -996,6 +998,56 @@ async function run() {
   await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.quiz?.result?.report?.readyForNext === null)`, '期末报告保存并不判断下一日准备程度');
   assert.equal(apiRecords.filter(record => record.purpose === '评分并生成学习报告').length, gradesBeforeDaily0 + 2);
 
+
+  currentStage = '按需讲解、缓存复用与两轮错题追问';
+  await clickAction(window, 'ask-question', newTask.id, { kind: 'final' });
+  await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open && !document.querySelector("#questionFollowUpForm").hidden', '打开错题追问，不自动调用API');
+  const beforeHelp = apiRecords.length;
+  await setValue(window, '#questionFollowUpInput', '为什么需要先检查输入？');
+  await click(window, '#sendQuestionFollowUp');
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.tutorChats?.['final:q9']?.messages?.length === 2)`, '首轮追问持久化');
+  await waitForJS(window, '!document.querySelector("#sendQuestionFollowUp").disabled', '追问按钮恢复');
+  await setValue(window, '#questionFollowUpInput', '可以换一个更简单的例子吗？');
+  await click(window, '#sendQuestionFollowUp');
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.tutorChats?.['final:q9']?.messages?.length === 4)`, '第二轮追问保留上下文');
+  assert.equal(apiRecords.length, beforeHelp + 2);
+  const followUpPayload = apiRecords.at(-1).payload;
+  assert.equal(followUpPayload.messages.length, 3);
+  assert.deepEqual(followUpPayload.question, {
+    id: 'q9',
+    type: 'short',
+    question: '请说明第 9 个知识点的用途。',
+    options: []
+  }, '追问请求只应包含当前错题');
+  assert.deepEqual(followUpPayload.materials, [], '错题追问不得重新发送原材料');
+  await click(window, '#tutoringDialog [data-close]');
+  await clickAction(window, 'open-plan', newTask.id);
+  await clickAction(window, 'open-lesson', newTask.id, { dayIndex: 1 });
+  await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open', '打开每日讲解');
+  const beforeLessons = apiRecords.length;
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#tutoringContent").innerText.includes("尚未生成")'), true);
+  await click(window, '#generateLesson');
+  await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.lessons?.['1']?.brief))`, '简要讲解保存');
+  assert.equal(apiRecords.at(-1).purpose, '讲解当前日学习内容');
+  assert.equal(apiRecords.at(-1).payload.depth, 'brief');
+  await click(window, '#tutoringDialog [data-close]');
+  await clickAction(window, 'open-lesson', newTask.id, { dayIndex: 1 });
+  await waitForJS(window, 'document.querySelector("#generateLesson").hidden', '再次查看直接使用缓存');
+  assert.equal(apiRecords.length, beforeLessons + 1);
+  await click(window, '#lessonControls [data-depth="detailed"]');
+  await click(window, '#generateLesson');
+  await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.lessons?.['1']?.detailed))`, '展开讲解单独缓存');
+  assert.equal(apiRecords.at(-1).purpose, '讲解当前日学习内容');
+  assert.equal(apiRecords.at(-1).payload.depth, 'detailed');
+  assert.equal(apiRecords.length, beforeLessons + 2);
+  await click(window, '#tutoringDialog [data-close]');
+  await clickAction(window, 'open-lesson', newTask.id, { dayIndex: 1 });
+  await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open', '重新打开已缓存的每日讲解');
+  await click(window, '#lessonControls [data-depth="detailed"]');
+  await waitForJS(window, 'document.querySelector("#generateLesson").hidden', '重新打开后直接使用展开讲解缓存');
+  assert.equal(apiRecords.length, beforeLessons + 2, '重新打开已缓存的展开讲解不应再次请求模型');
+  await click(window, '#tutoringDialog [data-close]');
+
   currentStage = '编辑第二天内容后将前一日报准备度标为过期';
   await clickAction(window, 'open-plan', newTask.id);
   await window.webContents.executeJavaScript('window.confirm = () => true; true');
@@ -1007,6 +1059,8 @@ async function run() {
   await waitForJS(window, 'document.querySelector("#editDayDialog") && !document.querySelector("#editDayDialog").open', '第二天修改保存');
   state = await readState(window);
   activeTask = state.tasks.find(candidate => candidate.id === newTask.id);
+  assert.equal(activeTask.lessons?.['1'], undefined, '改日程必须清除受影响的两种讲解');
+  assert.equal(activeTask.tutorChats?.['final:q9'], undefined, '期末失效同时清除对应追问');
   assert.equal(activeTask.dailyQuizzes['0'].readinessStale, true, '修改次日内容后应标记前一日报的准备度过期');
   assert.equal(activeTask.dailyQuizzes['0'].result.score, 100, '过期时应保留旧日报成绩');
   assert.deepEqual(activeTask.dailyQuizzes['0'].answers.q1, { text: 'A' }, '过期时应保留旧日报作答');
@@ -1132,7 +1186,7 @@ async function run() {
   const clearedSettings = JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8'));
   assert.equal(clearedSettings.encryptedKey, undefined);
   assert.equal(clearedSettings.key, undefined);
-  assert.deepEqual(apiRecords.map(record => record.purpose), [
+  assert.deepEqual(apiRecords.map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈'].includes(purpose)), [
     '连接测试',
     '生成周期测验',
     '按材料和评分标准评阅学习测验',

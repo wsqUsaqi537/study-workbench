@@ -5,6 +5,7 @@ const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
 const services = require('./services.cjs');
 const assessments = require('./assessment.cjs');
+const tutoring = require('./tutoring.cjs');
 
 let window;
 let state;
@@ -119,6 +120,7 @@ function validateTask(task) {
     if (typeof day.completed !== 'boolean') throw new Error('完成状态无效。');
   });
   assessments.validateAssessmentRecords(task);
+  tutoring.validateTutoringRecords(task);
   if (JSON.stringify(task).length > 2500000) throw new Error('单个任务数据过大，请减少材料。');
 }
 
@@ -185,6 +187,16 @@ function registerHandlers() {
     const config = activeCredentials();
     validateTask(payload?.task);
     return assessments.generateAssessment(payload.task, payload.selector, config);
+  });
+  handle('tutoring:lesson', (payload) => {
+    const config = activeCredentials();
+    validateTask(payload?.task);
+    return tutoring.generateLesson(payload.task, payload.dayIndex, payload.depth, config);
+  });
+  handle('tutoring:question', (payload) => {
+    const config = activeCredentials();
+    validateTask(payload?.task);
+    return tutoring.answerQuestion(payload.task, payload.selector, payload.questionId, payload.messages, config);
   });
   handle('assessment:grade', (payload) => {
     const config = activeCredentials();

@@ -586,3 +586,13 @@ h1, h2 { font-family: var(--serif); font-weight: 500; letter-spacing: .015em; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* 按需讲解与错题追问 */
+.tutoring-dialog { width: min(760px, calc(100vw - 36px)); }
+.tutoring-content { display: grid; gap: 14px; margin: 18px 0; }
+.tutor-text { color: #506356; font-size: 16px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tutor-message { padding: 14px 16px; border: 1px solid #dce5d9; border-radius: 8px; background: #f4f7f0; }
+.tutor-message.is-user { background: #fbf5e9; border-color: #e6dcc7; }
+.tutor-message > strong { display: block; margin-bottom: 7px; color: #54735a; font-size: 13px; }
+.tutor-question, .tutor-empty { color: #6b796d; font-size: 15px; line-height: 1.7; }
+#lessonControls .is-selected { background: #e8f0e3; border-color: #9caf97; }

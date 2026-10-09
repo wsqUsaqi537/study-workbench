@@ -32,6 +32,8 @@
   const assessmentBusyKeys = new Set();
   const taskSaveQueues = new Map();
   const sessionConsent = new Set();
+  let tutoringContext = null;
+  const tutoringRequests = new Set();
 
   const viewNames = {
     overview: '学习概览', today: '今日安排', plans: '全部计划', 'plan-detail': '计划详情',
@@ -184,7 +186,7 @@
   }
 
   function assessmentGenerationSnapshot(task, selector) {
-    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null });
+    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null, chats: tutorCacheSnapshot(task, selector.kind === 'daily' ? [selector.dayIndex] : [], selector.kind === 'final', false) });
   }
 
   function assessmentGradeSnapshot(task, selector) {
@@ -381,7 +383,7 @@
     const todayList = entries.length ? `<div class="plan-list">${entries.map(({ task, day, index }) => {
       const dailyQuiz = assessmentFor(task, { kind: 'daily', dayIndex: index });
       const dailyLabel = dailyQuiz?.result ? '查看日报' : dailyQuiz?.questions?.length ? '继续每日小测' : '每日小测';
-      return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(day.title)}</h3><p>${escapeHTML(task.title)} · ${Number(day.minutes) || 0} 分钟</p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}">编辑今日内容</button></div></div><div class="plan-days"><div class="plan-day-row is-today"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(task.title)}</strong><small>${escapeHTML((day.tasks || []).join(' · '))}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}" aria-pressed="${Boolean(day.completed)}">✓</button><button class="button button-small button-outline day-assessment-action" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="daily" data-day-index="${index}">${dailyLabel}</button></div></div></div></article>`;
+      return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(day.title)}</h3><p>${escapeHTML(task.title)} · ${Number(day.minutes) || 0} 分钟</p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}">编辑今日内容</button></div></div><div class="plan-days"><div class="plan-day-row is-today"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(task.title)}</strong><small>${escapeHTML((day.tasks || []).join(' · '))}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}" aria-pressed="${Boolean(day.completed)}">✓</button><button class="button button-small button-outline" type="button" data-action="open-lesson" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}">学习讲解</button><button class="button button-small button-outline day-assessment-action" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="daily" data-day-index="${index}">${dailyLabel}</button></div></div></div></article>`;
     }).join('')}</div>` : `<section class="panel"><div class="panel-heading"><div><span class="panel-kicker">TODAY / 留白</span><h2>今天没有安排好的学习任务</h2><p>已保存的计划还在这里，可以查看接下来的日程。</p></div></div><div class="focus-content"><div class="empty-inline"><span class="empty-inline-mark" aria-hidden="true">✳</span><div class="empty-inline-copy"><strong>空出来的时间也可以好好休息</strong><p>或者给下一个目标安排一个开始日期。</p></div><button class="button button-small button-outline" type="button" data-action="new-task">创建计划</button></div></div></section>`;
     return `${header}${todayList}${entries.length ? '<div class="page-head section-head-spaced"><div class="page-head-copy"><span class="eyebrow">NEXT STEPS</span><h2 class="section-page-title">接下来几天</h2><p>提前看看，不必一次完成所有事情。</p></div></div>' + renderUpcomingRows() : ''}`;
   }
@@ -398,7 +400,7 @@
     const dayTasks = Array.isArray(day.tasks) ? day.tasks : [];
     const tasksPreview = (editable ? dayTasks : dayTasks.slice(0, 3)).join(' · ');
     const quiz = assessmentFor(task, { kind: 'daily', dayIndex: index });
-    return `<div class="plan-day-row ${isToday ? 'is-today' : ''}"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(day.title)}</strong><small>${escapeHTML(tasksPreview)}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}：${escapeHTML(day.title)}" aria-pressed="${Boolean(day.completed)}">✓</button><button class="button button-small button-outline day-assessment-action" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="daily" data-day-index="${index}">${quiz?.result ? '查看日报' : quiz?.questions?.length ? '继续每日小测' : '每日小测'}</button>${editable ? `<button class="row-edit" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="编辑 ${escapeHTML(day.title)}" title="编辑这一天">✎</button>` : ''}</div></div>`;
+    return `<div class="plan-day-row ${isToday ? 'is-today' : ''}"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(day.title)}</strong><small>${escapeHTML(tasksPreview)}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}：${escapeHTML(day.title)}" aria-pressed="${Boolean(day.completed)}">✓</button><button class="button button-small button-outline" type="button" data-action="open-lesson" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}">学习讲解</button><button class="button button-small button-outline day-assessment-action" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="daily" data-day-index="${index}">${quiz?.result ? '查看日报' : quiz?.questions?.length ? '继续每日小测' : '每日小测'}</button>${editable ? `<button class="row-edit" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="编辑 ${escapeHTML(day.title)}" title="编辑这一天">✎</button>` : ''}</div></div>`;
   }
 
   function planCard(task, expanded = true) {
@@ -555,7 +557,8 @@
       }
       const reference = submitted ? `<details class="question-reference-details"><summary>查看参考答案与评分标准</summary><div class="question-reference">${questionType === 'choice' ? `<strong>正确选项</strong><p>${escapeHTML(question.answer || '')}</p>` : ''}${question.reference ? `<strong>参考要点</strong><p>${escapeHTML(question.reference)}</p>` : ''}${question.rubric ? `<strong>评分标准</strong><small>${escapeHTML(question.rubric)}</small>` : ''}</div></details>` : '';
       const item = submitted ? quiz.result.items?.find(resultItem => resultItem.id === question.id) : null;
-      return `<article class="quiz-question"><div class="question-head"><span class="question-index">${index + 1}</span><span>${isLegacy ? '历史题目' : label}</span></div><h3>${escapeHTML(question.question || '')}</h3>${input}${submitted && item ? `<p class="result-feedback">${escapeHTML(item.feedback || '')} · ${Number(item.score) || 0} 分</p>` : ''}${reference}</article>`;
+      const ask = submitted && isVersion2 && item && item.score < (isDaily ? 20 : 10) ? `<button class="button button-small button-outline" type="button" data-action="ask-question" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" data-day-index="${isDaily ? selector.dayIndex : ""}" data-question-id="${escapeHTML(question.id)}">问这道题</button>` : "";
+      return `<article class="quiz-question"><div class="question-head"><span class="question-index">${index + 1}</span><span>${isLegacy ? '历史题目' : label}</span></div><h3>${escapeHTML(question.question || '')}</h3>${input}${submitted && item ? `<p class="result-feedback">${escapeHTML(item.feedback || '')} · ${Number(item.score) || 0} 分</p>` : ''}${reference}${ask}</article>`;
     }).join('');
     const selectorAttrs = `data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}`;
     const retake = submitted ? `<button class="button button-small button-outline" type="button" data-action="retake-assessment" data-task-id="${escapeHTML(task.id)}" ${selectorAttrs}>重新生成${count}题${label}</button>` : '';
@@ -597,7 +600,7 @@
     if (selectedTaskId && !getTask(selectedTaskId)) selectedTaskId = null;
     if (!apiEnabled()) {
       sessionConsent.clear();
-      ['createDialog', 'editDayDialog', 'materialDialog'].forEach(id => {
+      ['createDialog', 'editDayDialog', 'materialDialog', 'tutoringDialog'].forEach(id => {
         const dialog = document.getElementById(id);
         if (dialog?.open) dialog.close();
       });
@@ -608,7 +611,7 @@
     return true;
   }
 
-  async function saveTask(task, nextView = currentView, expectedEpoch = configEpoch, baseTask = undefined, latestGuard = null) {
+  async function saveTask(task, nextView = currentView, expectedEpoch = configEpoch, baseTask = undefined, latestGuard = null, preserveNavigation = false) {
     if (expectedEpoch !== configEpoch || !apiEnabled()) throw new Error('模型服务配置已变化，请重新操作。');
     if (!api?.saveTask) throw new Error('学习服务未连接，无法保存任务。');
     const taskId = task.id;
@@ -640,8 +643,7 @@
         render();
         return null;
       }
-      selectedTaskId = saved.id;
-      currentView = nextView;
+      if (!preserveNavigation) { selectedTaskId = saved.id; currentView = nextView; }
       render();
       return saved;
     });
@@ -1143,6 +1145,8 @@
     if (changed) {
       if (next.dailyQuizzes && typeof next.dailyQuizzes === 'object') delete next.dailyQuizzes[String(index)];
       delete next.quiz;
+      clearDayTutoring(next, index);
+      clearTutorChats(next, 'final');
       const stalePreviousQuiz = index > 0 ? next.dailyQuizzes?.[String(index - 1)] : null;
       if (stalePreviousQuiz?.result) {
         stalePreviousQuiz.readinessStale = true;
@@ -1150,6 +1154,7 @@
         delete stalePreviousQuiz.supplementCompleted;
       }
     }
+    const priorTutorCache = tutorCacheSnapshot(task, [index], true);
     const editGuard = latest => {
       const latestDay = countDays(latest)[index];
       const latestPreviousQuiz = index > 0 ? latest.dailyQuizzes?.[String(index - 1)] || null : null;
@@ -1158,7 +1163,8 @@
         && sameValue(latestDay.tasks || [], day.tasks || [])
         && sameValue(latest.dailyQuizzes?.[String(index)] || null, task.dailyQuizzes?.[String(index)] || null)
         && sameValue(latest.quiz || null, task.quiz || null)
-        && sameValue(latestPreviousQuiz, previousQuiz || null);
+        && sameValue(latestPreviousQuiz, previousQuiz || null)
+        && tutorCacheSnapshot(latest, [index], true) === priorTutorCache;
     };
     try {
       const saved = await saveTask(next, currentView, configEpoch, task, editGuard);
@@ -1278,6 +1284,7 @@
         if (!next.dailyQuizzes || typeof next.dailyQuizzes !== 'object') next.dailyQuizzes = {};
         next.dailyQuizzes[String(requestedSelector.dayIndex)] = savedQuiz;
       } else next.quiz = savedQuiz;
+      clearTutorChats(next, requestedSelector.kind, requestedSelector.dayIndex);
       quizDrafts.delete(assessmentDraftKey(latest, requestedSelector));
       const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGenerationSnapshot(latestTask, requestedSelector) === inputSnapshot);
       if (!saved) return;
@@ -1485,6 +1492,7 @@
     const expected = countDays(next).map((day, index) => ({ day, index })).filter(entry => entry.index > pending.dayIndex && entry.day.date >= today && !entry.day.completed);
     const affectedIndices = expected.map(entry => entry.index);
     const affectedAssessments = adjustmentAssessmentSnapshot(task, affectedIndices);
+    const affectedTutorCache = tutorCacheSnapshot(task, affectedIndices, true);
     expected.forEach((entry, position) => {
       const item = pending.proposal.days[position];
       next.plan.days[entry.index] = { ...entry.day, title: item.title, minutes: item.minutes, tasks: item.tasks.slice(), source: item.source, completed: false };
@@ -1492,6 +1500,8 @@
     if (next.dailyQuizzes && typeof next.dailyQuizzes === 'object') {
       expected.forEach(entry => { delete next.dailyQuizzes[String(entry.index)]; });
     }
+    expected.forEach(entry => { clearDayTutoring(next, entry.index); });
+    clearTutorChats(next, 'final');
     delete next.quiz;
     const dailyQuiz = next.dailyQuizzes?.[String(pending.dayIndex)];
     if (dailyQuiz) {
@@ -1499,7 +1509,7 @@
       delete dailyQuiz.supplementCompleted;
     }
     try {
-      const saved = await saveTask(next, 'quiz', pending.epoch, task, latest => adjustmentInputSnapshot(latest, pending.dayIndex) === pending.snapshot && adjustmentAssessmentSnapshot(latest, affectedIndices) === affectedAssessments && adjustmentMatchesPlan(latest, pending.dayIndex, pending.proposal));
+      const saved = await saveTask(next, 'quiz', pending.epoch, task, latest => adjustmentInputSnapshot(latest, pending.dayIndex) === pending.snapshot && adjustmentAssessmentSnapshot(latest, affectedIndices) === affectedAssessments && tutorCacheSnapshot(latest, affectedIndices, true) === affectedTutorCache && adjustmentMatchesPlan(latest, pending.dayIndex, pending.proposal));
       if (!saved) return;
       $('#adjustmentDialog').close();
       toast('调整方案已应用到后续未完成日程。');
@@ -1510,6 +1520,155 @@
           toast('受影响的测验已更新，请重新生成调整预览后再确认。');
         } else toast(error.message || '调整方案没有保存，请重试。');
       }
+    }
+  }
+
+  function tutorQuiz(task, context) {
+    return assessmentFor(task, context.kind === 'daily' ? { kind: 'daily', dayIndex: context.dayIndex } : { kind: 'final' });
+  }
+
+  function tutorChatKey(context) {
+    return context.kind === 'daily' ? `daily:${context.dayIndex}:${context.questionId}` : `final:${context.questionId}`;
+  }
+
+  function tutorBasis(task, context) {
+    if (context.mode === 'lesson') {
+      const day = countDays(task)[context.dayIndex];
+      return day ? { dayTitle: day.title, dayTasks: day.tasks, daySource: day.source || '' } : null;
+    }
+    const quiz = tutorQuiz(task, context);
+    const question = quiz?.questions?.find(item => item.id === context.questionId);
+    const item = quiz?.result?.items?.find(item => item.id === context.questionId);
+    if (quiz?.version !== 2 || !question || !item) return null;
+    return { question: question.question, answer: quiz.answers?.[context.questionId]?.text || '', feedback: item.feedback };
+  }
+
+  function tutorSnapshot(task, context) {
+    return JSON.stringify({ title: task.title, goal: task.goal, level: task.level, knowledge: task.plan?.knowledge, materials: task.materials, basis: tutorBasis(task, context), questionDetails: context.mode === 'question' ? tutorQuiz(task, context)?.questions?.find(item => item.id === context.questionId) : null });
+  }
+
+  function tutorCacheSnapshot(task, dayIndices, includeFinal, includeLessons = true) {
+    const prefixes = dayIndices.map(index => `daily:${index}:`);
+    if (includeFinal) prefixes.push('final:');
+    return JSON.stringify({ lessons: includeLessons ? dayIndices.map(index => task.lessons?.[String(index)] || null) : [], chats: Object.entries(task.tutorChats || {}).filter(([key]) => prefixes.some(prefix => key.startsWith(prefix))).sort(([a], [b]) => a.localeCompare(b)) });
+  }
+
+  function clearTutorChats(task, kind, dayIndex) {
+    const prefix = kind === 'daily' ? `daily:${dayIndex}:` : 'final:';
+    Object.keys(task.tutorChats || {}).filter(key => key.startsWith(prefix)).forEach(key => { delete task.tutorChats[key]; });
+  }
+
+  function clearDayTutoring(task, dayIndex) {
+    if (task.lessons) delete task.lessons[String(dayIndex)];
+    clearTutorChats(task, 'daily', dayIndex);
+  }
+
+  function tutoringRequestKey(context) {
+    return `${context.taskId}:${context.mode}:${context.mode === 'lesson' ? `${context.dayIndex}:${context.depth}` : tutorChatKey(context)}`;
+  }
+
+  function tutorResponseHTML(response) {
+    return `<div class="tutor-text">${escapeHTML(response.text || '')}</div>${response.sources?.length ? `<p class="field-hint">来源：${escapeHTML(response.sources.join('；'))}</p>` : ''}${response.limitations?.length ? `<p class="field-hint">说明：${escapeHTML(response.limitations.join('；'))}</p>` : ''}`;
+  }
+
+  function renderTutoring() {
+    const context = tutoringContext;
+    if (!context || !$('#tutoringDialog').open) return;
+    const task = getTask(context.taskId);
+    const basis = task && tutorBasis(task, context);
+    if (!basis) { $('#tutoringDialog').close(); return; }
+    const isLesson = context.mode === 'lesson';
+    const busy = tutoringRequests.has(tutoringRequestKey(context));
+    $('#tutoringTitle').textContent = isLesson ? `第 ${context.dayIndex + 1} 天 · 学习讲解` : '错题与理解追问';
+    $('#tutoringIntro').textContent = isLesson ? '围绕当天任务解释概念、例子和易错点。点击后才生成；已有讲解可直接查看。' : '围绕这道题继续提问，帮助理解原因和方法。对话保留最近 20 轮。';
+    $('#lessonControls').hidden = !isLesson;
+    $('#lessonActions').hidden = !isLesson;
+    $('#questionFollowUpForm').hidden = isLesson;
+    const needsConsent = needsMaterialConsent(task) && !sessionConsent.has(task.id);
+    $('#tutoringConsentWrap').hidden = !needsConsent;
+    $('#tutoringConsent').checked = !needsConsent;
+    if (isLesson) {
+      const lesson = task.lessons?.[String(context.dayIndex)]?.[context.depth];
+      const valid = lesson && sameValue({ dayTitle: lesson.dayTitle, dayTasks: lesson.dayTasks, daySource: lesson.daySource }, basis);
+      $('#tutoringContent').innerHTML = valid ? tutorResponseHTML(lesson) : '<p class="tutor-empty">尚未生成这份讲解。</p>';
+      $$('#lessonControls [data-depth]').forEach(button => { button.classList.toggle('is-selected', button.dataset.depth === context.depth); });
+      $('#generateLesson').hidden = Boolean(valid);
+      $('#generateLesson').disabled = busy;
+      $('#generateLesson').textContent = busy ? '正在生成讲解…' : `生成${context.depth === 'brief' ? '简要' : '展开'}讲解`;
+    } else {
+      const chat = task.tutorChats?.[tutorChatKey(context)];
+      const valid = chat && sameValue({ question: chat.question, answer: chat.answer, feedback: chat.feedback }, basis);
+      const history = valid ? chat.messages : [];
+      $('#tutoringContent').innerHTML = `<p class="tutor-question">${escapeHTML(basis.question)}</p>${history.map(message => `<article class="tutor-message is-${message.role}"><strong>${message.role === 'user' ? '你' : '学习助手'}</strong>${tutorResponseHTML(message)}</article>`).join('')}`;
+      $('#sendQuestionFollowUp').disabled = busy;
+      $('#questionFollowUpInput').disabled = busy;
+      $('#sendQuestionFollowUp').textContent = busy ? '正在回答…' : '发送问题';
+    }
+  }
+
+  function openTutoring(taskId, context) {
+    if (!apiEnabled()) return openSettings();
+    const task = getTask(taskId);
+    if (!task || !tutorBasis(task, context)) return toast('当前学习内容无法打开讲解，请先完成测评或重新打开计划。');
+    tutoringContext = { ...context, taskId, depth: 'brief', epoch: configEpoch, session: makeId() };
+    setMessage($('#tutoringError'), '');
+    $('#questionFollowUpInput').value = '';
+    if (!$('#tutoringDialog').open) $('#tutoringDialog').showModal();
+    renderTutoring();
+  }
+
+  async function requestTutoring(event) {
+    event?.preventDefault();
+    const context = tutoringContext && clone(tutoringContext);
+    if (!context || context.epoch !== configEpoch || !apiEnabled()) return;
+    const task = getTask(context.taskId);
+    const basis = task && tutorBasis(task, context);
+    if (!basis) return;
+    const key = tutoringRequestKey(context);
+    if (tutoringRequests.has(key)) return;
+    if (needsMaterialConsent(task) && !sessionConsent.has(task.id)) {
+      if (!$('#tutoringConsent').checked) return setMessage($('#tutoringError'), '请先同意发送相关学习内容与作答。', 'warning');
+      sessionConsent.add(task.id);
+    }
+    const isLesson = context.mode === 'lesson';
+    const questionText = $('#questionFollowUpInput').value.trim();
+    if (!isLesson && !questionText) return setMessage($('#tutoringError'), '请写下想问的问题。');
+    const oldLesson = task.lessons?.[String(context.dayIndex)]?.[context.depth];
+    if (isLesson && oldLesson && sameValue({ dayTitle: oldLesson.dayTitle, dayTasks: oldLesson.dayTasks, daySource: oldLesson.daySource }, basis)) return renderTutoring();
+    const previousChat = task.tutorChats?.[tutorChatKey(context)];
+    const history = !isLesson && previousChat ? previousChat.messages : [];
+    const messages = [...history.slice(-8).map(message => ({ role: message.role, text: message.text })), { role: 'user', text: questionText }];
+    const snapshot = tutorSnapshot(task, context);
+    tutoringRequests.add(key);
+    setMessage($('#tutoringError'), '');
+    renderTutoring();
+    try {
+      const response = isLesson
+        ? await api.generateLesson({ task, dayIndex: context.dayIndex, depth: context.depth })
+        : await api.answerQuestion({ task, selector: context.kind === 'daily' ? { kind: 'daily', dayIndex: context.dayIndex } : { kind: 'final' }, questionId: context.questionId, messages });
+      if (context.epoch !== configEpoch || !apiEnabled()) return;
+      const latest = getTask(context.taskId);
+      if (!latest || tutorSnapshot(latest, context) !== snapshot) throw new Error('相关学习内容已变化，本次讲解没有保存，请重新生成。');
+      const next = clone(latest);
+      if (isLesson) {
+        next.lessons ||= {};
+        next.lessons[String(context.dayIndex)] ||= {};
+        next.lessons[String(context.dayIndex)][context.depth] = { ...response, ...basis, generatedDate: localDateString() };
+      } else {
+        next.tutorChats ||= {};
+        next.tutorChats[tutorChatKey(context)] = { kind: context.kind, dayIndex: context.kind === 'daily' ? context.dayIndex : null, questionId: context.questionId, ...basis, messages: [...history.slice(-38), { role: 'user', text: questionText }, { role: 'assistant', ...response }] };
+      }
+      const saved = await saveTask(next, currentView, context.epoch, latest, current => tutorSnapshot(current, context) === snapshot, true);
+      if (!saved) return;
+      if (tutoringContext && tutoringRequestKey(tutoringContext) === key) {
+        if (!isLesson && tutoringContext.session === context.session) $('#questionFollowUpInput').value = '';
+        renderTutoring();
+      }
+    } catch (error) {
+      if (context.epoch === configEpoch && tutoringContext && tutoringRequestKey(tutoringContext) === key) setMessage($('#tutoringError'), error.message || '讲解生成失败，请重试。');
+    } finally {
+      tutoringRequests.delete(key);
+      renderTutoring();
     }
   }
 
@@ -1586,7 +1745,11 @@
       await applyAdjustment();
       return;
     }
-    if (action === 'new-task') openCreateDialog();
+    if (action === 'open-lesson') openTutoring(taskId, { mode: 'lesson', dayIndex: Number(button.dataset.dayIndex) });
+    else if (action === 'ask-question') openTutoring(taskId, { mode: 'question', ...selectorFromButton(button), questionId: button.dataset.questionId });
+    else if (action === 'lesson-depth' && tutoringContext) { tutoringContext.depth = button.dataset.depth; setMessage($('#tutoringError'), ''); renderTutoring(); }
+    else if (action === 'generate-lesson') await requestTutoring();
+    else if (action === 'new-task') openCreateDialog();
     else if (action === 'settings') openSettings();
     else if (action === 'profile') openProfile();
     else if (action === 'import-create') await importMaterials();
@@ -1647,16 +1810,18 @@
   $('#profileDialog').addEventListener('close', () => { profileSession += 1; });
   $('#testConnection').addEventListener('click', () => persistSettings(true));
   $('#editDayForm').addEventListener('submit', saveDayEdit);
+  $('#questionFollowUpForm').addEventListener('submit', requestTutoring);
   viewHost.addEventListener('submit', event => {
     if (event.target.matches('#quizForm')) submitQuiz(event);
   });
   viewHost.addEventListener('input', event => {
     if (event.target.matches('[data-answer]')) saveQuizDraft(event.target);
   });
-  ['createDialog', 'settingsDialog', 'profileDialog', 'editDayDialog', 'materialDialog', 'adjustmentDialog'].forEach(id => {
+  ['createDialog', 'settingsDialog', 'profileDialog', 'editDayDialog', 'materialDialog', 'adjustmentDialog', 'tutoringDialog'].forEach(id => {
     const dialog = document.getElementById(id);
     dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
   });
+  $('#tutoringDialog').addEventListener('close', () => { if (!$('#tutoringDialog').open) tutoringContext = null; });
   $('#adjustmentDialog').addEventListener('close', () => {
     if (!$('#adjustmentDialog').open) proposedAdjustment = null;
   });

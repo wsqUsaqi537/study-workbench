@@ -151,5 +151,19 @@
     <div id="adjustmentPreview"></div>
     <div class="dialog-actions"><button class="button button-quiet" type="button" data-action="cancel-adjustment">取消</button><button class="button button-primary" type="button" data-action="confirm-adjustment">确认并应用</button></div>
   </dialog>
+  <dialog id="tutoringDialog" class="app-dialog tutoring-dialog" aria-labelledby="tutoringTitle">
+    <div class="dialog-topline"><span class="eyebrow">理解与练习</span><button class="dialog-close" type="button" data-close="tutoringDialog" aria-label="关闭">×</button></div>
+    <h2 id="tutoringTitle">学习讲解</h2>
+    <p id="tutoringIntro" class="dialog-intro"></p>
+    <div id="tutoringError" class="form-message error-message" role="alert" hidden></div>
+    <label id="tutoringConsentWrap" class="consent-row" hidden><input id="tutoringConsent" type="checkbox"><span><strong>同意发送相关学习内容与作答</strong><small>讲解按需生成，内容保存到本机供再次查看。</small></span></label>
+    <div id="lessonControls" class="report-actions"><button class="button button-outline" type="button" data-action="lesson-depth" data-depth="brief">简要讲解</button><button class="button button-outline" type="button" data-action="lesson-depth" data-depth="detailed">展开讲解</button></div>
+    <div id="tutoringContent" class="tutoring-content"></div>
+    <div id="lessonActions" class="dialog-actions"><button id="generateLesson" class="button button-primary" type="button" data-action="generate-lesson">生成讲解</button></div>
+    <form id="questionFollowUpForm" hidden>
+      <label class="field"><span>继续问这道题</span><textarea id="questionFollowUpInput" rows="3" maxlength="2000" placeholder="例如：我为什么会判断错？请换一个例子解释。" required></textarea></label>
+      <div class="dialog-actions"><button id="sendQuestionFollowUp" class="button button-primary" type="submit">发送问题</button></div>
+    </form>
+  </dialog>
 </body>
 </html>
