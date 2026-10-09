@@ -2,6 +2,7 @@
 
 const services = require('./services.cjs');
 const { EXAMPASS_RULES } = require('./exampass.cjs');
+const { languageInstruction, normalizeLanguage } = require('./i18n.js');
 
 const DAILY_QUESTION_COUNT = 5;
 const FINAL_QUESTION_COUNT = 10;
@@ -282,7 +283,7 @@ function getAssessment(task, selector, required = true) {
   return quiz;
 }
 
-function assessmentSystemPrompt(action, itemCount) {
+function assessmentSystemPrompt(action, itemCount, language) {
   return [
     '你是学习测验助手，只执行用户消息中 purpose 指定的任务。',
     EXAMPASS_RULES,
@@ -290,7 +291,8 @@ function assessmentSystemPrompt(action, itemCount) {
     '只返回一个合法 JSON 对象，不要 Markdown、代码围栏或额外文字。所有文字简洁、清楚、面向学习者。',
     action,
     '本次题量为 ' + itemCount + ' 道。选择题必须恰好四项 A-D，answer 只能是正确选项字母；填空题必须提供语义等价的 alternatives（最多五项）；题干不能展示答案。',
-    '出题内容仅依据给出的知识说明与任务；材料不足时明确限制范围，不编造材料证据。'
+    '出题内容仅依据给出的知识说明与任务；材料不足时明确限制范围，不编造材料证据。',
+    languageInstruction(language)
   ].join('\n');
 }
 
@@ -308,10 +310,12 @@ async function generateAssessment(task, selector, settings = {}) {
     selector.kind === 'daily'
       ? '生成每日测验，只考 day 任务范围；完成任务确实需要时可以考必要先修知识，不考未来日程。只能有选择题和填空题，并且两种都要有。'
       : '生成覆盖整个学习周期的期末测验，以选择题和填空题为主，并且两种都要有；可另含零至两道简答或论述题（short）。',
-    count
+    count,
+    settings.language
   ) + '\n输出结构：{"questions":[{"id":"q1","type":"choice|fill|short","question":string,"options":string[],"answer":string,"alternatives":string[],"reference":string,"rubric":string},...]}。编号按 q1 起连续排列。choice 的 alternatives 必须为空，fill 的 options 必须为空，short 的 options 和 alternatives 必须为空。填空题只设置一个明确、简短的答案空位。';
   const payload = {
     purpose: selector.kind === 'daily' ? '生成每日小测' : '生成周期测验',
+    outputLanguage: normalizeLanguage(settings.language),
     scope: selector.kind,
     title: task.title,
     goal: task.goal,
@@ -341,9 +345,15 @@ async function generateAssessment(task, selector, settings = {}) {
   if (!hasKnowledge) {
     const note = task.materials.length
       ? context.truncated
-        ? '（旧版计划缺少知识清单；本题只依据限长发送的材料，未覆盖内容可能遗漏。）'
-        : '（旧版计划缺少知识清单；本题依据现有材料，课程范围可能不完整。）'
-      : '（旧版计划缺少知识清单且未提供附件；本题范围可能不完整。）';
+        ? (settings.language === 'en'
+          ? ' (The older plan has no knowledge list; this question uses only the truncated material, so omitted content may be missing.)'
+          : '（旧版计划缺少知识清单；本题只依据限长发送的材料，未覆盖内容可能遗漏。）')
+        : (settings.language === 'en'
+          ? ' (The older plan has no knowledge list; this question uses the available material, so course coverage may be incomplete.)'
+          : '（旧版计划缺少知识清单；本题依据现有材料，课程范围可能不完整。）')
+      : (settings.language === 'en'
+        ? ' (The older plan has no knowledge list and no attachments were provided, so coverage may be incomplete.)'
+        : '（旧版计划缺少知识清单且未提供附件；本题范围可能不完整。）');
     quiz.questions = quiz.questions.map(question => {
       if (question.reference.length + note.length > 4000) fail('参考答案过长，无法添加材料范围提示。');
       return { ...question, reference: question.reference + note };
@@ -379,7 +389,7 @@ function dailyHistorySummary(task, beforeDayIndex) {
   return summary;
 }
 
-function gradeSystemPrompt(quiz, hasNextDay) {
+function gradeSystemPrompt(quiz, hasNextDay, language) {
   const cap = quiz.kind === 'daily' ? 20 : 10;
   const subjectiveIds = quiz.questions.filter(question => question.type !== 'choice').map(question => question.id);
   return [
@@ -392,7 +402,8 @@ function gradeSystemPrompt(quiz, hasNextDay) {
     hasNextDay ? '本次日测存在 nextDay，readyForNext 必须为 true 或 false。' : '本次没有后续学习日或正在评分期末测验，readyForNext 必须为 null。',
     '期末报告必须说明已记录多少天每日小测、缺少哪些日报；未测内容和未完成学习日不能表述为已掌握。',
     '只返回 JSON：{"feedback":string,"items":[{"id":string,"score":integer,"feedback":string}],"weakPoints":string[],"report":{"summary":string,"strengths":string[],"nextSteps":string[],"readyForNext":boolean|null,"reason":string,"extraMinutes":integer,"extraTasks":string[]}}。',
-    'items 只能包含这些主观题编号：' + subjectiveIds.join(', ') + '。每题满分 ' + cap + '，只输出主观题分数；不得返回 choice 题。报告简洁具体。'
+    'items 只能包含这些主观题编号：' + subjectiveIds.join(', ') + '。每题满分 ' + cap + '，只输出主观题分数；不得返回 choice 题。报告简洁具体。',
+    languageInstruction(language)
   ].join('\n');
 }
 
@@ -429,7 +440,9 @@ async function gradeAssessment(task, selector, answers, settings = {}) {
       objectiveResults.set(question.id, {
         id: question.id,
         score: correct ? (quiz.kind === 'daily' ? 20 : 10) : 0,
-        feedback: correct ? '选项正确。' : '此题应选 ' + question.answer + '。'
+        feedback: settings.language === 'en'
+          ? (correct ? 'Correct.' : 'The correct option is ' + question.answer + '.')
+          : (correct ? '选项正确。' : '此题应选 ' + question.answer + '。')
       });
       return {
         id: question.id,
@@ -462,6 +475,7 @@ async function gradeAssessment(task, selector, answers, settings = {}) {
   };
   const payload = {
     purpose: '评分并生成学习报告',
+    outputLanguage: normalizeLanguage(settings.language),
     title: task.title,
     goal: task.goal,
     brief: task.brief || null,
@@ -472,7 +486,7 @@ async function gradeAssessment(task, selector, answers, settings = {}) {
     previousDailySummary: selector.kind === 'final' ? dailyHistorySummary(task, task.days) : dailyHistorySummary(task, dayIndex),
     scoreSummary: quizSummary
   };
-  const systemMessage = gradeSystemPrompt(quiz, Boolean(nextDay));
+  const systemMessage = gradeSystemPrompt(quiz, Boolean(nextDay), settings.language);
   const context = services.boundedContext(payload, [], services.contextBudget(systemMessage, settings));
   const content = await services.requestChat(settings, systemMessage, context.text, quiz.questions.length === 5 ? 3000 : 5200, false, true);
   const modelResult = services.parseModelJson(content, '测验评分');
@@ -488,9 +502,11 @@ async function gradeAssessment(task, selector, answers, settings = {}) {
   };
   if (selector.kind === 'final') {
     const history = payload.previousDailySummary;
-    const coverageNote = '已记录 ' + history.completedDailyAssessments + '/' + history.expectedDailyAssessments +
-      ' 天每日小测，缺少 ' + history.missingDailyAssessmentDays.length + ' 天；有 ' + history.incompletePlanDays.length +
-      ' 个学习日尚未完成，相关内容未验证，不能视为已掌握。';
+    const coverageNote = settings.language === 'en'
+      ? `${history.completedDailyAssessments}/${history.expectedDailyAssessments} daily quizzes were recorded; ${history.missingDailyAssessmentDays.length} are missing. ${history.incompletePlanDays.length} study days are incomplete, so related content has not been verified and must not be treated as mastered.`
+      : '已记录 ' + history.completedDailyAssessments + '/' + history.expectedDailyAssessments +
+        ' 天每日小测，缺少 ' + history.missingDailyAssessmentDays.length + ' 天；有 ' + history.incompletePlanDays.length +
+        ' 个学习日尚未完成，相关内容未验证，不能视为已掌握。';
     result.report.summary = result.report.summary.slice(0, 1999 - coverageNote.length).trimEnd() + ' ' + coverageNote;
   }
   validateAssessmentResult(result, quiz);
@@ -524,9 +540,13 @@ function candidateSources(task) {
 
 function hasTimedQuiz(tasks, count, kind) {
   const text = tasks.join(' ');
-  const countPattern = new RegExp('(?:' + count + '|' + (count === 5 ? '五' : '十') + ')\\s*题');
-  const testPattern = kind === 'daily' ? /(小测|测验|自测)/ : /(周期测验|期末测验|综合测验)/;
-  return countPattern.test(text) && testPattern.test(text) && /(?:\d{1,3}\s*分钟|用时\s*\d{1,3}|时间预算)/.test(text);
+  const wordCount = count === 5 ? 'five' : 'ten';
+  const countPattern = new RegExp('(?:(?:' + count + '|' + (count === 5 ? '五' : '十') + ')\\s*题|(?:' + count + '|' + wordCount + ')\\s*-?\\s*questions?)', 'i');
+  const testPattern = kind === 'daily'
+    ? /(小测|测验|自测|\b(?:quiz|test)\b)/i
+    : /(周期测验|期末测验|综合测验|(?:final|end[- ]of[- ]cycle|comprehensive)\s+(?:quiz|test|assessment))/i;
+  const timePattern = /(?:\d{1,3}\s*分钟|用时\s*\d{1,3}|时间预算|\b\d{1,3}\s*(?:minutes?|mins?)\b)/i;
+  return countPattern.test(text) && testPattern.test(text) && timePattern.test(text);
 }
 
 function validateAdjustment(modelResult, candidates, task, sources) {
@@ -570,10 +590,12 @@ async function proposeAdjustment(task, dayIndex, settings = {}) {
     '不要接收或要求原始材料全文，也不要泄露 API 配置或隐藏信息。',
     '只返回合法 JSON：{"summary":string,"days":[{"day":number,"date":"YYYY-MM-DD","title":string,"minutes":number,"tasks":string[],"source":string}]}。',
     'days 必须按输入顺序逐日完整返回。day、date、minutes 必须与每个当前计划日期完全相同；不得出现过去日期或已完成日期。只使用 allowedSources 中的来源字符串。',
-    '每天任务都要保留 5 题小测并写明用时，测验时间计入当日 minutes。最后一天另外保留 10 题周期测验并写明用时，也计入当日 minutes。'
+    '每天任务都要保留 5 题小测并写明用时，测验时间计入当日 minutes。最后一天另外保留 10 题周期测验并写明用时，也计入当日 minutes。',
+    languageInstruction(settings.language)
   ].join('\n');
   const payload = {
     purpose: '调整后续学习规划',
+    outputLanguage: normalizeLanguage(settings.language),
     title: task.title,
     goal: task.goal,
     brief: task.brief || null,

@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const zlib = require('node:zlib');
+const JSZip = require('jszip');
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'study-workbench-desktop-data-'));
 const externalScreenshotDir = process.env.STUDY_TEST_SCREENSHOT_DIR;
@@ -14,7 +15,7 @@ const requestedScreenshots = process.env.STUDY_TEST_KEEP_SCREENSHOT === '1';
 const appRoot = path.resolve(process.env.STUDY_TEST_APP_ROOT || __dirname);
 process.env.STUDY_APP_DATA_DIR = dataDir;
 
-const { app, BrowserWindow, safeStorage } = require('electron');
+const { app, BrowserWindow, safeStorage, dialog } = require('electron');
 Object.defineProperty(safeStorage, 'isEncryptionAvailable', { configurable: true, value: () => false });
 
 const apiRecords = [];
@@ -103,6 +104,45 @@ function makeAssessmentQuestions(kind) {
   });
 }
 
+function makeDailyReadinessQuiz(dayIndex, date, decision = '') {
+  const questions = makeAssessmentQuestions('daily');
+  const answers = Object.fromEntries(questions.map(question => [question.id, {
+    text: question.type === 'choice' ? 'A' : '这是保留的作答。'
+  }]));
+  const items = questions.map(question => ({
+    id: question.id,
+    score: question.type === 'choice' ? 20 : 10,
+    feedback: '回答包含核心概念并给出解释。'
+  }));
+  return {
+    version: 2,
+    mode: 'ai',
+    kind: 'daily',
+    dayIndex,
+    questions,
+    generatedDate: date,
+    answers,
+    resultDate: date,
+    result: {
+      mode: 'ai',
+      score: items.reduce((sum, item) => sum + item.score, 0),
+      feedback: '建议先巩固基础，再继续下一步。',
+      items,
+      weakPoints: ['循环应用'],
+      report: {
+        summary: '建议先巩固循环的实际应用。',
+        strengths: ['能识别主要概念'],
+        nextSteps: ['用循环汇总多笔账目'],
+        readyForNext: false,
+        reason: '第 2 题显示还需要练习循环如何处理多笔账目。',
+        extraMinutes: 20,
+        extraTasks: ['用循环遍历三笔账目并核对总额']
+      }
+    },
+    ...(decision ? { decision, supplementCompleted: decision === 'extra' } : {})
+  };
+}
+
 function makeModelPlan(input) {
   const days = Number(input.days) || 2;
   const startDate = input.startDate || '2026-10-08';
@@ -132,6 +172,27 @@ function makeModelPlan(input) {
 }
 
 function responseFor(purpose, payload) {
+  if (payload.outputLanguage === 'en') {
+    if (purpose === '生成学习计划') {
+      const plan = makeModelPlan(payload);
+      plan.summary = 'Learn variables and loops, then apply them in a small project.';
+      plan.knowledge = plan.knowledge.map((item, index) => ({ ...item, title: index ? 'Loops' : 'Variables and types', explanation: index ? 'Repeat an operation for each record.' : 'Store values using appropriate types.' }));
+      plan.days = plan.days.map((day, index) => ({ ...day, title: index ? 'Practice and review' : 'Variables and examples', tasks: ['Practice the concepts', 'Take a 5-question daily quiz (10 minutes)', ...(index === plan.days.length - 1 ? ['Take a 10-question final test (15 minutes)'] : [])] }));
+      return plan;
+    }
+    if (purpose === '讲解当前日学习内容') return { text: 'Concept: variables store values.\nExample: record a purchase.\nCommon pitfall: mixing text and numbers.\nExercise: create a record.', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+    if (purpose === '生成每日小测' || purpose === '生成周期测验') {
+      return { questions: makeAssessmentQuestions(purpose === '生成每日小测' ? 'daily' : 'final').map(q => ({ ...q, question: q.type === 'choice' ? 'Which explanation is correct?' : 'Explain how to use this concept.', options: q.type === 'choice' ? ['Correct explanation', 'Distractor one', 'Distractor two', 'Distractor three'] : [], answer: q.type === 'choice' ? 'A' : 'Use the concept in practice.', alternatives: q.type === 'fill' ? ['Apply it to a practical example.'] : [], reference: 'Explain the concept with a concrete example.', rubric: 'Assess accuracy and application.' })) };
+    }
+    if (purpose === '评分并生成学习报告') {
+      const result = responseFor(purpose, { ...payload, outputLanguage: 'zh-CN' });
+      result.feedback = 'You understood the main concepts. Review the prerequisite before continuing.';
+      result.items = result.items.map(item => ({ ...item, feedback: 'Your response identifies the key concept.' }));
+      result.weakPoints = result.weakPoints.map(item => typeof item === 'string' ? 'Review the prerequisite.' : ({ ...item, point: 'Apply the concept independently.' }));
+      result.report = { ...result.report, summary: 'You completed the daily assessment.', strengths: ['You can identify the key concepts.'], nextSteps: ['Review the prerequisite.'], reason: payload.nextDay ? 'q4 shows a prerequisite gap for the next day.' : 'The report covers the recorded assessments.', extraTasks: payload.nextDay ? ['Practice the prerequisite with one more example.'] : [] };
+      return result;
+    }
+  }
   if (purpose === '澄清学习需求') {
     clarifyCount += 1;
     return clarifyCount === 1
@@ -281,6 +342,7 @@ const originalLegacyAITask = legacyAITask();
 const initialTasksText = JSON.stringify({ tasks: [originalLegacyTask, originalLegacyAITask] }, null, 2);
 fs.writeFileSync(path.join(dataDir, 'tasks.json'), initialTasksText);
 fs.writeFileSync(path.join(dataDir, 'profile.json'), JSON.stringify(seedProfile, null, 2));
+fs.writeFileSync(path.join(dataDir, 'preferences.json'), JSON.stringify({ language: 'zh-CN' }));
 require(path.join(appRoot, 'main.cjs'));
 
 let currentStage = '启动 Electron';
@@ -346,12 +408,12 @@ async function openAssessmentThroughUI(window, taskId, kind, dayIndex, generate 
     assert.equal(apiRecords.length, beforeRequests, '打开测验或报告不应隐式请求模型');
     return;
   }
-  await waitForJS(window, 'document.querySelector("#quizForm") || document.querySelector("[data-action=generate-assessment]") || document.querySelector(".quiz-intro h2")?.textContent.includes("正在生成")', '测验页面入口或已开始的请求');
+  await waitForJS(window, 'document.querySelector("#quizForm") || document.querySelector("[data-action=generate-assessment]") || /正在生成|generating/i.test(document.querySelector(".quiz-intro h2")?.textContent || "")', '测验页面入口或已开始的请求');
   const entryState = await window.webContents.executeJavaScript(`({
     title: document.querySelector('#appView h1')?.textContent || '',
     generateButtons: [...document.querySelectorAll('[data-action="generate-assessment"]')].map(button => ({ kind: button.dataset.kind, dayIndex: button.dataset.dayIndex, disabled: button.disabled })),
     form: Boolean(document.querySelector('#quizForm')),
-    busy: document.querySelector('.quiz-intro h2')?.textContent.includes('正在生成') || false,
+    busy: /正在生成|generating/i.test(document.querySelector('.quiz-intro h2')?.textContent || ''),
     requestStarted: ${apiRecords.length > beforeRequests},
     text: document.querySelector('#appView')?.innerText.slice(0, 400) || ''
   })`);
@@ -472,7 +534,10 @@ async function reloadWindow(window, configured, expectedTasks) {
   });
   window.webContents.reload();
   await loaded;
-  const expectedLabel = configured ? 'API 已配置' : 'API 未配置';
+  const language = (await readState(window)).preferences.language;
+  const expectedLabel = language === 'en'
+    ? require('./ui-messages.js')[configured ? 'API 已配置' : 'API 未配置']
+    : configured ? 'API 已配置' : 'API 未配置';
   await waitForJS(window,
     `window.studyApp.loadState().then(state => state.settings.configured === ${Boolean(configured)} && state.tasks.length === ${Number(expectedTasks)})`,
     '状态重新加载完成');
@@ -685,9 +750,40 @@ async function run() {
   assert.ok(blockedCalls.every(result => result.rejected), `所有任务 IPC 在 API 未配置时都应拒绝：${JSON.stringify(blockedCalls)}`);
   assert.equal(apiRecords.length, 0, '未配置时不应发出 mock API 请求');
 
+  currentStage = '未配置API时切换语言及拒绝无效偏好';
+  const preferencesBeforeInvalid = fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8');
+  const invalidPreferencesRejected = await window.webContents.executeJavaScript(`(async () => {
+    const results = [];
+    for (const input of [{ language: 'fr' }, { language: 'en', key: 'unexpected' }, null]) {
+      try { await window.studyApp.savePreferences(input); results.push(false); }
+      catch { results.push(true); }
+    }
+    return results;
+  })()`);
+  assert.deepEqual(invalidPreferencesRejected, [true, true, true]);
+  assert.equal(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8'), preferencesBeforeInvalid);
+  await click(window, '#profileButton', '无API时打开语言设置');
+  await setValue(window, '#profileLanguage', 'en');
+  await waitForJS(window, 'document.documentElement.lang === "en" && Boolean(document.querySelector(".service-locked"))', '未配置时仍可使用英文');
+  assert.equal((await readState(window)).settings.configured, false);
+  assert.equal(apiRecords.length, 0);
+  await setValue(window, '#profileLanguage', 'zh-CN');
+  await waitForJS(window, 'document.documentElement.lang === "zh-CN"', '锁定状态切回中文');
+  await click(window, '[data-close="profileDialog"]', '关闭语言设置');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'tasks.json'), 'utf8'), initialTasksText);
+
   currentStage = '保存部分配置并保持锁定';
   await click(window, '[data-action="settings"]', '打开 API 设置');
   await waitForJS(window, 'document.querySelector("#settingsDialog")?.open', 'API 设置对话框');
+  const deepSeekExamples = await window.webContents.executeJavaScript(`({
+    endpoint: document.querySelector('#apiEndpoint').placeholder,
+    model: document.querySelector('#apiModel').placeholder,
+    help: document.querySelector('#settingsDialog').innerText
+  })`);
+  assert.equal(deepSeekExamples.endpoint, 'https://api.deepseek.com', 'API 设置应展示 DeepSeek API 地址示例');
+  assert.equal(deepSeekExamples.model, 'deepseek-flash', 'API 设置应展示 DeepSeek 模型示例');
+  assert.match(deepSeekExamples.help, /https:\/\/api\.deepseek\.com/);
+  assert.match(deepSeekExamples.help, /deepseek-flash/);
   await setValue(window, '#apiEndpoint', endpoint);
   await setValue(window, '#apiModel', 'desktop-mock');
   await setValue(window, '#apiKey', '');
@@ -837,6 +933,9 @@ async function run() {
   currentStage = '讨论目标、确认简报并创建带知识清单的新计划';
   await click(window, '[data-action="new-task"]', '打开新建计划');
   await waitForJS(window, 'document.querySelector("#createDialog")?.open', '新建计划对话框');
+  const learningModes = await window.webContents.executeJavaScript(`Array.from(document.querySelector('#createForm [name="learningMode"]').options, option => [option.value, option.textContent.trim()])`);
+  assert.deepEqual(learningModes, [['exam', '备考'], ['balanced', '平衡'], ['deep', '深度学习']], '学习方式只提供备考、平衡和深度学习');
+  assert.doesNotMatch(await window.webContents.executeJavaScript('document.body.innerText'), /ExamPass/i, '界面不得提及 ExamPass');
   const dropPdfPath = path.join(dataDir, 'dropped-study-material.pdf');
   fs.writeFileSync(dropPdfPath, makeMinimalPdf());
   const requestsBeforeDrop = apiRecords.length;
@@ -845,6 +944,46 @@ async function run() {
   assert.equal(dropResult.highlighted, true, '拖入真实本机文件时附件区域应显示高亮');
   await waitForJS(window, 'document.querySelector("#createMaterials").innerText.includes("dropped-study-material.pdf")', '拖入的本机 PDF 已导入');
   assert.equal(apiRecords.length, requestsBeforeDrop, '本机解析并拖入材料不应请求模型服务');
+  const mdPath = path.join(dataDir, 'study-notes.md');
+  const mdText = "# 变量与公式\n\n- 单价乘数量\n\n```python\ntotal = price * count\n```";
+  fs.writeFileSync(mdPath, mdText);
+  await dispatchActualFileDrop(window, mdPath);
+  await waitForJS(window, 'document.querySelector("#createMaterials").innerText.includes("study-notes.md")', '真实 Markdown 文件已拖入');
+  await click(window, '[data-action="preview-create-material"][data-material-index="1"]', '预览 Markdown 文字');
+  await waitForJS(window, 'document.querySelector("#materialDialog").open', 'Markdown 预览打开');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#materialText").textContent'), mdText, '预览应保留标题和代码块');
+  await click(window, '[data-close="materialDialog"]', '关闭材料预览');
+  const texPath = path.join(dataDir, 'formula.tex');
+  const texText = String.raw`\section{求和}
+公式：$S=\sum_{i=1}^{n}i$
+\input{unavailable.tex}`;
+  fs.writeFileSync(texPath, texText);
+  const docxPath = path.join(dataDir, 'selected-notes.docx');
+  const docx = new JSZip();
+  docx.file('[Content_Types].xml', '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+  docx.file('_rels/.rels', '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
+  docx.file('word/document.xml', '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>DOCX native selection</w:t></w:r></w:p></w:body></w:document>');
+  fs.writeFileSync(docxPath, await docx.generateAsync({ type: 'nodebuffer' }));
+  const pptxPath = path.join(dataDir, 'selected-slides.pptx');
+  const pptx = new JSZip();
+  pptx.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><a:p><a:r><a:t>PPTX native selection</a:t></a:r></a:p></p:cSld></p:sld>');
+  fs.writeFileSync(pptxPath, await pptx.generateAsync({ type: 'nodebuffer' }));
+  const originalOpenDialog = dialog.showOpenDialog;
+  let pickerOptions;
+  try {
+    dialog.showOpenDialog = async (_owner, options) => {
+      pickerOptions = options;
+      return { canceled: false, filePaths: [texPath, docxPath, pptxPath] };
+    };
+    await click(window, '[data-action="import-create"]', '从选择器导入 TEX、DOCX、PPTX 文件');
+    await waitForJS(window, 'document.querySelector("#createMaterials").innerText.includes("formula.tex") && document.querySelector("#createMaterials").innerText.includes("selected-notes.docx") && document.querySelector("#createMaterials").innerText.includes("selected-slides.pptx")', '三种真实本机文件经选择对话框导入');
+  } finally {
+    dialog.showOpenDialog = originalOpenDialog;
+  }
+  for (const extension of ['pdf', 'docx', 'pptx', 'md', 'tex']) {
+    assert.ok(pickerOptions.filters[0].extensions.includes(extension), `文件选择器应允许 ${extension.toUpperCase()} 材料`);
+  }
+  assert.equal(apiRecords.length, requestsBeforeDrop, 'PDF、DOCX、PPTX、MD、TEX 导入与预览均在本机完成，不应请求 API');
   await setValue(window, '#createForm [name="title"]', 'Python 记账小程序');
   await setValue(window, '#createForm [name="goal"]', '我想学会 Python 基础并完成一个记账小程序。');
   await setValue(window, '#createForm [name="learningMode"]', 'deep');
@@ -872,10 +1011,18 @@ async function run() {
   assert.deepEqual(newTask.brief, expectedBrief);
   assert.equal(newTask.plan.mode, 'ai');
   assert.equal(newTask.plan.days.length, 3);
-  assert.equal(newTask.materials.length, 1);
+  assert.equal(newTask.materials.length, 5);
+  assert.equal(newTask.materials[1].text, mdText);
+  assert.equal(newTask.materials[2].text, texText);
+  assert.match(newTask.materials[3].text, /DOCX native selection/);
+  assert.match(newTask.materials[4].text, /PPTX native selection/);
   assert.equal(newTask.plan.knowledge.length, 2);
   const planPayload = apiRecords.find(record => record.purpose === '生成学习计划')?.payload;
   assert.equal(planPayload.learningMode, 'deep');
+  assert.equal(planPayload.materials.find(item => item.name === 'study-notes.md')?.text, mdText);
+  assert.equal(planPayload.materials.find(item => item.name === 'formula.tex')?.text, texText);
+  assert.match(planPayload.materials.find(item => item.name === 'selected-notes.docx')?.text || '', /DOCX native selection/);
+  assert.match(planPayload.materials.find(item => item.name === 'selected-slides.pptx')?.text || '', /PPTX native selection/);
   assert.deepEqual(planPayload.brief, expectedBrief);
   assert.equal(apiRecords.filter(record => record.purpose === '澄清学习需求').length, 2);
 
@@ -884,6 +1031,10 @@ async function run() {
   const knowledgeText = await window.webContents.executeJavaScript('document.querySelector(".plan-knowledge").innerText');
   assert.match(knowledgeText, /变量与数据类型/);
   assert.match(knowledgeText, /重点/);
+  const planFonts = await window.webContents.executeJavaScript(`[
+    '.plan-day-info strong', '.plan-day-info small', '.knowledge-item-heading > strong', '.knowledge-item p'
+  ].map(selector => parseFloat(getComputedStyle(document.querySelector(selector)).fontSize))`);
+  assert.ok(planFonts.every(size => size >= 16), `计划标题、任务和知识说明字号应至少为 16px：${planFonts.join(', ')}`);
   await captureScreenshot(window, 'knowledge-list-0.2.png');
 
   currentStage = '延迟计划请求期间锁定未确认简报';
@@ -922,7 +1073,7 @@ async function run() {
   await openAssessmentThroughUI(window, newTask.id, 'daily', 0, true);
   state = await readState(window);
   let activeTask = state.tasks.find(candidate => candidate.id === newTask.id);
-  assert.equal(activeTask.materials.length, 1, '通过真实文件拖入的材料应保存到新计划');
+  assert.equal(activeTask.materials.length, 5, '通过拖拽和选择导入的五种材料应保存到新计划');
   assert.equal(activeTask.dailyQuizzes['0'].questions.length, 5);
   assert.equal(activeTask.dailyQuizzes['0'].questions.filter(question => question.type === 'choice').length, 2);
   assert.equal(activeTask.dailyQuizzes['0'].questions.filter(question => question.type === 'fill').length, 3);
@@ -1136,6 +1287,82 @@ async function run() {
   assert.equal(adjustedTask.quiz, undefined, '应用调整后应清除原期末测验');
   assert.equal(apiRecords.filter(record => record.purpose === '评分并生成学习报告').length, gradesBeforeDaily1 + 1);
 
+  currentStage = '调整跳过已完成日期时让后一日准备度过期';
+  const sourceForRegression = (await readState(window)).tasks.find(candidate => candidate.id === newTask.id);
+  const regressionTask = structuredClone(sourceForRegression);
+  const now = new Date();
+  const regressionStartDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const regressionDateAt = offset => {
+    const date = new Date(`${regressionStartDate}T00:00:00.000Z`);
+    date.setUTCDate(date.getUTCDate() + offset);
+    return date.toISOString().slice(0, 10);
+  };
+  const regressionTitle = '五日计划跳过已完成日回归';
+  regressionTask.id = 'adjustment-skip-completed-regression';
+  regressionTask.title = regressionTitle;
+  regressionTask.goal = '已完成日之后的日程调整应使日报准备度重新评估。';
+  regressionTask.startDate = regressionStartDate;
+  regressionTask.days = 5;
+  regressionTask.minutesPerDay = 45;
+  regressionTask.plan.summary = regressionTask.goal;
+  const regressionSource = sourceForRegression.plan.days[0].source;
+  regressionTask.plan.days = Array.from({ length: 5 }, (_, index) => ({
+    day: index + 1,
+    date: regressionDateAt(index),
+    title: `回归第 ${index + 1} 天`,
+    minutes: 30,
+    tasks: [`验证第 ${index + 1} 天的计划安排`],
+    source: regressionSource,
+    completed: index === 2
+  }));
+  regressionTask.dailyQuizzes = {
+    '0': makeDailyReadinessQuiz(0, regressionStartDate),
+    '2': makeDailyReadinessQuiz(2, regressionDateAt(2), 'extra')
+  };
+  delete regressionTask.quiz;
+  delete regressionTask.lessons;
+  delete regressionTask.tutorChats;
+  await window.webContents.executeJavaScript(`window.studyApp.saveTask(${JSON.stringify(regressionTask)})`);
+  window = await reloadWindow(window, true, 5);
+  await clickAction(window, 'open-plan', regressionTask.id);
+  await waitForJS(window, `document.querySelector('#appView h1')?.textContent === ${JSON.stringify(regressionTitle)}`, '打开五日回归计划');
+  await openAssessmentThroughUI(window, regressionTask.id, 'daily', 0, false);
+  const requestsBeforeRegression = apiRecords.length;
+  await clickAction(window, 'propose-adjustment', regressionTask.id, { dayIndex: 0 });
+  await waitForJS(window, 'document.querySelector("#adjustmentDialog")?.open && document.querySelectorAll("#adjustmentPreview .adjustment-preview li").length === 3', '显示跳过 D3 的三日调整预览');
+  const regressionPreview = await window.webContents.executeJavaScript('document.querySelector("#adjustmentPreview").innerText');
+  assert.match(regressionPreview, /第 2 天 ·/);
+  assert.match(regressionPreview, /第 4 天 ·/);
+  assert.match(regressionPreview, /第 5 天 ·/);
+  assert.doesNotMatch(regressionPreview, /第 3 天 ·/, '调整预览不得包含已完成的 D3');
+  assert.equal(apiRecords.length, requestsBeforeRegression + 1);
+  const regressionAdjustmentRequest = apiRecords.at(-1);
+  assert.equal(regressionAdjustmentRequest.purpose, '调整后续学习规划');
+  assert.equal(regressionAdjustmentRequest.payload.title, regressionTitle);
+  assert.deepEqual(regressionAdjustmentRequest.payload.upcoming.map(day => day.day), [2, 4, 5], '调整请求应跳过已完成的 D3');
+  await clickAction(window, 'confirm-adjustment');
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(regressionTask.id)})?.dailyQuizzes?.['2']?.readinessStale === true)`, '应用调整后 D3 报告准备度过期');
+  state = await readState(window);
+  const adjustedRegressionTask = state.tasks.find(candidate => candidate.id === regressionTask.id);
+  assert.equal(adjustedRegressionTask.dailyQuizzes['2'].result.score, regressionTask.dailyQuizzes['2'].result.score, 'D3 成绩应保留');
+  assert.deepEqual(adjustedRegressionTask.dailyQuizzes['2'].answers, regressionTask.dailyQuizzes['2'].answers, 'D3 作答应保留');
+  assert.equal(adjustedRegressionTask.dailyQuizzes['2'].readinessStale, true);
+  assert.equal(adjustedRegressionTask.dailyQuizzes['2'].decision, undefined, 'D3 旧补学决定应清除');
+  assert.equal(adjustedRegressionTask.dailyQuizzes['2'].supplementCompleted, undefined, 'D3 旧补学完成状态应清除');
+  assert.equal(adjustedRegressionTask.dailyQuizzes['0'].decision, 'adjusted', '发起调整的 D1 应记录为 adjusted');
+  assert.equal(adjustedRegressionTask.plan.days[2].title, '回归第 3 天', '已完成的 D3 计划应保留');
+  assert.equal(adjustedRegressionTask.plan.days[2].completed, true, '已完成的 D3 状态应保留');
+  for (const dayIndex of [1, 3, 4]) {
+    assert.match(adjustedRegressionTask.plan.days[dayIndex].title, /循环巩固/, `D${dayIndex + 1} 应应用新调整`);
+  }
+  await clickAction(window, 'open-plan', regressionTask.id);
+  await waitForJS(window, `document.querySelector('#appView h1')?.textContent === ${JSON.stringify(regressionTitle)}`, '返回五日回归计划');
+  await clickAction(window, 'open-assessment', regressionTask.id, { kind: 'daily', dayIndex: 2 });
+  await waitForJS(window, 'Boolean(document.querySelector(".report-readiness.readiness-stale"))', 'D3 日报页面显示准备度过期');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("[data-action=choose-extra], [data-action=toggle-supplement], [data-action=propose-adjustment]").length'), 0, '过期的 D3 日报不得提供补学或调整操作');
+  await window.webContents.executeJavaScript(`window.studyApp.deleteTask(${JSON.stringify(regressionTask.id)})`);
+  window = await reloadWindow(window, true, 4);
+
   currentStage = '切回新版概览并保存截图';
   await click(window, '[data-nav="overview"]', '切换到学习概览');
   await waitForJS(window, 'Boolean(document.querySelector("#appView .welcome-panel"))', '学习概览内容');
@@ -1168,6 +1395,70 @@ async function run() {
     assert.equal(state.tasks.find(candidate => candidate.id === originalLegacyTask.id).plan.days[0].title, 'Python 变量与数据类型');
   }
 
+  currentStage = 'English偏好持久化、旧内容保留与新学习流程';
+  const callsBeforeLanguage = apiRecords.length;
+  const tasksBeforeLanguage = fs.readFileSync(path.join(dataDir, 'tasks.json'), 'utf8');
+  const profileBeforeLanguage = fs.readFileSync(path.join(dataDir, 'profile.json'), 'utf8');
+  await click(window, '#profileButton', '打开语言设置');
+  await setValue(window, '#profileNickname', 'Unsaved nickname draft');
+  await setValue(window, '#profileLanguage', 'en');
+  await waitForJS(window, 'window.studyApp.loadState().then(s => s.preferences.language === "en")', 'English偏好已保存');
+  await waitForJS(window, 'document.documentElement.lang === "en" && document.title === "Study Workbench"', '英文界面已应用');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#profileNickname").value'), 'Unsaved nickname draft', '切语言不丢昵称草稿');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'tasks.json'), 'utf8'), tasksBeforeLanguage, '切语言不重写原任务');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'profile.json'), 'utf8'), profileBeforeLanguage, '切语言不改个人资料');
+  assert.equal(apiRecords.length, callsBeforeLanguage, '切语言不发翻译请求');
+  await click(window, '[data-close="profileDialog"]', '关闭语言设置');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("button[data-nav=overview]").innerText'), /overview/i);
+  await clickAction(window, 'open-plan', originalLegacyTask.id);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#appView h1").textContent'), '旧版 Python 计划', '旧计划标题保留原文');
+  const legacyDay = await window.webContents.executeJavaScript(`({
+    title: document.querySelector('.plan-day-info strong')?.textContent,
+    tasks: document.querySelector('.plan-day-info small')?.textContent
+  })`);
+  assert.equal(legacyDay.title, 'Python 变量与数据类型', '旧日程标题切换语言后保留原文');
+  assert.equal(legacyDay.tasks, '理解变量赋值 · 练习字符串和数字类型', '旧日程任务切换语言后保留原文');
+  window = await reloadWindow(window, true, 4);
+  assert.equal((await readState(window)).preferences.language, 'en');
+  await waitForJS(window, 'document.documentElement.lang === "en"', '重开仍是English');
+  await click(window, '[data-action="new-task"]', '新建English计划');
+  await waitForJS(window, 'document.querySelector("#createDialog").open', '英文新建对话框');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#createTitle").textContent'), /plan/i);
+  await setValue(window, '#createForm [name="title"]', 'English study plan');
+  await setValue(window, '#createForm [name="goal"]', 'Learn variables and loops with examples.');
+  await setValue(window, '#createForm [name="days"]', 2);
+  await click(window, '#createSubmit', '生成English学习内容');
+  await waitForJS(window, 'window.studyApp.loadState().then(s => s.tasks.some(t => t.title === "English study plan"))', '英文计划保存');
+  await waitForJS(window, '!document.querySelector("#createDialog").open', '英文创建弹窗已关闭');
+  state = await readState(window);
+  const englishTask = state.tasks.find(task => task.title === 'English study plan');
+  assert.match(englishTask.plan.summary, /Learn variables/);
+  const enPlanRequest = apiRecords.findLast(record => record.purpose === '生成学习计划');
+  assert.equal(enPlanRequest.payload.outputLanguage, 'en');
+  assert.match(enPlanRequest.requestBody.messages[0].content, /in English/);
+  await click(window, '[data-action="open-lesson"][data-day-index="0"]', '打开英文讲解');
+  await click(window, '#generateLesson', '生成英文讲解');
+  await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(t => t.id === ${JSON.stringify(englishTask.id)})?.lessons?.['0']?.brief))`, '英文讲解保存');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#tutoringContent").innerText'), /Concept: variables/);
+  await click(window, '[data-close="tutoringDialog"]', '关闭英文讲解');
+  await openAssessmentThroughUI(window, englishTask.id, 'daily', 0, true);
+  for (const [index, q] of makeAssessmentQuestions('daily').entries()) {
+    if (q.type === 'choice') await chooseRadio(window, `#quizForm input[type="radio"][data-qid="q${index + 1}"][value="A"]`);
+    else await setValue(window, `#quizForm [data-answer][data-qid="q${index + 1}"]`, 'Use the concept in practice.');
+  }
+  await click(window, '#submitQuiz', '评分并生成英文报告');
+  await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(t => t.id === ${JSON.stringify(englishTask.id)})?.dailyQuizzes?.['0']?.result))`, '英文报告保存');
+  const englishResult = (await readState(window)).tasks.find(task => task.id === englishTask.id).dailyQuizzes['0'].result;
+  assert.match(englishResult.report.summary, /daily assessment/);
+  assert.doesNotMatch(englishResult.items[0].feedback, /[\u3400-\u9fff]/u, '本地选择题反馈也必须是英文');
+  const beforeReturnLanguage = apiRecords.length;
+  await click(window, '#profileButton', '切回中文');
+  await setValue(window, '#profileLanguage', 'zh-CN');
+  await waitForJS(window, 'document.documentElement.lang === "zh-CN"', '已切回中文');
+  await click(window, '[data-close="profileDialog"]', '关闭我的');
+  assert.equal(apiRecords.length, beforeReturnLanguage, '切回中文不发API请求');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8')).language, 'zh-CN');
+
   currentStage = '清除 Key、重新锁定并确认任务磁盘内容不变';
   const taskFilePath = path.join(dataDir, 'tasks.json');
   const taskFileBeforeRelock = fs.readFileSync(taskFilePath, 'utf8');
@@ -1186,7 +1477,10 @@ async function run() {
   const clearedSettings = JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8'));
   assert.equal(clearedSettings.encryptedKey, undefined);
   assert.equal(clearedSettings.key, undefined);
-  assert.deepEqual(apiRecords.map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈'].includes(purpose)), [
+  const regressionAdjustmentRequests = apiRecords.filter(record => record.purpose === '调整后续学习规划' && record.payload?.title === regressionTitle);
+  assert.equal(regressionAdjustmentRequests.length, 1, '跳过已完成日回归测试应单独发起一次模拟调整请求');
+  const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record));
+  assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈'].includes(purpose)), [
     '连接测试',
     '生成周期测验',
     '按材料和评分标准评阅学习测验',

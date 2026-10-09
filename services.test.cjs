@@ -383,6 +383,77 @@ test('真实 PDF 提取文字，旧格式与空幻灯片有可读错误', async 
   await assert.rejects(service.parseMaterial(emptyPath), /文字|文本|空/);
 });
 
+test('Markdown 与 TeX 保留原文结构、公式和文件名来源', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'study-text-material-test-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  await fs.writeFile(path.join(dir, 'supplement.md'), 'MD_SIDECAR_SECRET');
+  await fs.writeFile(path.join(dir, 'secret.tex'), 'TEX_SIDECAR_SECRET');
+
+  const markdownContent = '\r\n# 数学导论\r\n\r\n中文公式：$x^2 + y^2 = z^2$\r\n\r\n```tex\r\n\\frac{分子}{分母}\r\n```\r\n[外链](https://example.com)\r\n[附带文件](supplement.md)\r\n';
+  const markdownPath = path.join(dir, 'lecture.MD');
+  await fs.writeFile(markdownPath, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(markdownContent, 'utf8')]));
+  const readFile = fs.readFile;
+  const readPaths = [];
+  fs.readFile = async function trackedReadFile(filePath, ...args) {
+    readPaths.push(path.resolve(filePath));
+    return readFile.call(fs, filePath, ...args);
+  };
+  let markdown;
+  try {
+    markdown = await service.parseMaterial(markdownPath);
+  } finally {
+    fs.readFile = readFile;
+  }
+  assert.deepEqual(readPaths, [markdownPath]);
+  assert.equal(markdown.name, 'lecture.MD');
+  assert.equal(markdown.text, markdownContent.replace(/\r\n?/g, '\n'));
+  assert.equal(markdown.units, 1);
+  assert.equal(markdown.chars, markdown.text.length);
+  assert.doesNotMatch(markdown.text, /MD_SIDECAR_SECRET/);
+  service.validateSource(markdown.name, input({ materials: [{ id: 'md', ...markdown }] }), '知识点来源');
+
+  const texContent = '\r\n\\documentclass{article}\r\n\\begin{document}\r\n中文公式：\\[\\frac{a_1}{b^2} = \\alpha + \\beta\\]\r\n\\input{secret.tex}\r\n\\end{document}\r\n';
+  const texPath = path.join(dir, 'formula.TEX');
+  await fs.writeFile(texPath, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(texContent, 'utf8')]));
+  const tex = await service.parseMaterial(texPath);
+  assert.equal(tex.name, 'formula.TEX');
+  assert.equal(tex.text, texContent.replace(/\r\n?/g, '\n'));
+  assert.equal(tex.units, 1);
+  assert.equal(tex.chars, tex.text.length);
+  assert.doesNotMatch(tex.text, /TEX_SIDECAR_SECRET/);
+  service.validateSource(tex.name, input({ materials: [{ id: 'tex', ...tex }] }), '知识点来源');
+});
+
+test('Markdown 与 TeX 拒绝空文本、过大文件、无效 UTF-8 和二进制内容', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'study-invalid-text-test-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const cases = [
+    ['empty.md', Buffer.alloc(0), /文字|文本|空/],
+    ['blank.tex', Buffer.from(' \r\n\t', 'utf8'), /文字|文本|空/],
+    ['bad-encoding.md', Buffer.from([0x23, 0x20, 0xc3, 0x28]), /UTF-8|编码/],
+    ['binary.tex', Buffer.from('x = 1;\0\n', 'utf8'), /二进制|控制字符/],
+    ['too-many-chars.md', Buffer.from('a'.repeat(200001), 'utf8'), /200,000/]
+  ];
+  for (const [name, contents, error] of cases) {
+    const filePath = path.join(dir, name);
+    await fs.writeFile(filePath, contents);
+    await assert.rejects(service.parseMaterial(filePath), error, name);
+  }
+
+  const oversizedPath = path.join(dir, 'oversized.tex');
+  const oversized = await fs.open(oversizedPath, 'w');
+  try {
+    await oversized.truncate(30 * 1024 * 1024 + 1);
+  } finally {
+    await oversized.close();
+  }
+  await assert.rejects(service.parseMaterial(oversizedPath), /30 MB/);
+
+  const directoryPath = path.join(dir, 'directory.md');
+  await fs.mkdir(directoryPath);
+  await assert.rejects(service.parseMaterial(directoryPath), /不是文件/);
+});
+
 test('DOCX 和 PPTX 按原始 XML 顺序提取超链接、表格、字段与文本 run', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'study-xml-order-test-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));

@@ -27,6 +27,8 @@ tasks.json
 tasks.json.tmp
 profile.json
 profile.json.tmp
+preferences.json
+preferences.json.tmp
 
 # 本地预览与构建中间文件
 界面预览*.png

@@ -6,11 +6,13 @@ const { randomUUID } = require('node:crypto');
 const services = require('./services.cjs');
 const assessments = require('./assessment.cjs');
 const tutoring = require('./tutoring.cjs');
+const i18n = require('./i18n.js');
 
 let window;
 let state;
 let settings;
 let profile;
+let preferences = { language: 'zh-CN' };
 let sessionKey = '';
 const appURL = pathToFileURL(path.join(__dirname, 'index.html')).href;
 if (process.env.STUDY_APP_DATA_DIR) app.setPath('userData', process.env.STUDY_APP_DATA_DIR);
@@ -96,7 +98,7 @@ function credentials() {
       throw new Error('系统无法解密已保存的 API Key，请在设置中重新填写。');
     }
   }
-  return { endpoint: settings.endpoint || '', model: settings.model || '', key };
+  return { endpoint: settings.endpoint || '', model: settings.model || '', key, language: preferences.language };
 }
 
 function activeCredentials() {
@@ -126,8 +128,12 @@ function validateTask(task) {
 
 function handle(channel, callback) {
   ipcMain.handle(channel, async (event, ...args) => {
-    if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== appURL) throw new Error('请求来源无效。');
-    return callback(...args);
+    try {
+      if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== appURL) throw new Error('请求来源无效。');
+      return await callback(...args);
+    } catch (error) {
+      throw new Error(i18n.translateError(error.message, preferences.language));
+    }
   });
 }
 
@@ -143,7 +149,13 @@ async function importMaterialPaths(paths) {
 function registerHandlers() {
   handle('state:load', () => {
     const visibleSettings = publicSettings();
-    return { tasks: visibleSettings.configured ? state.tasks : [], settings: visibleSettings, profile };
+    return { tasks: visibleSettings.configured ? state.tasks : [], settings: visibleSettings, profile, preferences };
+  });
+  handle('preferences:save', (input) => {
+    const next = i18n.validatePreferences(input);
+    writeJSON('preferences.json', next);
+    preferences = next;
+    return preferences;
   });
   handle('profile:save', (input) => {
     const next = normalizeProfile(input);
@@ -174,8 +186,8 @@ function registerHandlers() {
   handle('materials:import', async () => {
     activeCredentials();
     const { canceled, filePaths } = await dialog.showOpenDialog(window, {
-      title: '添加学习材料', properties: ['openFile', 'multiSelections'],
-      filters: [{ name: '学习材料（文字内容）', extensions: ['pdf', 'docx', 'pptx', 'doc', 'ppt'] }]
+      title: preferences.language === 'en' ? 'Add learning materials' : '添加学习材料', properties: ['openFile', 'multiSelections'],
+      filters: [{ name: preferences.language === 'en' ? 'Learning materials (text)' : '学习材料（文字内容）', extensions: ['pdf', 'docx', 'pptx', 'md', 'tex', 'doc', 'ppt'] }]
     });
     if (canceled) return [];
     return importMaterialPaths(filePaths);
@@ -254,15 +266,21 @@ app.on('second-instance', () => {
 
 if (hasInstanceLock) app.whenReady().then(() => {
   try {
+    const firstLanguage = { language: i18n.systemLanguage(app.getLocale()) };
+    preferences = firstLanguage;
+    const hasPreferences = fs.existsSync(file('preferences.json'));
+    preferences = i18n.validatePreferences(readJSON('preferences.json', firstLanguage));
     state = readJSON('tasks.json', { tasks: [] });
     settings = readJSON('settings.json', {});
     profile = normalizeProfile(readJSON('profile.json', { nickname: '', avatar: '' }));
     if (!state || !Array.isArray(state.tasks) || !settings || typeof settings !== 'object') throw new Error('本地存储格式无效，请备份后恢复。');
+    if (!hasPreferences) writeJSON('preferences.json', preferences);
     registerHandlers();
     createWindow();
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   } catch (error) {
-    dialog.showErrorBox('无法打开学习工作台', error.message);
+    const translate = i18n.createTranslator(() => preferences.language);
+    dialog.showErrorBox(translate('无法打开学习工作台'), i18n.translateError(error.message, preferences.language));
     app.quit();
   }
 });
@@ -270,7 +288,7 @@ if (hasInstanceLock) app.whenReady().then(() => {
 function createWindow() {
   window = new BrowserWindow({
     width: 1320, height: 900, minWidth: 850, minHeight: 650,
-    title: '学习工作台', backgroundColor: '#f5f3ed', autoHideMenuBar: true,
+    title: preferences.language === 'en' ? 'Study Workbench' : '学习工作台', backgroundColor: '#f5f3ed', autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

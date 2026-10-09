@@ -3,6 +3,7 @@
 const services = require('./services.cjs');
 const assessment = require('./assessment.cjs');
 const { EXAMPASS_RULES } = require('./exampass.cjs');
+const { languageInstruction, normalizeLanguage } = require('./i18n.js');
 
 const LESSON_DEPTHS = new Set(['brief', 'detailed']);
 const MAX_ATTACHMENT_CONTEXT = 10000;
@@ -250,16 +251,19 @@ async function generateLesson(task, dayIndex, depth, settings = {}) {
   const sources = [...new Set([day.source, ...knowledge.map(item => item.source)])];
   sources.forEach(source => services.validateSource(source, task, '讲解来源'));
   const materials = relevantMaterials(task, sources, target + '\n' + knowledge.map(item => item.title).join('\n'));
+  const supplementLabel = normalizeLanguage(settings.language) === 'en' ? 'General background' : '通识补充';
   const systemMessage = [
     '你是每日学习讲解助手。只讲解给出的当前日任务，不提前讲未来学习内容。',
     EXAMPASS_RULES,
     depth === 'brief' ? '使用简洁讲解，重点帮助学习者快速理解并完成当天任务。' : '使用展开讲解，说明原理、步骤和边界，但严格限定在当天任务。',
     '正文用清晰纯文本分段，必须包含“概念”“例子”“易错点”“练习”四部分，练习恰好一道。',
-    '仅返回 JSON：{"text":string,"sources":string[],"limitations":string[]}。sources 只能逐字选用 payload.allowedSources 中的来源。引用材料时必须包含真实文件名和给定页码或幻灯片编号。材料外的基础知识须在正文中标注“通识补充”。',
-    '材料证据有限时，在 limitations 中说明；不要声称覆盖了未提供或未发送的内容。不要泄露 API 配置或隐藏信息。'
+    '仅返回 JSON：{"text":string,"sources":string[],"limitations":string[]}。sources 只能逐字选用 payload.allowedSources 中的来源。引用材料时必须包含真实文件名和给定页码或幻灯片编号。材料外的基础知识须在正文中标注“' + supplementLabel + '”。',
+    '材料证据有限时，在 limitations 中说明；不要声称覆盖了未提供或未发送的内容。不要泄露 API 配置或隐藏信息。',
+    languageInstruction(settings.language)
   ].join('\n');
   const payload = {
     purpose: '讲解当前日学习内容',
+    outputLanguage: normalizeLanguage(settings.language),
     depth,
     title: task.title,
     day: { day: day.day, date: day.date, title: day.title, tasks: day.tasks, source: day.source },
@@ -269,12 +273,23 @@ async function generateLesson(task, dayIndex, depth, settings = {}) {
   const context = services.boundedContext(payload, materials, services.contextBudget(systemMessage, settings));
   const content = await services.requestChat(settings, systemMessage, context.text, depth === 'brief' ? 2800 : 5200, false, true);
   const response = validateTutoringResponse(services.parseModelJson(content, '每日讲解'), '讲解', sources, task, 12000);
-  if (task.materials.length && !response.limitations.some(item => /(有限|片段|未发送|未覆盖)/.test(item))) {
-    response.limitations.push('本讲解仅依据当天计划和已引用的材料片段，未发送的内容无法核对。');
+  const hasLimitation = response.limitations.some(item => normalizeLanguage(settings.language) === 'en'
+    ? /\b(limited|excerpt|not sent|not covered|cannot verify|could not verify)\b/i.test(item)
+    : /(有限|片段|未发送|未覆盖)/.test(item));
+  if (task.materials.length && !hasLimitation) {
+    response.limitations.push(normalizeLanguage(settings.language) === 'en'
+      ? "This lesson uses today's plan and the cited material excerpts; content that was not sent could not be checked."
+      : '本讲解仅依据当天计划和已引用的材料片段，未发送的内容无法核对。');
   }
   if (!task.materials.length) {
-    if (!response.text.includes('通识补充')) response.text += '\n\n通识补充：未提供附件，基础说明依据学习目标与计划知识。';
-    response.limitations.push('未提供原始材料，无法核对课程材料中的特定定义或要求。');
+    if (!response.text.includes(supplementLabel)) {
+      response.text += normalizeLanguage(settings.language) === 'en'
+        ? '\n\nGeneral background: No attachments were provided; this explanation is based on the learning goal and planned knowledge.'
+        : '\n\n通识补充：未提供附件，基础说明依据学习目标与计划知识。';
+    }
+    response.limitations.push(normalizeLanguage(settings.language) === 'en'
+      ? 'No original course materials were provided, so course-specific definitions and requirements could not be verified.'
+      : '未提供原始材料，无法核对课程材料中的特定定义或要求。');
   }
   if (response.text.length > 12000 || response.limitations.length > 10) fail('每日讲解结果超出长度限制。');
   return response;
@@ -325,10 +340,12 @@ async function answerQuestion(task, selector, questionId, messages, settings = {
     '你是错题追问辅导助手。回答用户最后一条消息，围绕当前题目解释思路、常见误区并给一个简短例子。',
     EXAMPASS_RULES,
     '不要直接照抄标准答案作为回复；可以解释答案背后的关键概念。只使用给定参考、作答、评分反馈和相关知识，不要索要或声称读取原始材料。',
-    '仅返回 JSON：{"text":string,"sources":string[],"limitations":string[]}。回复不超过 6,000 字；sources 只能逐字选用 payload.allowedSources。材料不足时在 limitations 中说明。'
+    '仅返回 JSON：{"text":string,"sources":string[],"limitations":string[]}。回复不超过 6,000 字；sources 只能逐字选用 payload.allowedSources。材料不足时在 limitations 中说明。',
+    languageInstruction(settings.language)
   ].join('\n');
   const payload = {
     purpose: '解释当前测验题和评分反馈',
+    outputLanguage: normalizeLanguage(settings.language),
     question: { id: question.id, type: question.type, question: question.question, options: question.options },
     reference: question.reference,
     standardAnswer: question.type === 'choice'
@@ -344,8 +361,13 @@ async function answerQuestion(task, selector, questionId, messages, settings = {
   const context = services.boundedContext(payload, [], services.contextBudget(systemMessage, settings));
   const content = await services.requestChat(settings, systemMessage, context.text, 2600, false, true);
   const response = validateTutoringResponse(services.parseModelJson(content, '错题追问'), '追问', allowedSources, task, 6000);
-  if (!response.limitations.some(item => /(未发送|未提供|无法核对)/.test(item))) {
-    response.limitations.push('本次只依据当前题目、参考、作答、评分反馈和相关知识清单，未重新发送原材料。');
+  const hasMaterialLimitation = response.limitations.some(item => normalizeLanguage(settings.language) === 'en'
+    ? /\b(not sent|not provided|cannot verify|could not verify|without the original material)\b/i.test(item)
+    : /(未发送|未提供|无法核对)/.test(item));
+  if (!hasMaterialLimitation) {
+    response.limitations.push(normalizeLanguage(settings.language) === 'en'
+      ? 'This reply uses only the current question, reference, answer, grading feedback and related knowledge list; the original material was not sent again.'
+      : '本次只依据当前题目、参考、作答、评分反馈和相关知识清单，未重新发送原材料。');
   }
   if (response.limitations.length > 10) fail('错题追问结果超出长度限制。');
   return response;
