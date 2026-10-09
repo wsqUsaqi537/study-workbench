@@ -80,9 +80,9 @@
         <label class="field discussion-input"><span>补充说明或回复</span><textarea id="clarifyInput" rows="2" maxlength="4000" placeholder="例如：我会参加期末考试，希望多安排真题练习。"></textarea></label>
         <div class="discussion-actions"><span class="discussion-hint">讨论内容仅用于本次计划。</span><button id="clarifySubmit" class="button button-small button-outline" type="button">开始讨论目标</button><button id="confirmBrief" class="button button-small button-primary" type="button" hidden>确认学习范围</button></div>
       </section>
-      <section class="attachment-box" aria-labelledby="attachmentTitle">
+      <section id="materialDropZone" class="attachment-box" aria-labelledby="attachmentTitle">
         <div class="attachment-heading"><div><span class="section-kicker">可选</span><h3 id="attachmentTitle">学习材料</h3></div><button class="button button-small button-outline" type="button" data-action="import-create">＋ 添加材料</button></div>
-        <p>读取 PDF、DOCX、PPTX 中的文字。旧版 DOC/PPT 请先转换；扫描件暂不识别。</p>
+        <p>点击添加，或将 PDF、DOCX、PPTX 拖入此处。旧版 DOC/PPT 请先转换；扫描件暂不识别。</p>
         <div id="createMaterials" class="attachment-list"></div>
       </section>
       <label id="createConsentWrap" class="consent-row" hidden><input id="createConsent" type="checkbox"><span><strong>我同意发送本次添加的材料文字</strong><small>生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。</small></span></label>
@@ -113,9 +113,9 @@
       <h2 id="settingsTitle">API 设置</h2>
       <p class="dialog-intro">连接兼容 OpenAI Chat Completions 的服务后，才能创建计划、生成知识清单和 AI 测验。配置保存在本地。</p>
       <div id="settingsMessage" class="form-message" role="status" aria-live="polite" hidden></div>
-      <label class="field"><span>API 地址 <i>*</i></span><input id="apiEndpoint" name="endpoint" type="url" placeholder="https://api.example.com/v1/chat/completions" maxlength="2000" autocomplete="url"></label>
-      <p class="field-hint">可填写完整接口地址或服务基础地址。远程地址需使用 HTTPS。</p>
-      <label class="field"><span>模型名称 <i>*</i></span><input id="apiModel" name="model" type="text" placeholder="填写服务支持的模型标识" maxlength="200" autocomplete="off"></label>
+      <label class="field"><span>API 地址 <i>*</i></span><input id="apiEndpoint" name="endpoint" type="url" placeholder="https://api.deepseek.com" maxlength="2000" autocomplete="url"></label>
+      <p class="field-hint">可填写完整接口地址或服务基础地址；远程地址需使用 HTTPS。DeepSeek 示例：API 地址 https://api.deepseek.com；模型 deepseek-flash。</p>
+      <label class="field"><span>模型名称 <i>*</i></span><input id="apiModel" name="model" type="text" placeholder="deepseek-flash" maxlength="200" autocomplete="off"></label>
       <label class="field"><span>API Key</span><input id="apiKey" name="key" type="password" placeholder="" maxlength="4000" autocomplete="new-password"><small id="keyState" class="key-state"></small></label>
       <label id="clearKeyRow" class="check-row" hidden><input id="clearKey" type="checkbox"><span>清除已保存的 API Key</span></label>
       <div class="settings-footnote"><span class="lock-mark" aria-hidden="true">◈</span><span>应用优先使用系统加密保存 Key；若系统加密不可用，会提示 Key 仅保留在本次运行。界面只读取是否已配置，不会读取已保存的 Key。</span></div>
@@ -142,6 +142,14 @@
     <div class="material-meta" id="materialMeta"></div>
     <pre id="materialText" class="material-text"></pre>
     <div class="dialog-actions"><button class="button button-primary" type="button" data-close="materialDialog">完成</button></div>
+  </dialog>
+
+  <dialog id="adjustmentDialog" class="app-dialog adjustment-dialog" aria-labelledby="adjustmentTitle">
+    <div class="dialog-topline"><span class="eyebrow">后续计划预览</span><button class="dialog-close" type="button" data-action="cancel-adjustment" aria-label="关闭">×</button></div>
+    <h2 id="adjustmentTitle">确认调整未完成日程</h2>
+    <p class="dialog-intro">请检查调整内容。确认后会替换所列未完成日期，并清除这些日期的每日小测和原期末测验。</p>
+    <div id="adjustmentPreview"></div>
+    <div class="dialog-actions"><button class="button button-quiet" type="button" data-action="cancel-adjustment">取消</button><button class="button button-primary" type="button" data-action="confirm-adjustment">确认并应用</button></div>
   </dialog>
 </body>
 </html>

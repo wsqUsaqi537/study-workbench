@@ -4,6 +4,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
 const services = require('./services.cjs');
+const assessments = require('./assessment.cjs');
 
 let window;
 let state;
@@ -117,6 +118,7 @@ function validateTask(task) {
     if (typeof day.title !== 'string' || day.title.length > 300 || !Number.isFinite(day.minutes) || day.minutes < 1 || day.minutes > task.minutesPerDay) throw new Error('每日计划内容或时间无效。');
     if (typeof day.completed !== 'boolean') throw new Error('完成状态无效。');
   });
+  assessments.validateAssessmentRecords(task);
   if (JSON.stringify(task).length > 2500000) throw new Error('单个任务数据过大，请减少材料。');
 }
 
@@ -125,6 +127,15 @@ function handle(channel, callback) {
     if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== appURL) throw new Error('请求来源无效。');
     return callback(...args);
   });
+}
+
+async function importMaterialPaths(paths) {
+  if (!Array.isArray(paths) || paths.length > 10 || paths.some(filePath => typeof filePath !== 'string' || !path.isAbsolute(filePath) || filePath.length > 4096)) {
+    throw new Error('每次最多添加 10 份有效的本机材料。');
+  }
+  const materials = [];
+  for (const filePath of paths) materials.push({ id: randomUUID(), ...await services.parseMaterial(filePath) });
+  return materials;
 }
 
 function registerHandlers() {
@@ -165,13 +176,26 @@ function registerHandlers() {
       filters: [{ name: '学习材料（文字内容）', extensions: ['pdf', 'docx', 'pptx', 'doc', 'ppt'] }]
     });
     if (canceled) return [];
-    if (filePaths.length > 10) throw new Error('每次最多添加 10 份材料。');
-    const materials = [];
-    for (const filePath of filePaths) materials.push({ id: randomUUID(), ...await services.parseMaterial(filePath) });
-    return materials;
+    return importMaterialPaths(filePaths);
   });
+  handle('materials:drop', (paths) => { activeCredentials(); return importMaterialPaths(paths); });
   handle('learning:clarify', (payload) => services.clarifyGoal(payload, activeCredentials()));
   handle('plan:generate', (input) => services.generatePlan(input, activeCredentials()));
+  handle('assessment:generate', (payload) => {
+    const config = activeCredentials();
+    validateTask(payload?.task);
+    return assessments.generateAssessment(payload.task, payload.selector, config);
+  });
+  handle('assessment:grade', (payload) => {
+    const config = activeCredentials();
+    validateTask(payload?.task);
+    return assessments.gradeAssessment(payload.task, payload.selector, payload.answers, config);
+  });
+  handle('plan:adjust', (payload) => {
+    const config = activeCredentials();
+    validateTask(payload?.task);
+    return assessments.proposeAdjustment(payload.task, payload.dayIndex, config);
+  });
   handle('quiz:generate', (task) => { const config = activeCredentials(); validateTask(task); return services.generateQuiz(task, config); });
   handle('quiz:grade', (payload) => { const config = activeCredentials(); validateTask(payload?.task); return services.gradeQuiz(payload.task, payload.answers, config); });
   handle('settings:save', (input) => {

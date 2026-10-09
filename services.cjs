@@ -614,7 +614,7 @@ function boundedContext(payload, materials, maxChars) {
   return { text, truncated: materials.some((material, index) => material.text.length > low) };
 }
 
-async function requestChat(settings, systemMessage, userMessage, maxTokens, connectionTest = false) {
+async function requestChat(settings, systemMessage, userMessage, maxTokens, connectionTest = false, efficient = false) {
   const config = endpointUrl(settings);
   if (systemMessage.length + userMessage.length > MAX_CONTEXT_CHARS) {
     fail('API 请求超过 60,000 字符上限。');
@@ -630,8 +630,8 @@ async function requestChat(settings, systemMessage, userMessage, maxTokens, conn
     response_format: { type: 'json_object' },
     max_tokens: maxTokens
   };
-  // DeepSeek 默认先思考；连接探测只需短确认，避免思考耗尽输出预算。
-  if (connectionTest && new URL(config.url).hostname === 'api.deepseek.com') {
+  // DeepSeek 默认先思考；探测和新评估的小型结构化任务均关闭思考以控制时延和成本。
+  if ((connectionTest || efficient) && new URL(config.url).hostname === 'api.deepseek.com') {
     requestBody.thinking = { type: 'disabled' };
   }
   const controller = new AbortController();
@@ -729,7 +729,7 @@ async function generatePlan(input, settings = {}) {
     '只返回一个合法 JSON 对象，不要 Markdown、代码围栏或额外文字。',
     'JSON 结构必须为 {\"summary\":string,\"difficulty\":\"入门\"|\"进阶\"|\"较难\",\"warnings\":string[],\"knowledge\":[{\"title\":string,\"priority\":\"重点\"|\"了解\",\"explanation\":string,\"source\":string}],\"days\":[{\"day\":number,\"date\":\"YYYY-MM-DD\",\"title\":string,\"minutes\":number,\"tasks\":string[],\"source\":string}]}。knowledge 必须有 1 至 30 条。',
     'knowledge 每项标题不超过 300 字，说明不超过 2,000 字，source 不超过 2,000 字。priority 只能是“重点”或“了解”；不得无依据称为“必考”。',
-    'days 必须按输入给出的天数和日期逐日完整输出；分钟数为正整数且不超过每日预算；最后一天必须安排测试。每天最多 2 个任务，每个任务不超过 120 字，标题不超过 60 字。',
+    'days 必须按输入给出的天数和日期逐日完整输出；分钟数为正整数且不超过每日预算。每天学习结束时都安排 5 题小测，并给出明确的测验用时；测验时间计入当天 minutes，不得超出每日预算。最后一天除当日 5 题小测外，还安排覆盖本周期知识的 10 题周期测验，并给出明确用时，同样计入当天 minutes。每天最多 3 个任务，每个任务不超过 120 字，标题不超过 60 字。',
     'source 必须引用真实的输入材料名称及其文本中存在的页码/幻灯片标记；如果材料没有可提取的位置标记，只引用材料名称，不要编造页码。没有材料时写“主题与学习目标”。',
     '引用多份材料时，每份先写完整文件名，再写对应位置，以分号分隔，例如“A.pdf 第 1 页；B.pptx 第 2 张幻灯片”。',
     '材料不足以支持某个知识点或安排时，不要编造；在 warnings 中说明限制。'
@@ -981,5 +981,14 @@ module.exports = {
   endpointUrl,
   boundedContext,
   parseModelJson,
-  formatDate
+  formatDate,
+  exactKeys,
+  isPlainObject,
+  requireString,
+  validateSource,
+  validateKnowledge,
+  validateInput,
+  requestChat,
+  contextBudget,
+  requireApiConfiguration
 };

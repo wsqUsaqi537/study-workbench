@@ -9,9 +9,11 @@
   let currentView = 'overview';
   let selectedTaskId = null;
   let createMaterials = [];
+  let materialImportBusy = false;
   let editingTaskId = null;
   let toastTimer = null;
-  let quizBusyTaskId = null;
+  let assessmentSelector = { kind: 'final' };
+  let proposedAdjustment = null;
   let stateLoaded = false;
   let configEpoch = 0;
   let settingsRequestId = 0;
@@ -24,14 +26,16 @@
   let profileAvatar = '';
   let profileSession = 0;
   let profileBusy = false;
-  const quizGradeRequests = new Set();
+  const assessmentGradeRequests = new Set();
   const quizRequests = new Map();
   const quizDrafts = new Map();
+  const assessmentBusyKeys = new Set();
+  const taskSaveQueues = new Map();
   const sessionConsent = new Set();
 
   const viewNames = {
     overview: '学习概览', today: '今日安排', plans: '全部计划', 'plan-detail': '计划详情',
-    materials: '材料库', quiz: '阶段测验'
+    materials: '材料库', quiz: '学习测评'
   };
 
   function escapeHTML(value) {
@@ -40,6 +44,60 @@
 
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
+  }
+
+  function sameValue(left, right) {
+    return left === right || JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  function mergeTaskChanges(base, proposed, latest, path = 'task') {
+    if (sameValue(base, proposed)) return latest === undefined ? undefined : clone(latest);
+    if (Array.isArray(base) && Array.isArray(proposed) && Array.isArray(latest)
+      && base.length === proposed.length && proposed.length === latest.length) {
+      return proposed.map((item, index) => mergeTaskChanges(base[index], item, latest[index], `${path}[${index}]`));
+    }
+    const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    if (isObject(base) && isObject(proposed)) {
+      const merged = isObject(latest) ? clone(latest) : {};
+      const keys = new Set([...Object.keys(base), ...Object.keys(proposed)]);
+      for (const key of keys) {
+        const hasBase = Object.prototype.hasOwnProperty.call(base, key);
+        const hasProposed = Object.prototype.hasOwnProperty.call(proposed, key);
+        const hasLatest = isObject(latest) && Object.prototype.hasOwnProperty.call(latest, key);
+        if (!hasProposed) {
+          if (hasBase) delete merged[key];
+          continue;
+        }
+        if (!hasBase) {
+          if (hasLatest && !sameValue(latest[key], proposed[key])) {
+            if (isObject(proposed[key]) && isObject(latest[key])) {
+              merged[key] = mergeTaskChanges({}, proposed[key], latest[key], `${path}.${key}`);
+            } else throw new Error('这份计划已被同时修改，本次保存已取消，请重新操作。');
+          } else merged[key] = clone(proposed[key]);
+          continue;
+        }
+        merged[key] = mergeTaskChanges(base[key], proposed[key], hasLatest ? latest[key] : undefined, `${path}.${key}`);
+      }
+      return merged;
+    }
+    if (!sameValue(latest, base) && !sameValue(latest, proposed)) {
+      throw new Error('这份计划已被同时修改，本次保存已取消，请重新操作。');
+    }
+    return proposed === undefined ? undefined : clone(proposed);
+  }
+
+  async function withTaskSaveLock(taskId, operation) {
+    const previous = taskSaveQueues.get(taskId);
+    let release;
+    const lock = new Promise(resolve => { release = resolve; });
+    taskSaveQueues.set(taskId, lock);
+    if (previous) await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (taskSaveQueues.get(taskId) === lock) taskSaveQueues.delete(taskId);
+    }
   }
 
   function localDateString(date = new Date()) {
@@ -100,17 +158,76 @@
     return Array.isArray(task?.plan?.days) ? task.plan.days : [];
   }
 
-  function quizDraftKey(task) {
-    const questions = Array.isArray(task?.quiz?.questions) ? task.quiz.questions : [];
-    return `${task?.id || ''}:${JSON.stringify(questions.map(question => [question.id, question.question]))}`;
+  function assessmentKey(taskId, selector) {
+    return `${taskId}:${selector.kind}:${selector.kind === 'daily' ? selector.dayIndex : ''}`;
+  }
+
+  function assessmentFor(task, selector) {
+    return selector.kind === 'daily'
+      ? task?.dailyQuizzes?.[String(selector.dayIndex)]
+      : task?.quiz;
+  }
+
+  function assessmentTaskContext(task) {
+    return {
+      id: task.id,
+      title: task.title,
+      goal: task.goal,
+      brief: task.brief,
+      learningMode: task.learningMode,
+      level: task.level,
+      days: task.days,
+      minutesPerDay: task.minutesPerDay,
+      plan: task.plan,
+      materials: task.materials || []
+    };
+  }
+
+  function assessmentGenerationSnapshot(task, selector) {
+    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null });
+  }
+
+  function assessmentGradeSnapshot(task, selector) {
+    const history = Object.entries(task.dailyQuizzes || {})
+      .filter(([dayIndex, quiz]) => quiz?.result && (selector.kind === 'final' || Number(dayIndex) < selector.dayIndex))
+      .sort(([left], [right]) => Number(left) - Number(right))
+      .map(([dayIndex, quiz]) => [dayIndex, quiz.result]);
+    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null, history });
+  }
+
+  function adjustmentInputSnapshot(task, dayIndex) {
+    const selector = { kind: 'daily', dayIndex };
+    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null });
+  }
+
+  function adjustmentAssessmentSnapshot(task, dayIndices) {
+    return JSON.stringify({
+      final: task.quiz || null,
+      daily: dayIndices.map(dayIndex => [dayIndex, task.dailyQuizzes?.[String(dayIndex)] || null])
+    });
+  }
+
+  function selectorFromForm(form) {
+    return form.dataset.kind === 'daily'
+      ? { kind: 'daily', dayIndex: Number(form.dataset.dayIndex) }
+      : { kind: 'final' };
+  }
+
+  function assessmentDraftKey(task, selector) {
+    const quiz = assessmentFor(task, selector);
+    const questions = Array.isArray(quiz?.questions) ? quiz.questions : [];
+    return `${assessmentKey(task?.id || '', selector)}:${JSON.stringify(questions.map(question => [question.id, question.question]))}`;
   }
 
   function saveQuizDraft(field) {
     const form = field.closest('#quizForm');
     if (!form || !field.dataset.qid) return;
     const task = getTask(form.dataset.taskId);
-    if (!task?.quiz?.questions || task.quiz.result) return;
-    const key = quizDraftKey(task);
+    if (!task) return;
+    const selector = selectorFromForm(form);
+    const quiz = assessmentFor(task, selector);
+    if (!quiz?.questions || quiz.result || (field.type === 'radio' && !field.checked)) return;
+    const key = assessmentDraftKey(task, selector);
     const drafts = quizDrafts.get(key) || {};
     const answer = { ...(drafts[field.dataset.qid] || {}) };
     if (field.matches('[data-answer]')) answer.text = field.value;
@@ -178,7 +295,9 @@
     dot.classList.toggle('is-ready', apiEnabled());
     dot.setAttribute('aria-label', apiEnabled() ? 'API 已配置' : 'API 未配置');
     dot.title = apiEnabled() ? '模型服务已配置' : '未配置模型服务';
-    $('#crumbCurrent').textContent = viewNames[currentView] || '学习概览';
+    $('#crumbCurrent').textContent = currentView === 'quiz'
+      ? (assessmentSelector.kind === 'daily' ? '每日小测 / 日报' : '期末测验 / 周期报告')
+      : viewNames[currentView] || '学习概览';
   }
 
   function renderSidebar() {
@@ -259,7 +378,11 @@
     const entries = todayEntries();
     const header = `<div class="page-head"><div class="page-head-copy"><span class="eyebrow">TODAY / ${escapeHTML(localDateString())}</span><h1>今日安排</h1><p>${escapeHTML(todayLabel())}。把注意力放在当前这一步。</p></div><div class="page-head-actions"><button class="button button-outline" type="button" data-nav="plans">查看全部计划</button><button class="button button-primary" type="button" data-action="new-task">＋ 新建计划</button></div></div>`;
     if (!state.tasks.length) return `${header}${emptyState()}`;
-    const todayList = entries.length ? `<div class="plan-list">${entries.map(({ task, day, index }) => `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(day.title)}</h3><p>${escapeHTML(task.title)} · ${Number(day.minutes) || 0} 分钟</p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}">编辑今日内容</button></div></div><div class="plan-days"><div class="plan-day-row is-today"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(task.title)}</strong><small>${escapeHTML((day.tasks || []).join(' · '))}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}" aria-pressed="${Boolean(day.completed)}">✓</button></div></div></div></article>`).join('')}</div>` : `<section class="panel"><div class="panel-heading"><div><span class="panel-kicker">TODAY / 留白</span><h2>今天没有安排好的学习任务</h2><p>已保存的计划还在这里，可以查看接下来的日程。</p></div></div><div class="focus-content"><div class="empty-inline"><span class="empty-inline-mark" aria-hidden="true">✳</span><div class="empty-inline-copy"><strong>空出来的时间也可以好好休息</strong><p>或者给下一个目标安排一个开始日期。</p></div><button class="button button-small button-outline" type="button" data-action="new-task">创建计划</button></div></div></section>`;
+    const todayList = entries.length ? `<div class="plan-list">${entries.map(({ task, day, index }) => {
+      const dailyQuiz = assessmentFor(task, { kind: 'daily', dayIndex: index });
+      const dailyLabel = dailyQuiz?.result ? '查看日报' : dailyQuiz?.questions?.length ? '继续每日小测' : '每日小测';
+      return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(day.title)}</h3><p>${escapeHTML(task.title)} · ${Number(day.minutes) || 0} 分钟</p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}">编辑今日内容</button></div></div><div class="plan-days"><div class="plan-day-row is-today"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(task.title)}</strong><small>${escapeHTML((day.tasks || []).join(' · '))}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}" aria-pressed="${Boolean(day.completed)}">✓</button><button class="button button-small button-outline day-assessment-action" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="daily" data-day-index="${index}">${dailyLabel}</button></div></div></div></article>`;
+    }).join('')}</div>` : `<section class="panel"><div class="panel-heading"><div><span class="panel-kicker">TODAY / 留白</span><h2>今天没有安排好的学习任务</h2><p>已保存的计划还在这里，可以查看接下来的日程。</p></div></div><div class="focus-content"><div class="empty-inline"><span class="empty-inline-mark" aria-hidden="true">✳</span><div class="empty-inline-copy"><strong>空出来的时间也可以好好休息</strong><p>或者给下一个目标安排一个开始日期。</p></div><button class="button button-small button-outline" type="button" data-action="new-task">创建计划</button></div></div></section>`;
     return `${header}${todayList}${entries.length ? '<div class="page-head section-head-spaced"><div class="page-head-copy"><span class="eyebrow">NEXT STEPS</span><h2 class="section-page-title">接下来几天</h2><p>提前看看，不必一次完成所有事情。</p></div></div>' + renderUpcomingRows() : ''}`;
   }
 
@@ -272,8 +395,10 @@
 
   function dayRow(task, day, index, editable = true) {
     const isToday = day.date === localDateString();
-    const tasksPreview = Array.isArray(day.tasks) ? day.tasks.slice(0, 3).join(' · ') : '';
-    return `<div class="plan-day-row ${isToday ? 'is-today' : ''}"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(day.title)}</strong><small>${escapeHTML(tasksPreview)}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}：${escapeHTML(day.title)}" aria-pressed="${Boolean(day.completed)}">✓</button>${editable ? `<button class="row-edit" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="编辑 ${escapeHTML(day.title)}" title="编辑这一天">✎</button>` : ''}</div></div>`;
+    const dayTasks = Array.isArray(day.tasks) ? day.tasks : [];
+    const tasksPreview = (editable ? dayTasks : dayTasks.slice(0, 3)).join(' · ');
+    const quiz = assessmentFor(task, { kind: 'daily', dayIndex: index });
+    return `<div class="plan-day-row ${isToday ? 'is-today' : ''}"><div class="plan-day-date"><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))}</strong>第 ${Number(day.day) || index + 1} 天</div><div class="plan-day-info"><strong>${escapeHTML(day.title)}</strong><small>${escapeHTML(tasksPreview)}</small></div><div class="plan-day-right"><span class="plan-source">${escapeHTML(day.source || '计划安排')}</span><button class="tiny-check" type="button" data-action="toggle-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="${day.completed ? '标记为未完成' : '标记为已完成'}：${escapeHTML(day.title)}" aria-pressed="${Boolean(day.completed)}">✓</button><button class="button button-small button-outline day-assessment-action" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="daily" data-day-index="${index}">${quiz?.result ? '查看日报' : quiz?.questions?.length ? '继续每日小测' : '每日小测'}</button>${editable ? `<button class="row-edit" type="button" data-action="edit-day" data-task-id="${escapeHTML(task.id)}" data-day-index="${index}" aria-label="编辑 ${escapeHTML(day.title)}" title="编辑这一天">✎</button>` : ''}</div></div>`;
   }
 
   function planCard(task, expanded = true) {
@@ -288,10 +413,9 @@
       : '<section class="plan-knowledge plan-knowledge-history"><span class="panel-kicker">KNOWLEDGE / 知识清单</span><p>这份旧计划没有单独保存知识清单，原有学习日程仍可查看。</p></section>';
     const body = expanded ? `${knowledge}<div class="plan-days">${days.map((day, index) => dayRow(task, day, index)).join('')}</div>` : '';
     const warningMarkup = warnings.length ? `<div class="plan-warnings" role="note"><strong>生成提示</strong><ul>${warnings.map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : '';
-    const quizNeedsAI = task.quiz && task.quiz.mode !== 'ai' && !task.quiz.result;
-    const quizLabel = quizNeedsAI ? '生成 AI 测验' : task.quiz ? '查看测验' : '生成测验';
-    const quizAction = quizNeedsAI ? 'retake-quiz' : 'open-test';
-    return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(task.title)}</h3><p>${escapeHTML(summary)} · ${days.length} 天 · 已完成 ${completed} 天 · 开始于 ${escapeHTML(formatDate(task.startDate, { year: 'numeric', month: 'numeric', day: 'numeric' }))} <span class="mode-badge ${mode}">${modeLabel}</span></p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="${quizAction}" data-task-id="${escapeHTML(task.id)}">${quizLabel}</button><button class="button button-small button-outline" type="button" data-action="export-task" data-task-id="${escapeHTML(task.id)}">导出 JSON</button><button class="button button-small button-quiet" type="button" data-action="delete-task" data-task-id="${escapeHTML(task.id)}">删除</button></div></div>${warningMarkup}${body}</article>`;
+    const finalLabel = task.quiz?.result ? '查看周期报告' : task.quiz?.version === 2 && task.quiz?.questions?.length ? '继续期末测验' : task.quiz && task.quiz.mode === 'ai' && !task.quiz.version ? '继续旧版测验' : '生成10题期末测验';
+    const finalRetake = Boolean(task.quiz && task.quiz.mode !== 'ai' && !task.quiz.result);
+    return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(task.title)}</h3><p>${escapeHTML(summary)} · ${days.length} 天 · 已完成 ${completed} 天 · 开始于 ${escapeHTML(formatDate(task.startDate, { year: 'numeric', month: 'numeric', day: 'numeric' }))} <span class="mode-badge ${mode}">${modeLabel}</span></p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="final" ${finalRetake ? 'data-retake="true"' : ''}>${finalLabel}</button><button class="button button-small button-outline" type="button" data-action="export-task" data-task-id="${escapeHTML(task.id)}">导出 JSON</button><button class="button button-small button-quiet" type="button" data-action="delete-task" data-task-id="${escapeHTML(task.id)}">删除</button></div></div>${warningMarkup}${body}</article>`;
   }
 
   function summaryRow() {
@@ -350,47 +474,96 @@
   function quizConsentCard(task) {
     if (!needsMaterialConsent(task)) return '';
     const checked = sessionConsent.has(task.id);
-    return `<div class="quiz-side-card"><h3>材料隐私确认</h3><p>本计划包含材料文字。生成 AI 测验或提交答案前，材料文字会发送到已配置的服务。</p><label class="consent-row"><input type="checkbox" data-action="quiz-consent" data-task-id="${escapeHTML(task.id)}" ${checked ? 'checked' : ''}><span><strong>我同意本次向服务发送材料文字</strong><small>同意状态只保存在当前应用会话中。</small></span></label></div>`;
+    return `<div class="quiz-side-card"><h3>材料隐私确认</h3><p>请求会发送本计划相关学习内容与作答；旧版计划必要时可能包含材料文字。</p><label class="consent-row"><input type="checkbox" data-action="quiz-consent" data-task-id="${escapeHTML(task.id)}" ${checked ? 'checked' : ''}><span><strong>我同意本次向服务发送相关内容</strong><small>同意状态只保存在当前应用会话中。</small></span></label></div>`;
+  }
+
+  function reportList(title, values) {
+    const entries = Array.isArray(values) ? values.filter(value => typeof value === 'string' && value.trim()) : [];
+    return entries.length ? `<div class="report-list"><strong>${escapeHTML(title)}</strong><ul>${entries.map(value => `<li>${escapeHTML(value)}</li>`).join('')}</ul></div>` : '';
+  }
+
+  function canAdjustAfter(task, dayIndex, quiz) {
+    const today = localDateString();
+    return !quiz?.readinessStale && quiz?.result?.report?.readyForNext === false && countDays(task).some((day, index) => index > dayIndex && day.date >= today && !day.completed);
+  }
+
+  function renderAssessmentReport(task, selector, quiz) {
+    const result = quiz.result;
+    const report = result.report && typeof result.report === 'object' ? result.report : {};
+    const isDaily = selector.kind === 'daily';
+    const readinessStale = Boolean(quiz.readinessStale);
+    const readiness = readinessStale ? '判断已过期' : report.readyForNext === true ? '可以继续下一步' : report.readyForNext === false ? '建议先补齐基础' : '本次不判断准备程度';
+    const decisionText = readinessStale ? '' : quiz.decision === 'adjusted'
+      ? '<p class="result-feedback">后续未完成日程已按你确认的调整方案更新。</p>'
+      : quiz.decision === 'extra'
+        ? `<p class="result-feedback">本次选择了补学方案，${quiz.supplementCompleted ? '已标记完成。' : '尚未标记完成。'}</p>`
+        : '';
+    const decisionActions = readinessStale ? '' : quiz.decision === 'extra'
+      ? `<button class="button button-small button-outline" type="button" data-action="toggle-supplement" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${quiz.supplementCompleted ? '撤销补学完成' : '标记补学完成'}</button>`
+      : quiz.decision === 'adjusted' ? '' : report.readyForNext === false ? `<button class="button button-small button-outline" type="button" data-action="choose-extra" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>按补学任务继续</button>${canAdjustAfter(task, selector.dayIndex, quiz) ? `<button class="button button-small button-primary" type="button" data-action="propose-adjustment" data-task-id="${escapeHTML(task.id)}" data-day-index="${selector.dayIndex}">预览调整后续计划</button>` : ''}` : '';
+    const feedbackMarkup = result.feedback && result.feedback !== report.summary ? `<p class="result-feedback">${escapeHTML(result.feedback)}</p>` : '';
+    return `<section class="learning-report" aria-live="polite"><div class="result-panel-head"><div><span class="panel-kicker">${isDaily ? '每日学习报告' : '周期学习报告'}</span><h3>${isDaily ? '本日掌握情况' : '阶段学习回顾'}</h3></div><div class="result-score">${escapeHTML(result.score)}<small>满分 100</small></div></div><p class="result-feedback">${escapeHTML(report.summary || result.feedback || '本次反馈已保存。')}</p>${feedbackMarkup}<div class="report-readiness ${readinessStale ? 'readiness-stale' : ''}"><strong>准备程度：${readiness}</strong>${readinessStale ? '<p>下一日任务已变更，这份报告的继续学习判断需重新评估。成绩和作答仍保留；重新生成并提交测评后会更新判断。</p>' : report.reason ? `<p>${escapeHTML(report.reason)}</p>` : ''}</div>${reportList('薄弱点', result.weakPoints)}${reportList('本次表现', report.strengths)}${reportList('下一步建议', report.nextSteps)}${report.extraMinutes ? `<div class="report-list"><strong>建议补学 · ${Number(report.extraMinutes) || 0} 分钟</strong><ul>${(Array.isArray(report.extraTasks) ? report.extraTasks : []).map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : ''}${decisionText}<div class="report-actions"><button class="button button-small button-outline" type="button" data-action="export-report" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>导出纯文本报告</button>${decisionActions}</div></section>`;
   }
 
   function renderQuiz(task) {
-    if (!task) return `${emptyState()}`;
-    const days = countDays(task);
-    const lastDay = days.slice().sort((a, b) => String(a.date).localeCompare(String(b.date))).at(-1);
-    const beforeEnd = lastDay?.date && localDateString() < lastDay.date;
-    const quiz = task.quiz;
-    const introNote = quiz?.mode === 'ai'
-      ? `${quiz.generatedDate ? `题目生成于 ${formatDate(quiz.generatedDate, { year: 'numeric', month: 'long', day: 'numeric' })}。` : '题目生成日期未记录。'}${beforeEnd ? `计划末日是 ${formatDate(lastDay.date, { year: 'numeric', month: 'long', day: 'numeric' })}，现在可以提前自测。` : ''}AI 题目与反馈仅供参考。`
-      : '旧版测验仅作为历史记录保留。';
-    const head = `<div class="page-head"><div class="page-head-copy"><span class="eyebrow">RECALL / 复习与检验</span><h1>${escapeHTML(task.title)}</h1><p>任何时候都可以查看或参加测试，测验帮助你发现下一步要补上的内容。</p></div><div class="page-head-actions"><button class="button button-outline" type="button" data-action="open-plan" data-task-id="${escapeHTML(task.id)}">返回计划</button></div></div>`;
-    if (quizBusyTaskId === task.id) return `${head}<section class="panel quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">正在准备</span><h2>正在生成阶段测验…</h2><p>题目会依据这份计划生成。</p></div></section>`;
+    if (!task) return emptyState();
+    const selector = assessmentSelector;
+    const quiz = assessmentFor(task, selector);
+    const key = assessmentKey(task.id, selector);
+    const isDaily = selector.kind === 'daily';
+    const day = isDaily ? countDays(task)[selector.dayIndex] : null;
+    if (isDaily && !day) return `${emptyState()}`;
+    const count = selector.kind === 'daily' ? 5 : 10;
+    const label = isDaily ? '每日小测' : '期末测验';
+    const reportLabel = isDaily ? '日报' : '周期报告';
+    const busy = assessmentBusyKeys.has(key);
+    const head = `<div class="page-head"><div class="page-head-copy"><span class="eyebrow">${isDaily ? 'DAILY / 每日检验' : 'FINAL / 周期检验'}</span><h1>${escapeHTML(isDaily ? day.title : task.title)}</h1><p>${escapeHTML(isDaily ? `${task.title} · ${formatDate(day.date, { month: 'long', day: 'numeric' })}` : '覆盖本计划知识清单，回顾整个学习周期。')}</p></div><div class="page-head-actions"><button class="button button-outline" type="button" data-action="open-plan" data-task-id="${escapeHTML(task.id)}">返回计划</button></div></div>`;
+    if (busy) return `${head}<section class="panel quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">正在准备</span><h2>正在生成${label}…</h2><p>保存完成后会在这里复用题目。</p></div></section>`;
+    const consentRequired = needsMaterialConsent(task) && !sessionConsent.has(task.id);
     if (!quiz?.questions?.length) {
-      const consentRequired = needsMaterialConsent(task) && !sessionConsent.has(task.id);
-      return `${head}<div class="quiz-layout"><div class="quiz-main"><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">5 QUESTIONS / AI 阶段测验</span><h2>开始一场阶段测验</h2><p>AI 会根据学习计划生成五道题，并在提交后评估你的回答。</p></div><div class="quiz-intro-note">${escapeHTML(introNote)}</div></section>${consentRequired ? `<div class="form-message warning-message">本计划包含材料文字。请先在右侧勾选同意，之后才会向模型服务发送请求；未同意时不会触发远程生成。</div>` : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">${consentRequired ? '当前还没有请求模型服务。' : '参考答案和评分标准会在提交后显示。'}</span><button class="button button-primary" type="button" data-action="generate-quiz" data-task-id="${escapeHTML(task.id)}">生成阶段测验</button></div></div><aside class="quiz-side"><section class="quiz-side-card"><h3>这份测验</h3><p>共 5 道题，题型可包含计算、代码和论述。所有回答均由模型评分。</p></section>${quizConsentCard(task)}</aside></div>`;
-    }
-    const questions = quiz.questions.slice(0, 5);
-    if (questions.length !== 5) {
-      return `${head}<div class="form-message error-message">服务返回了 ${questions.length} 道题，当前测验需要 5 道题。请重新生成测验或检查服务配置。</div><button class="button button-outline" type="button" data-action="retake-quiz" data-task-id="${escapeHTML(task.id)}">重新生成</button>`;
+      const description = isDaily ? '根据当天任务生成 5 道选择或填空题。' : '根据整份计划生成 10 道选择或填空题，最多包含 2 道简答。';
+      return `${head}<div class="quiz-layout"><div class="quiz-main"><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">${count} QUESTIONS / AI 测评</span><h2>开始${label}</h2><p>${description}</p></div></section>${consentRequired ? '<div class="form-message warning-message">本计划包含材料文字。请先在右侧勾选同意，之后才会向模型服务发送请求。</div>' : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">题目会保存到本计划，之后可直接查看和作答。</span><button class="button button-primary" type="button" data-action="generate-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>生成${count}题${label}</button></div></div><aside class="quiz-side"><section class="quiz-side-card"><h3>这份测评</h3><p>共 ${count} 道题。答案和反馈会在提交后显示。</p></section>${quizConsentCard(task)}</aside></div>`;
     }
     const submitted = Boolean(quiz.result);
-    const isLegacy = quiz.mode !== 'ai';
-    if (isLegacy && !submitted) {
-      return `${head}<section class="panel legacy-quiz-note"><span class="panel-kicker">历史题目</span><h2>这份旧版测验不能继续作答</h2><p>重新生成 AI 测验后，你就可以作答并获得模型评分。</p><button class="button button-primary" type="button" data-action="retake-quiz" data-task-id="${escapeHTML(task.id)}">生成 AI 测验</button></section>`;
+    const isVersion2 = quiz.version === 2;
+    const isLegacyAI = !isVersion2 && quiz.mode === 'ai';
+    const isLegacy = !isVersion2;
+    if (isLegacy && !isLegacyAI && !submitted) {
+      return `${head}<section class="panel legacy-quiz-note"><span class="panel-kicker">历史题目</span><h2>这份旧版测验只能查看</h2><p>重新生成 10 题期末测验后，可以继续作答并获得周期报告。</p><button class="button button-primary" type="button" data-action="generate-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="final">生成10题期末测验</button></section>${quizConsentCard(task)}`;
+    }
+    const questions = Array.isArray(quiz.questions) ? quiz.questions.slice(0, isVersion2 ? count : 5) : [];
+    if (isVersion2 && questions.length !== count) {
+      return `${head}<div class="form-message error-message">保存的题目数量与${label}要求不符。请明确选择重新生成。</div><button class="button button-outline" type="button" data-action="retake-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>重新生成</button>`;
     }
     const answerMap = quiz.answers || {};
-    const draftMap = submitted ? {} : quizDrafts.get(quizDraftKey(task)) || {};
+    const draftMap = submitted ? {} : quizDrafts.get(assessmentDraftKey(task, selector)) || {};
     const questionFields = questions.map((question, index) => {
       const answer = submitted ? (answerMap[question.id] || {}) : (draftMap[question.id] || answerMap[question.id] || {});
-      const reference = submitted && (question.reference || question.rubric) ? `<details class="question-reference-details"><summary>查看参考要点与评分标准</summary><div class="question-reference">${question.reference ? `<strong>参考要点</strong><p>${escapeHTML(question.reference)}</p>` : ''}${question.rubric ? `<strong>评分标准</strong><small>${escapeHTML(question.rubric)}</small>` : ''}</div></details>` : '';
-      return `<article class="quiz-question"><div class="question-head"><span class="question-index">${index + 1}</span><span>${isLegacy ? '历史题目' : 'AI 测验'}</span></div><h3>${escapeHTML(question.question || '')}</h3><textarea name="answer-${index}" maxlength="4000" ${isLegacy ? '' : 'data-answer'} data-qid="${escapeHTML(question.id)}" aria-label="第 ${index + 1} 题答案" placeholder="用自己的话写下理解…" ${submitted || isLegacy ? 'readonly' : 'required'}>${escapeHTML(answer.text || '')}</textarea>${reference}</article>`;
+      const questionType = isVersion2 ? question.type : 'short';
+      let input;
+      if (questionType === 'choice') {
+        const selected = answer.text || '';
+        input = `<fieldset class="quiz-options" aria-label="第 ${index + 1} 题选项"><legend>请选择一项</legend>${question.options.map((option, optionIndex) => {
+          const letter = 'ABCD'[optionIndex];
+          const optionText = String(option).replace(/^[A-D][.、)）]\s*/, '');
+          return `<label class="quiz-option"><input type="radio" name="answer-${index}" value="${letter}" data-answer data-qid="${escapeHTML(question.id)}" ${selected === letter ? 'checked' : ''} ${submitted ? 'disabled' : 'required'}><span>${letter}. ${escapeHTML(optionText)}</span></label>`;
+        }).join('')}</fieldset>`;
+      } else if (questionType === 'fill') {
+        input = `<input class="quiz-fill" type="text" maxlength="4000" data-answer data-qid="${escapeHTML(question.id)}" aria-label="第 ${index + 1} 题答案" placeholder="填写答案" value="${escapeHTML(answer.text || '')}" ${submitted ? 'readonly' : 'required'}>`;
+      } else {
+        input = `<textarea maxlength="4000" data-answer data-qid="${escapeHTML(question.id)}" aria-label="第 ${index + 1} 题答案" placeholder="用自己的话写下理解…" ${submitted ? 'readonly' : 'required'}>${escapeHTML(answer.text || '')}</textarea>`;
+      }
+      const reference = submitted ? `<details class="question-reference-details"><summary>查看参考答案与评分标准</summary><div class="question-reference">${questionType === 'choice' ? `<strong>正确选项</strong><p>${escapeHTML(question.answer || '')}</p>` : ''}${question.reference ? `<strong>参考要点</strong><p>${escapeHTML(question.reference)}</p>` : ''}${question.rubric ? `<strong>评分标准</strong><small>${escapeHTML(question.rubric)}</small>` : ''}</div></details>` : '';
+      const item = submitted ? quiz.result.items?.find(resultItem => resultItem.id === question.id) : null;
+      return `<article class="quiz-question"><div class="question-head"><span class="question-index">${index + 1}</span><span>${isLegacy ? '历史题目' : label}</span></div><h3>${escapeHTML(question.question || '')}</h3>${input}${submitted && item ? `<p class="result-feedback">${escapeHTML(item.feedback || '')} · ${Number(item.score) || 0} 分</p>` : ''}${reference}</article>`;
     }).join('');
-    const action = isLegacy
-      ? `<button class="button button-primary" type="button" data-action="retake-quiz" data-task-id="${escapeHTML(task.id)}">生成 AI 测验</button>`
-      : submitted
-        ? `<button class="button button-outline" type="button" data-action="retake-quiz" data-task-id="${escapeHTML(task.id)}">重新生成 AI 测验</button>`
-        : `<button class="button button-primary" type="submit" id="submitQuiz">提交本次测试</button>`;
-    const consentMissing = !isLegacy && needsMaterialConsent(task) && !sessionConsent.has(task.id);
-    return `${head}<div class="quiz-layout"><form id="quizForm" class="quiz-main" data-task-id="${escapeHTML(task.id)}"><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">${isLegacy ? '历史测验记录' : 'AI ASSISTED / AI 测验'}</span><h2>${escapeHTML(task.plan?.difficulty || '学习测验')}</h2><p>${isLegacy ? '仅显示此前已提交的历史答案与结果。' : '用自己的表达完成回答，提交后由模型评分。'}</p></div><div class="quiz-intro-note">${escapeHTML(introNote)}</div></section>${consentMissing ? '<div class="form-message warning-message">AI 评分会发送本计划材料文字。请先在右侧勾选同意；未同意时不会提交远程请求。</div>' : ''}${questionFields}${submitted ? renderResult(quiz) : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">${submitted ? '结果已保存在这份学习计划中。' : '参考答案与评分标准会在提交后显示。'}</span>${action}</div></form><aside class="quiz-side"><section class="quiz-side-card"><h3>本次练习</h3><p>主题：${escapeHTML(task.title)}<br>模式：${isLegacy ? '历史记录' : 'AI 参考反馈'}<br>题目：5 道</p></section>${quizConsentCard(task)}<section class="quiz-side-card"><h3>回顾与反馈</h3><p>所有新测验答案由模型评分。参考答案和评分标准只在提交后显示。</p></section></aside></div>`;
+    const selectorAttrs = `data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}`;
+    const retake = submitted ? `<button class="button button-small button-outline" type="button" data-action="retake-assessment" data-task-id="${escapeHTML(task.id)}" ${selectorAttrs}>重新生成${count}题${label}</button>` : '';
+    const legacyAction = isLegacyAI && !submitted ? `<button class="button button-small button-outline" type="button" data-action="retake-assessment" data-task-id="${escapeHTML(task.id)}" ${selectorAttrs}>升级为新题型</button>` : '';
+    const submitAction = `<button class="button button-primary" type="submit" id="submitQuiz">${isLegacyAI ? '提交旧版测试并评分' : `提交并生成${reportLabel}`}</button>`;
+    const action = submitted ? retake : isLegacyAI ? `${submitAction}${legacyAction}` : submitAction;
+    const materialNotice = !submitted && consentRequired ? '<div class="form-message warning-message">请求会发送本计划相关学习内容与作答；旧版计划必要时可能包含材料文字。请先在右侧勾选同意。</div>' : '';
+    return `${head}<div class="quiz-layout"><form id="quizForm" class="quiz-main" data-task-id="${escapeHTML(task.id)}" ${selectorAttrs}><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">${isLegacy ? '历史测验记录' : `${count} QUESTIONS / ${label}`}</span><h2>${escapeHTML(isDaily ? day.title : task.plan?.difficulty || '学习测验')}</h2><p>${isLegacy ? '显示此前保存的历史答案与结果。' : '选项在答题时可见；参考答案和评分反馈会在提交后显示。'}</p></div>${quiz.generatedDate ? `<div class="quiz-intro-note">题目生成于 ${escapeHTML(formatDate(quiz.generatedDate, { year: 'numeric', month: 'long', day: 'numeric' }))}。</div>` : ''}</section>${materialNotice}${questionFields}${submitted && !isVersion2 ? renderResult(quiz) : ''}${submitted && isVersion2 ? renderAssessmentReport(task, selector, quiz) : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">${submitted ? '题目与报告已保存在这份学习计划中。' : '答题草稿只保存在当前应用会话中。'}</span>${action}</div></form><aside class="quiz-side"><section class="quiz-side-card"><h3>本次练习</h3><p>主题：${escapeHTML(task.title)}<br>测评：${label}<br>题目：${isLegacy ? '旧版 5 题' : `${count} 道`}</p></section>${quizConsentCard(task)}<section class="quiz-side-card"><h3>回顾与反馈</h3><p>${submitted ? `已生成${reportLabel}，结果可导出为纯文本。` : '结果保存后关闭页面也可继续查看。'}</p></section></aside></div>`;
   }
 
   function render() {
@@ -435,26 +608,43 @@
     return true;
   }
 
-  async function saveTask(task, nextView = currentView, expectedEpoch = configEpoch) {
+  async function saveTask(task, nextView = currentView, expectedEpoch = configEpoch, baseTask = undefined, latestGuard = null) {
     if (expectedEpoch !== configEpoch || !apiEnabled()) throw new Error('模型服务配置已变化，请重新操作。');
     if (!api?.saveTask) throw new Error('学习服务未连接，无法保存任务。');
-    const saved = await api.saveTask(task);
-    if (expectedEpoch !== configEpoch || !apiEnabled()) return null;
-    const fresh = await api.loadState();
-    if (expectedEpoch !== configEpoch || !apiEnabled()) return null;
-    state.tasks = Array.isArray(fresh?.tasks) ? fresh.tasks : [];
-    state.settings = fresh?.settings || state.settings;
-    if (!apiEnabled()) {
-      state.tasks = [];
-      selectedTaskId = null;
-      currentView = 'overview';
+    const taskId = task.id;
+    const base = baseTask === undefined ? getTask(taskId) : baseTask;
+    const baseSnapshot = base ? clone(base) : null;
+    const proposed = clone(task);
+    return withTaskSaveLock(taskId, async () => {
+      if (expectedEpoch !== configEpoch || !apiEnabled()) throw new Error('模型服务配置已变化，请重新操作。');
+      const beforeSave = await api.loadState();
+      if (expectedEpoch !== configEpoch) return null;
+      state.settings = beforeSave?.settings || state.settings;
+      if (!apiEnabled()) return null;
+      const latest = Array.isArray(beforeSave?.tasks) ? beforeSave.tasks.find(item => item.id === taskId) : null;
+      if (baseSnapshot && !latest) throw new Error('这份计划已被删除，本次保存已取消。');
+      if (latestGuard && (!latest || !latestGuard(latest))) throw new Error('相关学习内容已变化，本次保存已取消，请重新操作。');
+      const saveValue = baseSnapshot && latest
+        ? mergeTaskChanges(baseSnapshot, proposed, latest)
+        : proposed;
+      const saved = await api.saveTask(saveValue);
+      if (expectedEpoch !== configEpoch) return null;
+      const fresh = await api.loadState();
+      if (expectedEpoch !== configEpoch) return null;
+      state.settings = fresh?.settings || state.settings;
+      state.tasks = apiEnabled() && Array.isArray(fresh?.tasks) ? fresh.tasks : [];
+      if (!apiEnabled()) {
+        state.tasks = [];
+        selectedTaskId = null;
+        currentView = 'overview';
+        render();
+        return null;
+      }
+      selectedTaskId = saved.id;
+      currentView = nextView;
       render();
-      return null;
-    }
-    selectedTaskId = saved.id;
-    currentView = nextView;
-    render();
-    return saved;
+      return saved;
+    });
   }
 
   function resetGoalDiscussion(clearInput = true) {
@@ -565,25 +755,59 @@
     refreshCreateConsent();
   }
 
+  function addImportedMaterials(imported, sessionId, epoch) {
+    if (sessionId !== createSessionId || epoch !== configEpoch || !apiEnabled() || !$('#createDialog').open) return;
+    if (!Array.isArray(imported) || imported.length === 0) return;
+    const existing = new Set(createMaterials.map(item => item.id));
+    const added = imported.filter(item => item && !existing.has(item.id));
+    if (!added.length) return;
+    const totalCount = createMaterials.length + added.length;
+    const totalChars = createMaterials.reduce((sum, item) => sum + (typeof item.text === 'string' ? item.text.length : Number(item.chars) || 0), 0)
+      + added.reduce((sum, item) => sum + (typeof item.text === 'string' ? item.text.length : Number(item.chars) || 0), 0);
+    if (totalCount > 10) throw new Error('一个学习计划最多添加 10 份材料。');
+    if (totalChars > 200000) throw new Error('材料文字总量不能超过 200,000 字，请移除部分材料后重试。');
+    createMaterials.push(...added);
+    setMessage($('#createError'), '');
+    invalidateGoalDiscussion();
+    renderCreateMaterials();
+    toast(`已添加 ${added.length} 份材料，可预览或移除。`);
+  }
+
   async function importMaterials() {
     if (!apiEnabled()) return openSettings();
     if (createActivity) return toast('当前操作完成后再添加材料。');
+    if (materialImportBusy) return toast('正在导入材料，请稍候。');
     if (!api?.importMaterials) return toast('当前运行环境没有文件导入服务。');
     const sessionId = createSessionId;
     const epoch = configEpoch;
+    materialImportBusy = true;
     try {
       const imported = await api.importMaterials();
-      if (sessionId !== createSessionId || epoch !== configEpoch || !apiEnabled() || !$('#createDialog').open) return;
-      if (!Array.isArray(imported) || imported.length === 0) return;
-      const existing = new Set(createMaterials.map(item => item.id));
-      const added = imported.filter(item => !existing.has(item.id));
-      if (!added.length) return;
-      createMaterials.push(...added);
-      invalidateGoalDiscussion();
-      renderCreateMaterials();
-      toast(`已添加 ${added.length} 份材料，可预览或移除。`);
+      addImportedMaterials(imported, sessionId, epoch);
     } catch (error) {
       if (sessionId === createSessionId && epoch === configEpoch && $('#createDialog').open) setMessage($('#createError'), error.message || '导入材料失败，请检查文件后重试。');
+    } finally {
+      materialImportBusy = false;
+    }
+  }
+
+  async function importDroppedMaterials(files) {
+    if (!apiEnabled()) return openSettings();
+    if (createActivity) return toast('当前操作完成后再添加材料。');
+    if (!api?.importDroppedMaterials) return toast('当前运行环境没有拖入材料服务。');
+    if (!files.length) return;
+    if (materialImportBusy) return toast('正在导入材料，请稍候。');
+    if (createMaterials.length + files.length > 10) return setMessage($('#createError'), '一个学习计划最多添加 10 份材料。');
+    const sessionId = createSessionId;
+    const epoch = configEpoch;
+    materialImportBusy = true;
+    try {
+      const imported = await api.importDroppedMaterials(files);
+      addImportedMaterials(imported, sessionId, epoch);
+    } catch (error) {
+      if (sessionId === createSessionId && epoch === configEpoch && $('#createDialog').open) setMessage($('#createError'), error.message || '导入材料失败，请检查文件后重试。');
+    } finally {
+      materialImportBusy = false;
     }
   }
 
@@ -872,7 +1096,7 @@
     const next = clone(task);
     next.plan.days[index].completed = !Boolean(day.completed);
     try {
-      const saved = await saveTask(next, currentView);
+      const saved = await saveTask(next, currentView, configEpoch, task);
       if (!saved) return;
       toast(next.plan.days[index].completed ? '已记录这一天的完成。' : '已将这一天恢复为未完成。');
     } catch (error) {
@@ -903,14 +1127,47 @@
     if (!task || !countDays(task)[index]) return setMessage($('#editDayError'), '找不到要编辑的计划日期，请关闭后重试。');
     if (!title) return setMessage($('#editDayError'), '请填写当天标题。');
     if (!tasks.length) return setMessage($('#editDayError'), '请至少保留一项学习任务。');
+    const day = countDays(task)[index];
+    const changed = title !== day.title || JSON.stringify(tasks) !== JSON.stringify(day.tasks || []);
+    const dailyQuizExists = Boolean(task.dailyQuizzes?.[String(index)]);
+    const finalQuizExists = Boolean(task.quiz);
+    const previousQuiz = index > 0 ? task.dailyQuizzes?.[String(index - 1)] : null;
+    const previousReportExists = Boolean(previousQuiz?.result);
+    if (changed && (dailyQuizExists || finalQuizExists || previousReportExists)) {
+      const confirmed = window.confirm('修改当天学习内容会清除这一天的每日小测和期末测验；前一日已保存日报会保留成绩与作答，但继续学习判断将标记为需重新评估，并撤销补学决定。其他日期的日报会保留。确定保存修改吗？');
+      if (!confirmed) return;
+    }
     const next = clone(task);
     next.plan.days[index].title = title;
     next.plan.days[index].tasks = tasks;
+    if (changed) {
+      if (next.dailyQuizzes && typeof next.dailyQuizzes === 'object') delete next.dailyQuizzes[String(index)];
+      delete next.quiz;
+      const stalePreviousQuiz = index > 0 ? next.dailyQuizzes?.[String(index - 1)] : null;
+      if (stalePreviousQuiz?.result) {
+        stalePreviousQuiz.readinessStale = true;
+        delete stalePreviousQuiz.decision;
+        delete stalePreviousQuiz.supplementCompleted;
+      }
+    }
+    const editGuard = latest => {
+      const latestDay = countDays(latest)[index];
+      const latestPreviousQuiz = index > 0 ? latest.dailyQuizzes?.[String(index - 1)] || null : null;
+      return Boolean(latestDay)
+        && latestDay.title === day.title
+        && sameValue(latestDay.tasks || [], day.tasks || [])
+        && sameValue(latest.dailyQuizzes?.[String(index)] || null, task.dailyQuizzes?.[String(index)] || null)
+        && sameValue(latest.quiz || null, task.quiz || null)
+        && sameValue(latestPreviousQuiz, previousQuiz || null);
+    };
     try {
-      const saved = await saveTask(next, currentView);
+      const saved = await saveTask(next, currentView, configEpoch, task, editGuard);
       if (!saved) return;
       $('#editDayDialog').close();
-      toast('每日安排已保存。');
+      const impactMessages = [];
+      if (changed && (dailyQuizExists || finalQuizExists)) impactMessages.push('受影响的测验已清除');
+      if (changed && previousReportExists) impactMessages.push('前一日报的继续学习判断已失效');
+      toast(impactMessages.length ? `每日安排已保存；${impactMessages.join('；')}。` : '每日安排已保存。');
     } catch (error) {
       if (apiEnabled()) setMessage($('#editDayError'), error.message || '保存每日安排失败，请重试。');
     }
@@ -924,13 +1181,16 @@
     if (!confirmed) return;
     const epoch = configEpoch;
     try {
-      const result = await api.deleteTask(taskId);
-      if (epoch !== configEpoch || !apiEnabled()) return;
-      if (result !== true) throw new Error('删除没有完成，请重试。');
-      const reloaded = await reloadState(epoch);
-      if (!reloaded || epoch !== configEpoch || !apiEnabled()) return;
-      sessionConsent.delete(taskId);
-      toast('学习计划已删除。');
+      await withTaskSaveLock(taskId, async () => {
+        if (epoch !== configEpoch || !apiEnabled()) return;
+        const result = await api.deleteTask(taskId);
+        if (epoch !== configEpoch || !apiEnabled()) return;
+        if (result !== true) throw new Error('删除没有完成，请重试。');
+        const reloaded = await reloadState(epoch);
+        if (!reloaded || epoch !== configEpoch || !apiEnabled()) return;
+        sessionConsent.delete(taskId);
+        toast('学习计划已删除。');
+      });
     } catch (error) {
       if (epoch === configEpoch && apiEnabled()) toast(error.message || '删除学习计划失败。');
     }
@@ -955,67 +1215,82 @@
     toast('任务 JSON 已导出，不包含 API 配置。');
   }
 
-  async function openTest(taskId, retake = false) {
+  async function openAssessment(taskId, selector, retake = false) {
     if (!apiEnabled()) return openSettings();
     const task = getTask(taskId);
     if (!task) return;
-    if (retake && task.quiz?.result) {
-      const confirmed = window.confirm('重新测试会替换这份计划中已保存的答案和反馈。确定开始新的测试吗？');
-      if (!confirmed) return;
-    }
-    const mustGenerate = retake || !task.quiz?.questions?.length;
-    if (mustGenerate && quizBusyTaskId) return toast('已有测验正在生成，请稍候。');
+    assessmentSelector = selector.kind === 'daily'
+      ? { kind: 'daily', dayIndex: Number(selector.dayIndex) }
+      : { kind: 'final' };
+    const quiz = assessmentFor(task, assessmentSelector);
+    const legacyBasic = quiz && quiz.version !== 2 && quiz.mode !== 'ai' && !quiz.result;
+    if (legacyBasic) retake = true;
     selectedTaskId = task.id;
     currentView = 'quiz';
-    if (!mustGenerate) {
-      render();
-      return;
+    if (retake && quiz?.questions?.length) {
+      const confirmed = window.confirm('重新生成会替换这份测评中已保存的题目、答案和报告。确定继续吗？');
+      if (!confirmed) { render(); return; }
     }
-    if (quizRequests.has(task.id)) return toast('这份测验正在生成，请稍候。');
+    const mustGenerate = retake || !quiz?.questions?.length;
+    if (!mustGenerate) { render(); return; }
     if (needsMaterialConsent(task) && !sessionConsent.has(task.id)) {
       render();
       toast('请先确认是否允许发送本计划的材料文字。');
       return;
     }
-    const previousQuestions = JSON.stringify(task.quiz?.questions || null);
-    const previousGeneratedDate = task.quiz?.generatedDate || '';
-    const taskSnapshot = JSON.stringify(task);
+    const key = assessmentKey(task.id, assessmentSelector);
+    const requestKey = `${key}:generate`;
+    if (quizRequests.has(requestKey)) return toast('这份测评正在生成，请稍候。');
+    const inputSnapshot = assessmentGenerationSnapshot(task, assessmentSelector);
     const epoch = configEpoch;
     const requestId = makeId();
-    quizRequests.set(task.id, requestId);
-    quizBusyTaskId = task.id;
+    const requestedSelector = clone(assessmentSelector);
+    quizRequests.set(requestKey, requestId);
+    assessmentBusyKeys.add(key);
     render();
     try {
-      const quiz = await api.generateQuiz(task);
-      if (epoch !== configEpoch || !apiEnabled() || quizRequests.get(taskId) !== requestId) return;
-      if (!quiz || !Array.isArray(quiz.questions) || quiz.questions.length !== 5) throw new Error('服务没有返回 5 道题，请检查配置后重试。');
+      if (typeof api.generateAssessment !== 'function') throw new Error('当前运行环境尚未提供新测评服务。');
+      const generated = await api.generateAssessment(task, requestedSelector);
+      if (epoch !== configEpoch || !apiEnabled() || quizRequests.get(requestKey) !== requestId) return;
+      const expectedCount = requestedSelector.kind === 'daily' ? 5 : 10;
+      if (!generated || generated.version !== 2 || !Array.isArray(generated.questions) || generated.questions.length !== expectedCount) {
+        throw new Error(`服务没有返回符合要求的 ${expectedCount} 道题，请检查配置后重试。`);
+      }
       const latest = getTask(taskId);
-      if (!latest) {
-        toast('计划已删除，生成的测验没有保存。');
-        return;
-      }
-      if (JSON.stringify(latest) !== taskSnapshot || JSON.stringify(latest.quiz?.questions || null) !== previousQuestions || (latest.quiz?.generatedDate || '') !== previousGeneratedDate) {
-        toast('这份计划中的测验已更新，旧请求的结果没有保存。');
-        return;
-      }
+      if (!latest) { toast('计划已删除，生成的题目没有保存。'); return; }
+      if (assessmentGenerationSnapshot(latest, requestedSelector) !== inputSnapshot) { toast('相关学习内容已更新，旧请求的题目没有保存。'); return; }
       const next = clone(latest);
-      next.quiz = { ...quiz, generatedDate: localDateString() };
-      delete next.quiz.answers;
-      delete next.quiz.result;
-      delete next.quiz.resultDate;
-      const saved = await saveTask(next, 'quiz', epoch);
+      const savedQuiz = {
+        ...generated,
+        version: 2,
+        mode: 'ai',
+        kind: requestedSelector.kind,
+        dayIndex: requestedSelector.kind === 'daily' ? requestedSelector.dayIndex : null,
+        generatedDate: localDateString()
+      };
+      delete savedQuiz.answers;
+      delete savedQuiz.result;
+      delete savedQuiz.resultDate;
+      delete savedQuiz.decision;
+      delete savedQuiz.supplementCompleted;
+      delete savedQuiz.readinessStale;
+      if (requestedSelector.kind === 'daily') {
+        if (!next.dailyQuizzes || typeof next.dailyQuizzes !== 'object') next.dailyQuizzes = {};
+        next.dailyQuizzes[String(requestedSelector.dayIndex)] = savedQuiz;
+      } else next.quiz = savedQuiz;
+      quizDrafts.delete(assessmentDraftKey(latest, requestedSelector));
+      const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGenerationSnapshot(latestTask, requestedSelector) === inputSnapshot);
       if (!saved) return;
-      quizDrafts.delete(quizDraftKey(latest));
-      quizDrafts.delete(quizDraftKey(next));
+      quizDrafts.delete(assessmentDraftKey(next, requestedSelector));
     } catch (error) {
       if (epoch === configEpoch && apiEnabled()) {
         render();
-        toast(error.message || '生成测验失败，请稍后重试。');
+        toast(error.message || '生成测评失败，请稍后重试。');
       }
     } finally {
-      if (quizRequests.get(taskId) === requestId) {
-        quizRequests.delete(taskId);
-        if (quizBusyTaskId === taskId) quizBusyTaskId = null;
+      if (quizRequests.get(requestKey) === requestId) {
+        quizRequests.delete(requestKey);
+        assessmentBusyKeys.delete(key);
         render();
       }
     }
@@ -1026,60 +1301,251 @@
     if (!apiEnabled()) return openSettings();
     const form = event.target.closest('#quizForm');
     const taskId = form.dataset.taskId;
+    const selector = selectorFromForm(form);
     const task = getTask(taskId);
-    if (!task?.quiz?.questions || task.quiz.mode !== 'ai' || task.quiz.result) return;
-    if (quizGradeRequests.has(taskId)) return;
-    const requestedQuestions = JSON.stringify(task.quiz.questions);
-    const requestedGeneratedDate = task.quiz.generatedDate || '';
-    const taskSnapshot = JSON.stringify(task);
+    const quiz = assessmentFor(task, selector);
+    if (!quiz?.questions || quiz.result) return;
+    const legacyAI = quiz.version !== 2 && quiz.mode === 'ai';
+    if (quiz.version !== 2 && !legacyAI) return;
+    const key = assessmentKey(taskId, selector);
+    const requestKey = `${key}:grade`;
+    if (assessmentGradeRequests.has(requestKey)) return;
+    const inputSnapshot = assessmentGradeSnapshot(task, selector);
     const epoch = configEpoch;
     if (needsMaterialConsent(task) && !sessionConsent.has(task.id)) {
       toast('请先勾选同意，AI 评分才会向模型服务发送请求。');
       return;
     }
     const answers = {};
-    const questionFields = $$('[data-answer]', form);
-    for (let index = 0; index < questionFields.length; index += 1) {
-      const answerField = questionFields[index];
-      const id = answerField.dataset.qid;
-      const text = answerField.value.trim();
-      if (!text) return toast(`请先填写第 ${index + 1} 题的回答。`);
-      answers[id] = { text };
+    const questions = Array.isArray(quiz.questions) ? quiz.questions : [];
+    for (let index = 0; index < questions.length; index += 1) {
+      const question = questions[index];
+      const fields = $$('[data-answer]', form).filter(field => field.dataset.qid === question.id);
+      const field = fields.find(item => item.type !== 'radio') || fields.find(item => item.checked);
+      const text = String(field?.value || '').trim();
+      if (!text) { toast(`请先完成第 ${index + 1} 题。`); return; }
+      answers[question.id] = { text };
     }
     const button = $('#submitQuiz', form);
     const requestId = makeId();
-    quizGradeRequests.add(taskId);
-    quizRequests.set(`grade:${taskId}`, requestId);
-    setBusy(button, true, '正在生成反馈');
+    assessmentGradeRequests.add(requestKey);
+    quizRequests.set(requestKey, requestId);
+    setBusy(button, true, '正在生成报告');
     try {
-      const result = await api.gradeQuiz({ task, answers });
-      if (epoch !== configEpoch || !apiEnabled() || quizRequests.get(`grade:${taskId}`) !== requestId) return;
-      if (!result || typeof result !== 'object') throw new Error('服务没有返回有效的反馈结果。');
+      const result = legacyAI
+        ? await api.gradeQuiz({ task, answers })
+        : await api.gradeAssessment({ task, selector, answers });
+      if (epoch !== configEpoch || !apiEnabled() || quizRequests.get(requestKey) !== requestId) return;
+      if (!result || typeof result !== 'object') throw new Error('服务没有返回有效的测评结果。');
       const latest = getTask(taskId);
-      if (!latest) {
-        toast('计划已删除，本次反馈没有保存。');
-        return;
-      }
-      if (JSON.stringify(latest) !== taskSnapshot || JSON.stringify(latest.quiz?.questions || null) !== requestedQuestions || (latest.quiz?.generatedDate || '') !== requestedGeneratedDate) {
-        toast('这份计划的测验题目已更新，旧评分没有保存。');
-        return;
-      }
+      if (!latest) { toast('计划已删除，本次结果没有保存。'); return; }
+      if (assessmentGradeSnapshot(latest, selector) !== inputSnapshot) { toast('相关学习内容或题目已更新，旧评分没有保存。'); return; }
       const next = clone(latest);
-      next.quiz.answers = answers;
-      next.quiz.result = result;
-      next.quiz.resultDate = localDateString();
-      const saved = await saveTask(next, 'quiz', epoch);
+      const target = selector.kind === 'daily'
+        ? next.dailyQuizzes?.[String(selector.dayIndex)]
+        : next.quiz;
+      if (!target) return;
+      target.answers = answers;
+      target.result = result;
+      target.resultDate = localDateString();
+      delete target.readinessStale;
+      const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGradeSnapshot(latestTask, selector) === inputSnapshot);
       if (!saved) return;
-      quizDrafts.delete(quizDraftKey(next));
-      toast('测试结果和反馈已保存。');
+      quizDrafts.delete(assessmentDraftKey(next, selector));
+      toast('测评结果和报告已保存。');
     } catch (error) {
-      if (epoch === configEpoch && apiEnabled()) toast(error.message || '提交测试失败，请重试。');
+      if (epoch === configEpoch && apiEnabled()) toast(error.message || '提交测评失败，请重试。');
     } finally {
       setBusy(button, false);
-      if (quizRequests.get(`grade:${taskId}`) === requestId) quizRequests.delete(`grade:${taskId}`);
-      quizGradeRequests.delete(taskId);
+      if (quizRequests.get(requestKey) === requestId) quizRequests.delete(requestKey);
+      assessmentGradeRequests.delete(requestKey);
     }
   }
+
+  function selectorFromButton(button) {
+    return button.dataset.kind === 'daily'
+      ? { kind: 'daily', dayIndex: Number(button.dataset.dayIndex) }
+      : { kind: 'final' };
+  }
+
+  async function saveAssessmentDecision(taskId, selector, decision) {
+    const task = getTask(taskId);
+    const quiz = assessmentFor(task, selector);
+    if (!task || !quiz?.result) return;
+    if (quiz.readinessStale) return toast('下一日安排已变更，请重新测评后再选择补学或调整。');
+    const epoch = configEpoch;
+    const snapshot = assessmentGenerationSnapshot(task, selector);
+    const next = clone(task);
+    const target = assessmentFor(next, selector);
+    if (decision === 'extra') {
+      if (target.readinessStale) return toast('下一日安排已变更，请重新测评后再选择补学。');
+      if (target.result?.report?.readyForNext !== false) return toast('当前报告没有补学方案。');
+      target.decision = 'extra';
+      target.supplementCompleted = false;
+    } else if (decision === 'toggle-extra') {
+      if (target.decision !== 'extra') return;
+      target.supplementCompleted = !target.supplementCompleted;
+    }
+    try {
+      await saveTask(next, 'quiz', epoch, task, latest => assessmentGenerationSnapshot(latest, selector) === snapshot);
+    } catch (error) {
+      if (epoch === configEpoch && apiEnabled()) toast(error.message || '报告决定没有保存，请重试。');
+    }
+  }
+
+  function exportReport(taskId, selector) {
+    const task = getTask(taskId);
+    const quiz = assessmentFor(task, selector);
+    if (!task || !quiz?.result) return;
+    const report = quiz.result.report || {};
+    const lines = [
+      selector.kind === 'daily' ? '每日学习报告' : '周期学习报告',
+      `学习计划：${task.title}`,
+      selector.kind === 'daily' ? `日期：${countDays(task)[selector.dayIndex]?.date || ''}` : `完成日期：${quiz.resultDate || ''}`,
+      `得分：${quiz.result.score} / 100`,
+      `反馈：${quiz.result.feedback || ''}`,
+      `报告摘要：${report.summary || ''}`,
+      `准备程度：${quiz.readinessStale ? '判断已过期（下一日任务已变更，需重新评估）' : report.readyForNext === true ? '可以继续' : report.readyForNext === false ? '建议先补学' : '不判断'}`,
+      ...(quiz.readinessStale ? ['继续学习判断：下一日任务已变更，这份报告需重新评估。'] : []),
+      `判断依据：${report.reason || ''}`,
+      `薄弱点：${weakPointsText(quiz.result.weakPoints)}`,
+      `表现：${(report.strengths || []).join('；')}`,
+      `下一步：${(report.nextSteps || []).join('；')}`,
+      `补学时长：${report.extraMinutes || 0} 分钟`,
+      `补学任务：${(report.extraTasks || []).join('；')}`
+    ];
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${selector.kind === 'daily' ? '每日学习报告' : '周期学习报告'}-${selector.kind === 'daily' ? countDays(task)[selector.dayIndex]?.date || '日期' : task.id}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('纯文本报告已导出。');
+  }
+
+  function adjustmentMatchesPlan(task, dayIndex, proposal) {
+    const today = localDateString();
+    const expected = countDays(task).map((day, index) => ({ day, index })).filter(entry => entry.index > dayIndex && entry.day.date >= today && !entry.day.completed);
+    if (!proposal || !Array.isArray(proposal.days) || proposal.days.length !== expected.length) return false;
+    return proposal.days.every((item, position) => {
+      const current = expected[position];
+      return item && item.date === current.day.date
+        && Number(item.day) === (Number(current.day.day) || current.index + 1)
+        && Number(item.minutes) === Number(current.day.minutes)
+        && typeof item.title === 'string' && item.title.trim()
+        && Array.isArray(item.tasks) && item.tasks.every(taskText => typeof taskText === 'string' && taskText.trim())
+        && typeof item.source === 'string' && item.source.trim();
+    });
+  }
+
+  async function proposeAdjustment(taskId, dayIndex) {
+    const task = getTask(taskId);
+    const quiz = assessmentFor(task, { kind: 'daily', dayIndex });
+    if (!task || !canAdjustAfter(task, dayIndex, quiz)) return;
+    const selector = { kind: 'daily', dayIndex };
+    const key = `${assessmentKey(taskId, selector)}:adjust`;
+    if (quizRequests.has(key)) return toast('调整方案正在生成，请稍候。');
+    const snapshot = adjustmentInputSnapshot(task, dayIndex);
+    const epoch = configEpoch;
+    const requestId = makeId();
+    quizRequests.set(key, requestId);
+    try {
+      if (typeof api.proposeAdjustment !== 'function') throw new Error('当前运行环境尚未提供计划调整服务。');
+      const proposal = await api.proposeAdjustment({ task, dayIndex });
+      if (epoch !== configEpoch || !apiEnabled() || quizRequests.get(key) !== requestId) return;
+      const latest = getTask(taskId);
+      if (!latest || adjustmentInputSnapshot(latest, dayIndex) !== snapshot) return toast('相关学习内容已更新，旧调整方案没有显示。');
+      if (!canAdjustAfter(latest, dayIndex, assessmentFor(latest, selector))) return toast('这份日报已过期或不再需要调整，请重新测评。');
+      if (!adjustmentMatchesPlan(latest, dayIndex, proposal)) throw new Error('服务返回的调整方案与未完成日程不匹配，请稍后重试。');
+      proposedAdjustment = { taskId, dayIndex, snapshot, epoch, proposal };
+      const host = $('#adjustmentPreview');
+      host.innerHTML = `<section class="adjustment-preview"><p>${escapeHTML(proposal.summary || '以下调整只覆盖所选日期之后未完成的安排。')}</p><p><strong>确认后会替换 ${proposal.days.length} 个未完成日程，并清除这些日期的日测和原期末测验。</strong></p><ul>${proposal.days.map(item => `<li><strong>第 ${Number(item.day)} 天 · ${escapeHTML(formatDate(item.date, { month: 'numeric', day: 'numeric' }))} · ${Number(item.minutes)} 分钟</strong><span>${escapeHTML(item.title)}</span><small>${escapeHTML(item.tasks.join(' · '))}</small><small>来源：${escapeHTML(item.source)}</small></li>`).join('')}</ul></section>`;
+      $('#adjustmentDialog').showModal();
+    } catch (error) {
+      if (epoch === configEpoch && apiEnabled()) toast(error.message || '生成调整方案失败。');
+    } finally {
+      if (quizRequests.get(key) === requestId) quizRequests.delete(key);
+    }
+  }
+
+  async function applyAdjustment() {
+    const pending = proposedAdjustment;
+    if (!pending || pending.epoch !== configEpoch) return;
+    const task = getTask(pending.taskId);
+    if (!task || adjustmentInputSnapshot(task, pending.dayIndex) !== pending.snapshot || !adjustmentMatchesPlan(task, pending.dayIndex, pending.proposal)) {
+      toast('计划已更新，请重新生成调整预览。');
+      $('#adjustmentDialog').close();
+      return;
+    }
+    const next = clone(task);
+    const today = localDateString();
+    const expected = countDays(next).map((day, index) => ({ day, index })).filter(entry => entry.index > pending.dayIndex && entry.day.date >= today && !entry.day.completed);
+    const affectedIndices = expected.map(entry => entry.index);
+    const affectedAssessments = adjustmentAssessmentSnapshot(task, affectedIndices);
+    expected.forEach((entry, position) => {
+      const item = pending.proposal.days[position];
+      next.plan.days[entry.index] = { ...entry.day, title: item.title, minutes: item.minutes, tasks: item.tasks.slice(), source: item.source, completed: false };
+    });
+    if (next.dailyQuizzes && typeof next.dailyQuizzes === 'object') {
+      expected.forEach(entry => { delete next.dailyQuizzes[String(entry.index)]; });
+    }
+    delete next.quiz;
+    const dailyQuiz = next.dailyQuizzes?.[String(pending.dayIndex)];
+    if (dailyQuiz) {
+      dailyQuiz.decision = 'adjusted';
+      delete dailyQuiz.supplementCompleted;
+    }
+    try {
+      const saved = await saveTask(next, 'quiz', pending.epoch, task, latest => adjustmentInputSnapshot(latest, pending.dayIndex) === pending.snapshot && adjustmentAssessmentSnapshot(latest, affectedIndices) === affectedAssessments && adjustmentMatchesPlan(latest, pending.dayIndex, pending.proposal));
+      if (!saved) return;
+      $('#adjustmentDialog').close();
+      toast('调整方案已应用到后续未完成日程。');
+    } catch (error) {
+      if (pending.epoch === configEpoch && apiEnabled()) {
+        if (error.message?.includes('相关学习内容已变化')) {
+          $('#adjustmentDialog').close();
+          toast('受影响的测验已更新，请重新生成调整预览后再确认。');
+        } else toast(error.message || '调整方案没有保存，请重试。');
+      }
+    }
+  }
+
+  function dragHasFiles(event) {
+    return Array.from(event.dataTransfer?.types || []).includes('Files') || Boolean(event.dataTransfer?.files?.length);
+  }
+
+  function eventDropZone(event) {
+    return event.target?.closest?.('#materialDropZone') || null;
+  }
+
+  window.addEventListener('dragenter', event => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    const zone = eventDropZone(event);
+    if (zone && $('#createDialog').open) zone.classList.add('is-dragging');
+  });
+
+  window.addEventListener('dragover', event => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = eventDropZone(event) ? 'copy' : 'none';
+  });
+
+  window.addEventListener('dragleave', event => {
+    const zone = eventDropZone(event);
+    if (zone && !zone.contains(event.relatedTarget)) zone.classList.remove('is-dragging');
+  });
+
+  window.addEventListener('drop', event => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    const zone = eventDropZone(event);
+    $('#materialDropZone')?.classList.remove('is-dragging');
+    if (zone && $('#createDialog').open) importDroppedMaterials(Array.from(event.dataTransfer.files || []));
+  });
 
   function openPlan(taskId) {
     if (!apiEnabled()) return openSettings();
@@ -1112,6 +1578,14 @@
     if (!button) return;
     const action = button.dataset.action;
     const taskId = button.dataset.taskId;
+    if (action === 'cancel-adjustment') {
+      $('#adjustmentDialog').close();
+      return;
+    }
+    if (action === 'confirm-adjustment') {
+      await applyAdjustment();
+      return;
+    }
     if (action === 'new-task') openCreateDialog();
     else if (action === 'settings') openSettings();
     else if (action === 'profile') openProfile();
@@ -1127,9 +1601,13 @@
     else if (action === 'edit-day') openEditDay(taskId, Number(button.dataset.dayIndex));
     else if (action === 'delete-task') await deleteTask(taskId);
     else if (action === 'export-task') exportTask(taskId);
-    else if (action === 'open-test') await openTest(taskId);
-    else if (action === 'generate-quiz') await openTest(taskId);
-    else if (action === 'retake-quiz') await openTest(taskId, true);
+    else if (action === 'open-assessment') await openAssessment(taskId, selectorFromButton(button), button.dataset.retake === 'true');
+    else if (action === 'generate-assessment') await openAssessment(taskId, selectorFromButton(button), true);
+    else if (action === 'retake-assessment') await openAssessment(taskId, selectorFromButton(button), true);
+    else if (action === 'export-report') exportReport(taskId, selectorFromButton(button));
+    else if (action === 'choose-extra') await saveAssessmentDecision(taskId, selectorFromButton(button), 'extra');
+    else if (action === 'toggle-supplement') await saveAssessmentDecision(taskId, selectorFromButton(button), 'toggle-extra');
+    else if (action === 'propose-adjustment') await proposeAdjustment(taskId, Number(button.dataset.dayIndex));
   });
 
   document.addEventListener('change', event => {
@@ -1175,12 +1653,16 @@
   viewHost.addEventListener('input', event => {
     if (event.target.matches('[data-answer]')) saveQuizDraft(event.target);
   });
-  ['createDialog', 'settingsDialog', 'profileDialog', 'editDayDialog', 'materialDialog'].forEach(id => {
+  ['createDialog', 'settingsDialog', 'profileDialog', 'editDayDialog', 'materialDialog', 'adjustmentDialog'].forEach(id => {
     const dialog = document.getElementById(id);
     dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
   });
+  $('#adjustmentDialog').addEventListener('close', () => {
+    if (!$('#adjustmentDialog').open) proposedAdjustment = null;
+  });
   $('#createDialog').addEventListener('close', () => {
     createSessionId += 1;
+    $('#materialDropZone').classList.remove('is-dragging');
     createActivity = null;
     resetGoalDiscussion();
     setBusy($('#createSubmit'), false);
