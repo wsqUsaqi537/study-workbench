@@ -2,11 +2,13 @@ const { app, BrowserWindow, ipcMain, dialog, safeStorage, nativeImage } = requir
 const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const services = require('./services.cjs');
 const assessments = require('./assessment.cjs');
 const tutoring = require('./tutoring.cjs');
 const i18n = require('./i18n.js');
+const schedule = require('./schedule.js');
+const cadence = require('./cadence.cjs');
 
 let window;
 let state;
@@ -14,6 +16,11 @@ let settings;
 let profile;
 let preferences = { language: 'zh-CN' };
 let sessionKey = '';
+let configRevision = 0;
+let planGeneration;
+let materialGeneration;
+let cadenceGeneration;
+let cadencePreview;
 const appURL = pathToFileURL(path.join(__dirname, 'index.html')).href;
 if (process.env.STUDY_APP_DATA_DIR) app.setPath('userData', process.env.STUDY_APP_DATA_DIR);
 const file = (name) => path.join(app.getPath('userData'), name);
@@ -114,6 +121,7 @@ function activeCredentials() {
 function validateTask(task) {
   if (!task || typeof task !== 'object') throw new Error('任务数据无效。');
   services.validateInput(task);
+  schedule.validateTimeline(task);
   if (typeof task.id !== 'string' || !/^[\w-]{1,80}$/.test(task.id)) throw new Error('任务编号无效。');
   if (!task.plan || !Array.isArray(task.plan.days) || task.plan.days.length !== task.days) throw new Error('计划天数与学习周期不一致。');
   task.plan.days.forEach((day, index) => {
@@ -121,9 +129,27 @@ function validateTask(task) {
     if (typeof day.title !== 'string' || day.title.length > 300 || !Number.isFinite(day.minutes) || day.minutes < 1 || day.minutes > task.minutesPerDay) throw new Error('每日计划内容或时间无效。');
     if (typeof day.completed !== 'boolean') throw new Error('完成状态无效。');
   });
+  if (task.plan.studyNotes !== undefined) services.validateStudyNotes(task.plan.studyNotes);
   assessments.validateAssessmentRecords(task);
   tutoring.validateTutoringRecords(task);
   if (JSON.stringify(task).length > 2500000) throw new Error('单个任务数据过大，请减少材料。');
+}
+
+function fingerprint(value) {
+  return createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex');
+}
+
+function cancelGenerations() {
+  configRevision += 1;
+  planGeneration?.controller.abort();
+  materialGeneration?.controller.abort();
+  cadenceGeneration?.abort();
+  cadencePreview = undefined;
+}
+
+function localDateString() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
 function handle(channel, callback) {
@@ -137,13 +163,35 @@ function handle(channel, callback) {
   });
 }
 
-async function importMaterialPaths(paths) {
+async function importMaterialPaths(paths, requestId = randomUUID()) {
   if (!Array.isArray(paths) || paths.length > 10 || paths.some(filePath => typeof filePath !== 'string' || !path.isAbsolute(filePath) || filePath.length > 4096)) {
     throw new Error('每次最多添加 10 份有效的本机材料。');
   }
-  const materials = [];
-  for (const filePath of paths) materials.push({ id: randomUUID(), ...await services.parseMaterial(filePath) });
-  return materials;
+  if (typeof requestId !== 'string' || requestId.length > 100) throw new Error('材料请求编号无效。');
+  materialGeneration?.controller.abort();
+  const controller = new AbortController();
+  const generation = { requestId, controller };
+  const revision = configRevision;
+  materialGeneration = generation;
+  try {
+    const materials = [];
+    for (const filePath of paths) {
+      if (controller.signal.aborted) throw new Error('材料导入已取消。');
+      materials.push({ id: randomUUID(), ...await services.parseMaterial(filePath, {
+        signal: controller.signal,
+        cachePath: file('ocr-cache.json'),
+        onProgress: progress => {
+          if (!controller.signal.aborted && materialGeneration === generation && window && !window.isDestroyed()) {
+            window.webContents.send('materials:progress', { requestId, ...progress });
+          }
+        }
+      }) });
+    }
+    if (controller.signal.aborted || revision !== configRevision) throw new Error('材料导入已取消。');
+    return materials;
+  } finally {
+    if (materialGeneration === generation) materialGeneration = undefined;
+  }
 }
 
 function registerHandlers() {
@@ -154,6 +202,7 @@ function registerHandlers() {
   handle('preferences:save', (input) => {
     const next = i18n.validatePreferences(input);
     writeJSON('preferences.json', next);
+    if (next.language !== preferences.language) cancelGenerations();
     preferences = next;
     return preferences;
   });
@@ -183,18 +232,94 @@ function registerHandlers() {
     state = { tasks: next };
     return true;
   });
-  handle('materials:import', async () => {
+  handle('materials:import', async requestId => {
     activeCredentials();
     const { canceled, filePaths } = await dialog.showOpenDialog(window, {
       title: preferences.language === 'en' ? 'Add learning materials' : '添加学习材料', properties: ['openFile', 'multiSelections'],
       filters: [{ name: preferences.language === 'en' ? 'Learning materials (text)' : '学习材料（文字内容）', extensions: ['pdf', 'docx', 'pptx', 'md', 'tex', 'doc', 'ppt'] }]
     });
     if (canceled) return [];
-    return importMaterialPaths(filePaths);
+    return importMaterialPaths(filePaths, requestId);
   });
-  handle('materials:drop', (paths) => { activeCredentials(); return importMaterialPaths(paths); });
+  handle('materials:drop', (paths, requestId) => { activeCredentials(); return importMaterialPaths(paths, requestId); });
+  handle('materials:cancel', requestId => {
+    if (materialGeneration?.requestId === requestId) materialGeneration.controller.abort();
+    return true;
+  });
   handle('learning:clarify', (payload) => services.clarifyGoal(payload, activeCredentials()));
-  handle('plan:generate', (input) => services.generatePlan(input, activeCredentials()));
+  handle('plan:generate', async (input, requestId = randomUUID()) => {
+    const config = activeCredentials();
+    services.validateInput(input);
+    if (typeof requestId !== 'string' || requestId.length > 100) throw new Error('计划请求编号无效。');
+    planGeneration?.controller.abort();
+    const controller = new AbortController();
+    const generation = { controller, requestId };
+    planGeneration = generation;
+    const revision = configRevision;
+    const key = fingerprint({ version: 2, input, endpoint: config.endpoint, model: config.model, language: config.language });
+    const saved = readJSON('plan-generation.json', null);
+    try {
+      const plan = await services.generatePlan(input, config, {
+        signal: controller.signal,
+        checkpoint: saved?.key === key ? saved.checkpoint : undefined,
+        onCheckpoint: checkpoint => {
+          if (!controller.signal.aborted && revision === configRevision && planGeneration === generation) {
+            writeJSON('plan-generation.json', { key, checkpoint });
+          }
+        },
+        onProgress: progress => {
+          if (!controller.signal.aborted && planGeneration === generation && window && !window.isDestroyed()) {
+            window.webContents.send('plan:progress', { requestId, stage: progress.stage, completed: progress.completed, total: progress.total });
+          }
+        }
+      });
+      if (controller.signal.aborted || revision !== configRevision) throw new Error('计划生成已取消。');
+      return plan;
+    } finally {
+      if (planGeneration === generation) planGeneration = undefined;
+    }
+  });
+  handle('plan:cancel', requestId => {
+    if (planGeneration?.requestId === requestId) planGeneration.controller.abort();
+    return true;
+  });
+  handle('plan:cadence-preview', async payload => {
+    const config = activeCredentials();
+    const task = state.tasks.find(item => item.id === payload?.taskId);
+    if (!task) throw new Error('学习计划不存在。');
+    validateTask(task);
+    const source = fingerprint(task);
+    const revision = configRevision;
+    const today = localDateString();
+    cadenceGeneration?.abort();
+    const controller = new AbortController();
+    cadenceGeneration = controller;
+    cadencePreview = undefined;
+    try {
+      const proposal = await cadence.proposeCadence(task, payload.cadence, config, { today, signal: controller.signal });
+      if (controller.signal.aborted || revision !== configRevision || source !== fingerprint(state.tasks.find(item => item.id === task.id))) throw new Error('计划已变化，请重新预览学习频率。');
+      const id = randomUUID();
+      cadencePreview = { id, taskId: task.id, source, revision, today, proposal };
+      return { ...proposal, id, taskId: task.id };
+    } finally {
+      if (cadenceGeneration === controller) cadenceGeneration = undefined;
+    }
+  });
+  handle('plan:cadence-apply', id => {
+    activeCredentials();
+    const preview = cadencePreview;
+    if (!preview || preview.id !== id) throw new Error('学习频率预览已失效，请重新生成。');
+    const index = state.tasks.findIndex(item => item.id === preview.taskId);
+    if (index < 0 || preview.revision !== configRevision || preview.today !== localDateString() || fingerprint(state.tasks[index]) !== preview.source) throw new Error('计划已变化，请重新预览学习频率。');
+    const task = cadence.applyCadence(state.tasks[index], preview.proposal);
+    validateTask(task);
+    const next = [...state.tasks];
+    next[index] = task;
+    writeJSON('tasks.json', { tasks: next });
+    state = { tasks: next };
+    cadencePreview = undefined;
+    return task;
+  });
   handle('assessment:generate', (payload) => {
     const config = activeCredentials();
     validateTask(payload?.task);
@@ -247,6 +372,7 @@ function registerHandlers() {
       }
     }
     writeJSON('settings.json', next);
+    cancelGenerations();
     settings = next;
     sessionKey = nextSessionKey;
     return { ...publicSettings(), keySessionOnly: Boolean(sessionKey) };
@@ -294,7 +420,7 @@ function createWindow() {
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  window.on('closed', () => { window = null; });
+  window.on('closed', () => { cancelGenerations(); window = null; });
   window.loadFile(path.join(__dirname, 'index.html'));
 }
 

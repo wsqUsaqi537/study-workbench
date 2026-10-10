@@ -29,7 +29,14 @@ profile.json
 profile.json.tmp
 preferences.json
 preferences.json.tmp
+plan-generation.json
+plan-generation.json.tmp
 
 # 本地预览与构建中间文件
 界面预览*.png
 *.blockmap
+
+# 本地 OCR 缓存
+ocr-cache.json
+ocr-cache.json.tmp
+ocr-cache.json.tmp-*

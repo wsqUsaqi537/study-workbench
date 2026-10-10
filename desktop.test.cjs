@@ -13,6 +13,7 @@ const externalScreenshotDir = process.env.STUDY_TEST_SCREENSHOT_DIR;
 const screenshotDir = externalScreenshotDir || fs.mkdtempSync(path.join(os.tmpdir(), 'study-workbench-desktop-shot-'));
 const requestedScreenshots = process.env.STUDY_TEST_KEEP_SCREENSHOT === '1';
 const appRoot = path.resolve(process.env.STUDY_TEST_APP_ROOT || __dirname);
+const schedule = require(path.join(appRoot, 'schedule.js'));
 process.env.STUDY_APP_DATA_DIR = dataDir;
 
 const { app, BrowserWindow, safeStorage, dialog } = require('electron');
@@ -143,15 +144,24 @@ function makeDailyReadinessQuiz(dayIndex, date, decision = '') {
   };
 }
 
+function materialSource(input) {
+  const material = input.materials?.[0];
+  if (!material) return '主题与学习目标';
+  const reference = String(material.text || '').match(/【第\s*(\d+)\s*(页|张幻灯片)】/);
+  return reference ? `${material.name} 第 ${reference[1]} ${reference[2]}` : material.name;
+}
+
 function makeModelPlan(input) {
-  const days = Number(input.days) || 2;
-  const startDate = input.startDate || '2026-10-08';
-  const dates = Array.from({ length: days }, (_, offset) => {
-    const date = new Date(`${startDate}T00:00:00.000Z`);
-    date.setUTCDate(date.getUTCDate() + offset);
-    return date.toISOString().slice(0, 10);
-  });
-  const materialSource = input.materials?.length ? `${input.materials[0].name} 第 1 页` : '主题与学习目标';
+  const dates = Array.isArray(input.sessions)
+    ? input.sessions.map(session => session.date)
+    : schedule.learningDates({
+      startDate: input.startDate || '2026-10-08',
+      days: Number(input.days) || 2,
+      calendarDays: input.calendarDays,
+      cadence: input.cadence
+    });
+  const days = dates.length;
+  const source = materialSource(input);
   return {
     summary: '逐步学习 Python 基础，并通过小程序检验掌握情况。',
     difficulty: '入门',
@@ -161,13 +171,63 @@ function makeModelPlan(input) {
       date,
       title: index === days - 1 ? '小程序综合测试与复盘' : `第 ${index + 1} 天：变量与练习`,
       minutes: Math.min(45, Number(input.minutesPerDay) || 60),
-      tasks: [index === days - 1 ? '完成小程序测试并复盘' : '理解概念并完成练习'],
-      source: materialSource
+      tasks: [
+        index === days - 1 ? '完成小程序测试并复盘' : '理解概念并完成练习',
+        '完成 5 题小测，用时 10 分钟',
+        ...(index === days - 1 ? ['完成 10 题周期测验，用时 15 分钟'] : [])
+      ],
+      source
     })),
     knowledge: [
-      { title: '变量与数据类型', priority: '重点', explanation: '变量保存需要使用的数据；选择合适的数据类型有助于正确处理输入和计算。', source: materialSource },
-      { title: '循环结构', priority: '了解', explanation: '循环可以重复执行操作，适合处理多笔记账记录。', source: materialSource }
+      { title: '变量与数据类型', priority: '重点', explanation: '变量保存需要使用的数据；选择合适的数据类型有助于正确处理输入和计算。', source },
+      { title: '循环结构', priority: '了解', explanation: '循环可以重复执行操作，适合处理多笔记账记录。', source }
     ]
+  };
+}
+
+function makePlanOutline(input) {
+  const plan = makeModelPlan({ ...input, days: Math.min(Number(input.days) || 2, 2) });
+  return {
+    summary: plan.summary,
+    difficulty: plan.difficulty,
+    warnings: plan.warnings,
+    knowledge: plan.knowledge
+  };
+}
+
+function makePlanBatch(payload) {
+  const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+  const source = payload.allowedSources?.[0] || payload.knowledge?.[0]?.source || payload.materials?.[0]?.name || '主题与学习目标';
+  const totalDays = Number(payload.totalDays ?? payload.days) || 0;
+  return {
+    days: sessions.map(session => ({
+      day: session.day,
+      date: session.date,
+      title: `第 ${session.day} 天：变量与练习`,
+      minutes: Math.min(45, Number(payload.minutesPerDay) || 60),
+      tasks: [
+        '理解概念并完成练习',
+        '完成 5 题小测，用时 10 分钟',
+        ...(Number(session.day) === totalDays ? ['完成 10 题周期测验，用时 15 分钟'] : [])
+      ],
+      source
+    }))
+  };
+}
+
+function makeCadenceBatch(payload) {
+  return {
+    days: (Array.isArray(payload.sessions) ? payload.sessions : []).map(session => ({
+      day: session.day,
+      date: session.date,
+      title: `第 ${session.day} 天：循环巩固与练习`,
+      minutes: Math.min(45, Number(payload.minutesPerDay) || 60),
+      tasks: [
+        '用循环处理多笔账目并复核结果；安排 5 题小测，用时 10 分钟',
+      ...(Number(session.day) === Number(payload.totalDays ?? payload.days) ? ['完成 10 题周期测验，用时 15 分钟'] : [])
+      ],
+      source: payload.allowedSources?.[0] || '主题与学习目标'
+    }))
   };
 }
 
@@ -201,6 +261,9 @@ function responseFor(purpose, payload) {
   }
   if (purpose === '讲解当前日学习内容') return { text: '概念：变量保存信息。\n例子：记录一笔账目。\n易错点：混淆数字与文本。\n练习：写出一笔记录。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
   if (purpose === '解释当前测验题和评分反馈') return { text: '把记录拆分后，先校验输入，再汇总数值；用一个简单例子逐步检查。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+  if (purpose === '生成学习计划概要与知识清单') return makePlanOutline(payload);
+  if (purpose === '生成学习计划每日安排') return makePlanBatch(payload);
+  if (purpose === '按学习频率重拟未来计划') return makeCadenceBatch(payload);
   if (purpose === '生成学习计划') return makeModelPlan(payload);
   if (purpose === '生成每日小测') return { questions: makeAssessmentQuestions('daily') };
   if (purpose === '生成周期测验') return { questions: makeAssessmentQuestions('final') };
@@ -261,17 +324,23 @@ const apiServer = http.createServer(async (request, response) => {
     let payload;
     try { payload = JSON.parse(content); } catch { payload = null; }
     const purpose = payload?.purpose || (content.includes('连接测试') ? '连接测试' : '');
-    apiRecords.push({ path: request.url, authorization: request.headers.authorization, requestBody, purpose, payload });
-    if (purpose === '生成学习计划' && nextPlanGate) {
+    const record = { path: request.url, authorization: request.headers.authorization, requestBody, purpose, payload, responseAborted: false };
+    response.once('close', () => {
+      if (!response.writableFinished) record.responseAborted = true;
+    });
+    apiRecords.push(record);
+    if (nextPlanGate && nextPlanGate.purpose === purpose) {
       const gate = nextPlanGate;
       nextPlanGate = null;
       gate.resolveObserved(payload);
       await gate.released;
     }
     const result = responseFor(purpose, payload || {});
+    if (response.destroyed) return;
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(result) } }] }));
   } catch (error) {
+    if (response.destroyed) return;
     response.writeHead(500, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ error: { message: error.message } }));
   }
@@ -282,12 +351,12 @@ const apiStarted = new Promise((resolve, reject) => {
 });
 let nextPlanGate = null;
 
-function delayNextPlanResponse() {
+function delayNextPlanResponse(purpose = '生成学习计划') {
   let resolveObserved;
   let releaseResponse;
   const observed = new Promise(resolve => { resolveObserved = resolve; });
   const released = new Promise(resolve => { releaseResponse = resolve; });
-  nextPlanGate = { resolveObserved, released };
+  nextPlanGate = { purpose, resolveObserved, released };
   return { observed, release: () => releaseResponse() };
 }
 
@@ -457,11 +526,65 @@ async function setChecked(window, selector, checked) {
   assert.equal(changed, true, `找不到复选框 ${selector}`);
 }
 
+async function beginCreateLoadingObservation(window) {
+  await window.webContents.executeJavaScript(`(() => {
+    window.__desktopLoadingStates = [];
+    const sample = () => {
+      const submit = document.querySelector('#createSubmit');
+      const status = document.querySelector('#createLoadingStatus');
+      window.__desktopLoadingStates.push({ spinner: Boolean(submit?.classList.contains('is-busy')), status: Boolean(status && !status.hidden) });
+    };
+    const dialog = document.querySelector('#createDialog');
+    window.__desktopLoadingObserver?.disconnect();
+    window.__desktopLoadingObserver = new MutationObserver(sample);
+    window.__desktopLoadingObserver.observe(dialog, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['class', 'hidden', 'disabled', 'aria-busy'] });
+    sample();
+  })()`);
+}
+
+async function endCreateLoadingObservation(window) {
+  return window.webContents.executeJavaScript(`(() => {
+    window.__desktopLoadingObserver?.disconnect();
+    return window.__desktopLoadingStates.slice();
+  })()`);
+}
+
+function testLocalDate(offsetDays = 0) {
+  const date = new Date();
+  date.setDate(date.getDate() + offsetDays);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function writeMarkdownFixture(name, text) {
+  const filePath = path.join(dataDir, name);
+  fs.writeFileSync(filePath, text, 'utf8');
+  return filePath;
+}
+
+async function setUiLanguage(window, language) {
+  await click(window, '#profileButton', `打开个人资料以切换为 ${language}`);
+  await waitForJS(window, 'document.querySelector("#profileDialog")?.open', '个人资料语言对话框');
+  await setValue(window, '#profileLanguage', language);
+  await waitForJS(window, `document.documentElement.lang === ${JSON.stringify(language)}`, `${language} 界面已应用`);
+  await click(window, '[data-close="profileDialog"]', '关闭个人资料语言对话框');
+}
+
+async function setVisualViewport(window, width, height) {
+  window.setContentSize(width, height);
+  if (!window.isVisible()) window.show();
+  window.focus();
+  await window.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 220))))');
+  const viewport = await window.webContents.executeJavaScript('({ width: innerWidth, height: innerHeight })');
+  assert.ok(viewport.width >= width - 30, `Electron 内容宽度应接近 ${width}px：${JSON.stringify(viewport)}`);
+  assert.ok(viewport.height >= height - 80, `Electron 内容高度应接近 ${height}px：${JSON.stringify(viewport)}`);
+}
+
 async function chooseRadio(window, selector) {
   await click(window, selector, `选择选项 ${selector}`);
 }
 
-async function dispatchActualFileDrop(window, filePath) {
+async function dispatchActualFileDrop(window, filePath, zoneSelector = '#materialDropZone') {
+  const filePaths = Array.isArray(filePath) ? filePath : [filePath];
   const debuggerAPI = window.webContents.debugger;
   const wasAttached = debuggerAPI.isAttached();
   if (!wasAttached) debuggerAPI.attach('1.3');
@@ -472,6 +595,7 @@ async function dispatchActualFileDrop(window, filePath) {
         input = document.createElement('input');
         input.type = 'file';
         input.id = 'nativeFilePathProbe';
+        input.multiple = true;
         input.hidden = true;
         document.querySelector('#createDialog').appendChild(input);
       }
@@ -479,19 +603,19 @@ async function dispatchActualFileDrop(window, filePath) {
     const documentRoot = await debuggerAPI.sendCommand('DOM.getDocument', { depth: -1, pierce: true });
     const query = await debuggerAPI.sendCommand('DOM.querySelector', { nodeId: documentRoot.root.nodeId, selector: '#nativeFilePathProbe' });
     assert.ok(query.nodeId, 'CDP 应能找到用于设置真实本地文件的测试 input');
-    await debuggerAPI.sendCommand('DOM.setFileInputFiles', { nodeId: query.nodeId, files: [filePath] });
+    await debuggerAPI.sendCommand('DOM.setFileInputFiles', { nodeId: query.nodeId, files: filePaths });
     return await window.webContents.executeJavaScript(`(() => {
       const input = document.querySelector('#nativeFilePathProbe');
-      const zone = document.querySelector('#materialDropZone');
-      if (!input?.files?.[0] || !zone) return { prepared: false };
+      const zone = document.querySelector(${JSON.stringify(zoneSelector)});
+      if (!input?.files?.length || !zone) return { prepared: false };
       const transfer = new DataTransfer();
-      transfer.items.add(input.files[0]);
+      for (const file of input.files) transfer.items.add(file);
       zone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: transfer }));
       const highlighted = zone.classList.contains('is-dragging');
       zone.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer }));
       zone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
       input.remove();
-      return { prepared: true, highlighted };
+      return { prepared: true, highlighted, fileCount: transfer.files.length };
     })()`);
   } finally {
     if (!wasAttached && debuggerAPI.isAttached()) debuggerAPI.detach();
@@ -557,6 +681,89 @@ async function captureScreenshot(window, name) {
   const screenshot = await window.webContents.capturePage();
   fs.writeFileSync(filePath, screenshot.toPNG());
   console.log(`TEMP_SCREENSHOT ${filePath}`);
+}
+
+async function inspectVisualLayout(window, dialogSelector = '') {
+  return window.webContents.executeJavaScript(`(() => {
+    const dialog = ${JSON.stringify(dialogSelector)} ? document.querySelector(${JSON.stringify(dialogSelector)}) : null;
+    const visible = element => Boolean(element && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
+    const rect = element => {
+      const box = element.getBoundingClientRect();
+      return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width, height: box.height };
+    };
+    const buttons = dialog ? [...dialog.querySelectorAll('.dialog-actions button')].filter(visible).map(rect) : [];
+    const overlaps = [];
+    for (let i = 0; i < buttons.length; i += 1) for (let j = i + 1; j < buttons.length; j += 1) {
+      if (Math.min(buttons[i].right, buttons[j].right) - Math.max(buttons[i].left, buttons[j].left) > 1 &&
+          Math.min(buttons[i].bottom, buttons[j].bottom) - Math.max(buttons[i].top, buttons[j].top) > 1) overlaps.push([i, j]);
+    }
+    let alignment = [];
+    let close = null;
+    let footerSpace = 0;
+    let dialogMetrics = null;
+    let horizontalDialogOverflow = false;
+    let actionOverflow = false;
+    let tutoringOverflow = false;
+    if (dialog && dialog.open) {
+      const box = rect(dialog);
+      const blocks = [...dialog.querySelectorAll(':scope > form > .dialog-topline, :scope > form > h2, :scope > form > .dialog-intro, :scope > form > .dialog-actions, :scope > .dialog-topline, :scope > h2, :scope > .dialog-intro, :scope > .material-meta, :scope > .material-text, :scope > .dialog-actions, :scope > #adjustmentPreview, :scope > #finalHistoryContent, :scope > #tutoringContent')].filter(visible).map(element => {
+        const value = rect(element);
+        return { selector: element.id || element.className || element.tagName, left: value.left - box.left, right: box.right - value.right };
+      });
+      alignment = blocks;
+      const closeButton = dialog.querySelector('.dialog-close');
+      close = closeButton && visible(closeButton) ? rect(closeButton) : null;
+      const form = dialog.querySelector(':scope > form');
+      const actions = [...dialog.querySelectorAll('.dialog-actions')].filter(visible).at(-1);
+      const formBottom = form ? parseFloat(getComputedStyle(form).paddingBottom) || 0 : 0;
+      const dialogBottom = parseFloat(getComputedStyle(dialog).paddingBottom) || 0;
+      const actionsBottom = actions ? parseFloat(getComputedStyle(actions).marginBottom) || 0 : 0;
+      footerSpace = Math.max(formBottom, dialogBottom + actionsBottom);
+      dialogMetrics = { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width, height: box.height, scrollWidth: dialog.scrollWidth, clientWidth: dialog.clientWidth };
+      horizontalDialogOverflow = dialog.scrollWidth > dialog.clientWidth + 1;
+      actionOverflow = actions ? actions.scrollWidth > actions.clientWidth + 1 : false;
+      const tutoring = dialog.querySelector('.tutoring-content');
+      tutoringOverflow = tutoring ? tutoring.scrollWidth > tutoring.clientWidth + 1 : false;
+    }
+    return {
+      viewport: { width: innerWidth, height: innerHeight, documentWidth: document.documentElement.scrollWidth, bodyWidth: document.body.scrollWidth },
+      pageHorizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1 || document.body.scrollWidth > innerWidth + 1,
+      dialogOpen: Boolean(dialog?.open), dialogMetrics, horizontalDialogOverflow, actionOverflow, tutoringOverflow,
+      close, footerSpace, alignment, overlaps,
+      closeReachable: Boolean(close && close.width > 0 && close.height > 0 && close.left >= 0 && close.top >= 0 && close.right <= innerWidth + 1 && close.bottom <= innerHeight + 1),
+      alignmentSpread: alignment.length ? {
+        left: Math.max(...alignment.map(item => item.left)) - Math.min(...alignment.map(item => item.left)),
+        right: Math.max(...alignment.map(item => item.right)) - Math.min(...alignment.map(item => item.right))
+      } : { left: 0, right: 0 }
+    };
+  })()`);
+}
+
+async function captureVisualScreenshot(window, name, dialogSelector = '') {
+  assert.equal(window.isVisible(), true, `截图前 Electron 窗口必须可见：${name}`);
+  await window.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 180))))');
+  const layout = await inspectVisualLayout(window, dialogSelector);
+  assert.equal(layout.pageHorizontalOverflow, false, `${name} 不得产生页面横向溢出：${JSON.stringify(layout)}`);
+  if (dialogSelector) {
+    assert.equal(layout.dialogOpen, true, `${name} 对话框必须由真实 showModal 流程打开`);
+    assert.equal(layout.horizontalDialogOverflow, false, `${name} 对话框不得横向溢出：${JSON.stringify(layout)}`);
+    assert.equal(layout.actionOverflow, false, `${name} 底部按钮区域不得横向溢出：${JSON.stringify(layout)}`);
+    assert.deepEqual(layout.overlaps, [], `${name} 底部按钮不得重叠`);
+    assert.equal(layout.closeReachable, true, `${name} 关闭按钮应在当前视口内可触达：${JSON.stringify(layout.close)}`);
+    assert.ok(layout.footerSpace >= 12, `${name} 底部应留至少 12px 间距：${JSON.stringify({ footerSpace: layout.footerSpace, dialog: layout.dialogMetrics })}`);
+    assert.ok(layout.alignmentSpread.left <= 4 && layout.alignmentSpread.right <= 4, `${name} 对话框正文左右边距应一致：${JSON.stringify(layout.alignment)}`);
+    if (dialogSelector === '#tutoringDialog') assert.equal(layout.tutoringOverflow, false, '讲解正文不得横向溢出');
+  }
+  const screenshot = await window.webContents.capturePage();
+  const bytes = screenshot.toPNG();
+  assert.ok(bytes.length > 1000, `${name} 必须产生真实 Electron PNG 截图`);
+  assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  const size = screenshot.getSize();
+  assert.ok(size.width > 100 && size.height > 100, `${name} 截图必须包含可见窗口内容`);
+  const filePath = path.join(screenshotDir, name);
+  fs.writeFileSync(filePath, bytes);
+  console.log(`TEMP_SCREENSHOT ${filePath} ${size.width}x${size.height}`);
+  return layout;
 }
 
 function pngDimensions(dataURL) {
@@ -1303,6 +1510,8 @@ async function run() {
   regressionTask.goal = '已完成日之后的日程调整应使日报准备度重新评估。';
   regressionTask.startDate = regressionStartDate;
   regressionTask.days = 5;
+  regressionTask.calendarDays = 5;
+  regressionTask.cadence = { mode: 'daily', weekdays: [] };
   regressionTask.minutesPerDay = 45;
   regressionTask.plan.summary = regressionTask.goal;
   const regressionSource = sourceForRegression.plan.days[0].source;
@@ -1459,6 +1668,738 @@ async function run() {
   assert.equal(apiRecords.length, beforeReturnLanguage, '切回中文不发API请求');
   assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8')).language, 'zh-CN');
 
+  currentStage = '新建14日日历跨度隔日计划并验证七个真实日期';
+  await click(window, '[data-nav="overview"]', '返回学习概览');
+  await waitForJS(window, 'Boolean(document.querySelector(".welcome-panel"))', '学习概览就绪');
+  async function createCadencePlanThroughUI(title, mode, weekdays = []) {
+    await click(window, '[data-action="new-task"]', `打开${title}新建计划`);
+    await waitForJS(window, 'document.querySelector("#createDialog")?.open', `${title}新建对话框`);
+    await setValue(window, '#createForm [name="title"]', title);
+    await setValue(window, '#createForm [name="goal"]', '理解变量和循环，并完成可运行的 Python 练习。');
+    await setValue(window, '#createForm [name="days"]', 14);
+    await setValue(window, '#createForm [name="cadenceMode"]', mode);
+    for (const weekday of [0, 1, 2, 3, 4, 5, 6]) {
+      await setChecked(window, `#createWeekdays [name="cadenceWeekday"][value="${weekday}"]`, weekdays.includes(weekday));
+    }
+    const startDate = await window.webContents.executeJavaScript('document.querySelector("#createForm [name=startDate]").value');
+    const cadence = { mode, weekdays: mode === 'weekly' ? [...weekdays] : [] };
+    const expectedDates = schedule.learningDates({ startDate, calendarDays: 14, cadence });
+    const summary = await window.webContents.executeJavaScript('document.querySelector("#createCadenceSummary").textContent');
+    assert.match(summary, /14.*日历日/);
+    assert.match(summary, new RegExp(`${expectedDates.length} 次学习`));
+    if (mode === 'alternate') assert.equal(expectedDates.length, 7, '14 个日历日的隔日频率应安排 7 次学习');
+
+    const beforeRequests = apiRecords.length;
+    await click(window, '#createSubmit', `生成${title}`);
+    await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.some(t => t.title === ${JSON.stringify(title)}))`, `${title}已保存`);
+    await waitForJS(window, '!document.querySelector("#createDialog")?.open', `${title}对话框关闭`);
+    const saved = (await readState(window)).tasks.find(task => task.title === title);
+    assert.ok(saved);
+    assert.equal(saved.calendarDays, 14);
+    assert.equal(saved.days, expectedDates.length);
+    assert.deepEqual(saved.cadence, cadence);
+    assert.deepEqual(saved.plan.days.map(day => day.date), expectedDates, `${title}必须保存真实日历日期`);
+    const requests = apiRecords.slice(beforeRequests).filter(record => record.purpose === '生成学习计划');
+    assert.equal(requests.length, 1, '14 日频率计划应由一次提交触发一次短计划请求');
+    assert.deepEqual(requests[0].payload.sessions.map(session => session.date), expectedDates, '模型请求应收到准确的非连续学习日期');
+    assert.equal(requests[0].requestBody.max_tokens, undefined, '短计划请求不应设置模型输出预算');
+    return saved;
+  }
+  const alternateTask = await createCadencePlanThroughUI('14日隔日计划', 'alternate');
+
+  currentStage = '新建每周一三五计划并验证日期 weekday';
+  const weeklyTask = await createCadencePlanThroughUI('每周一三五计划', 'weekly', [1, 3, 5]);
+  assert.deepEqual(weeklyTask.cadence.weekdays, [1, 3, 5]);
+  assert.ok(weeklyTask.plan.days.every(day => [1, 3, 5].includes(new Date(`${day.date}T00:00:00.000Z`).getUTCDay())), '每周计划只应安排周一、周三和周五');
+
+  currentStage = '100000字符材料一次提交并自动生成60日批次计划';
+  await click(window, '[data-action="new-task"]', '打开60日计划新建对话框');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '60日计划新建对话框');
+  await setValue(window, '#createForm [name="title"]', '60日 Python 练习计划');
+  await setValue(window, '#createForm [name="goal"]', '循序学习 Python 变量、条件、循环和函数。');
+  await setValue(window, '#createForm [name="days"]', 60);
+  await window.webContents.executeJavaScript(`(() => {
+    window.__desktopCreateDialogCloseEvents = [];
+    const dialog = document.querySelector('#createDialog');
+    dialog.addEventListener('close', () => window.__desktopCreateDialogCloseEvents.push({ open: Boolean(dialog.open) }));
+  })()`);
+  const longMetadata = 'x'.repeat(100000);
+  const longMaterialPath = path.join(dataDir, '100000-character-study-metadata.md');
+  fs.writeFileSync(longMaterialPath, longMetadata, 'utf8');
+  await dispatchActualFileDrop(window, longMaterialPath);
+  await waitForJS(window, 'document.querySelector("#createMaterials").innerText.includes("100000-character-study-metadata.md") && !document.querySelector("#createConsentWrap").hidden', '100000 字符材料已导入并要求授权');
+  await setChecked(window, '#createConsent', true);
+  await window.webContents.executeJavaScript(`(() => {
+    window.__desktopPlanProgress = [];
+    window.__desktopPlanProgressOff?.();
+    window.__desktopPlanProgressOff = window.studyApp.onPlanProgress(progress => window.__desktopPlanProgress.push(progress));
+  })()`);
+  await beginCreateLoadingObservation(window);
+  const longPlanRequestStart = apiRecords.length;
+  await click(window, '#createSubmit', '一次提交60日分批计划');
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.some(t => t.title === "60日 Python 练习计划"))`, '60 日分批计划生成并保存');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '60 日计划创建对话框关闭');
+  const longPlanLoadingStates = await endCreateLoadingObservation(window);
+  assert.ok(longPlanLoadingStates.length > 0 && longPlanLoadingStates.every(item => !item.spinner && !item.status), `10 秒内完成的计划不应显示 spinner 或进度状态：${JSON.stringify(longPlanLoadingStates)}`);
+  const longTask = (await readState(window)).tasks.find(task => task.title === '60日 Python 练习计划');
+  assert.equal(longTask.calendarDays, 60);
+  assert.equal(longTask.days, 60);
+  assert.equal(longTask.materials[0].text.length, 100000, '本地任务应完整保存 100000 字符材料 metadata');
+  assert.equal(longTask.plan.days.length, 60);
+  assert.deepEqual(longTask.plan.days.map(day => day.date), schedule.learningDates({ startDate: longTask.startDate, calendarDays: 60, cadence: { mode: 'daily' } }));
+  const longPlannerRecords = apiRecords.slice(longPlanRequestStart).filter(record => ['生成学习计划概要与知识清单', '生成学习计划每日安排'].includes(record.purpose));
+  const outlineRecords = longPlannerRecords.filter(record => record.purpose === '生成学习计划概要与知识清单');
+  const dayBatchRecords = longPlannerRecords.filter(record => record.purpose === '生成学习计划每日安排');
+  assert.equal(outlineRecords.length, 1, '大材料应只发起一次计划概要请求');
+  assert.equal(dayBatchRecords.length, Math.ceil(60 / 7), '60 个学习日应按每批最多 7 日生成');
+  const outlineRequest = outlineRecords[0].requestBody.messages[1].content;
+  assert.ok(outlineRequest.length < 100000 && !outlineRequest.includes(longMetadata), '100000 字符原文只应经上下文预算截取后发送一次');
+  const requestedSessions = dayBatchRecords.flatMap(record => record.payload.sessions);
+  assert.equal(requestedSessions.length, 60);
+  assert.ok(dayBatchRecords.every(record => record.payload.sessions.length <= 7));
+  assert.ok(dayBatchRecords.every(record => record.payload.materials.every(material => !Object.hasOwn(material, 'text'))), '日批次只能收到材料描述符，不能重复发送附件原文');
+  assert.ok(dayBatchRecords.every(record => !JSON.stringify(record.payload).includes(longMetadata)));
+  const progressEvents = await window.webContents.executeJavaScript(`(() => {
+    window.__desktopPlanProgressOff?.();
+    window.__desktopPlanProgressOff = null;
+    return window.__desktopPlanProgress.slice();
+  })()`);
+  assert.ok(progressEvents.some(event => event.stage === 'outline' && event.completed === 0 && event.total === 1), '界面进度应收到概要阶段开始');
+  assert.ok(progressEvents.some(event => event.stage === 'outline' && event.completed === 1 && event.total === 1), '界面进度应收到概要阶段完成');
+  assert.equal(progressEvents.filter(event => event.stage === 'days').at(-1)?.completed, 60, '界面进度应在全部60日安排后完成');
+  const checkpointPath = path.join(dataDir, 'plan-generation.json');
+  assert.equal(fs.existsSync(checkpointPath), true, '60 日计划完成后应持久化计划生成检查点');
+  const checkpointContents = fs.readFileSync(checkpointPath, 'utf8');
+  const completedCheckpoint = JSON.parse(checkpointContents);
+  assert.equal(completedCheckpoint.checkpoint.days.length, 60, '持久检查点应包含完整的60日计划');
+  assert.equal(checkpointContents.includes(longMetadata), false, '检查点不得保存材料原文');
+  assert.equal(checkpointContents.includes('desktop-session-key'), false, '检查点不得保存 API Key');
+  const replayInput = Object.fromEntries(['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'calendarDays', 'cadence', 'minutesPerDay', 'materials'].map(key => [key, longTask[key]]));
+  const requestsBeforeCheckpointReplay = apiRecords.length;
+  const replayedPlan = await window.webContents.executeJavaScript(`window.studyApp.generatePlan(${JSON.stringify(replayInput)}, 'completed-checkpoint-reuse-probe')`);
+  assert.equal(replayedPlan.days.length, 60, '重新提交相同输入应返回已持久化的完整计划');
+  assert.equal(apiRecords.length, requestsBeforeCheckpointReplay, '复用完整检查点不得重复调用模型 API');
+
+  currentStage = '计划生成超过10秒才显示spinner并在取消后清理状态';
+  await click(window, '[data-action="new-task"]', '打开待取消计划');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '待取消计划对话框');
+  await setValue(window, '#createForm [name="title"]', '取消中的计划');
+  await setValue(window, '#createForm [name="goal"]', '学习 Python 基础并进行练习。');
+  await setValue(window, '#createForm [name="days"]', 14);
+  await click(window, '#createExamButton', '为待取消的计划打开考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '待取消计划的考纲对话框');
+  await setValue(window, '#examDescription', '仅用于验证异步取消时不保存考纲草稿。');
+  await click(window, '#saveExamDraft', '暂存待取消计划的考纲');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open', '考纲已暂存到待取消创建表单');
+  const cancelGate = delayNextPlanResponse('生成学习计划概要与知识清单');
+  window.show();
+  await beginCreateLoadingObservation(window);
+  const cancelRequestStart = apiRecords.length;
+  const submittedAt = Date.now();
+  await click(window, '#createSubmit', '提交待取消的计划');
+  const cancelPayload = await cancelGate.observed;
+  const cancelRecord = apiRecords.slice(cancelRequestStart).find(record => record.purpose === '生成学习计划概要与知识清单');
+  assert.ok(cancelRecord, '延迟请求应到达 localhost mock');
+  assert.equal(cancelRecord.requestBody.max_tokens, undefined);
+  assert.equal(cancelRecord.payload.examContext.description, '仅用于验证异步取消时不保存考纲草稿。', '创建异步计划请求时应携带已保存的考纲范围');
+  let earlyLoading = await window.webContents.executeJavaScript(`({
+    disabled: document.querySelector('#createSubmit').disabled,
+    spinner: document.querySelector('#createSubmit').classList.contains('is-busy'),
+    statusVisible: !document.querySelector('#createLoadingStatus').hidden
+  })`);
+  assert.equal(earlyLoading.disabled, true, '计划请求启动后立即锁定提交按钮');
+  assert.equal(earlyLoading.spinner, false, '10 秒前不显示 spinner');
+  assert.equal(earlyLoading.statusVisible, false, '10 秒前不显示进度状态');
+  await delay(Math.max(0, 11000 - (Date.now() - submittedAt)));
+  const delayedLoading = await window.webContents.executeJavaScript(`({
+    spinner: document.querySelector('#createSubmit').classList.contains('is-busy'),
+    statusVisible: !document.querySelector('#createLoadingStatus').hidden,
+    statusText: document.querySelector('#createLoadingStatus').textContent,
+    dialogCloseEvents: window.__desktopCreateDialogCloseEvents
+  })`);
+  assert.ok(delayedLoading.dialogCloseEvents.some(event => event.open), '重开后的创建对话框应收到迟发 close 事件，以覆盖活动清理竞态');
+  assert.equal(delayedLoading.spinner, true, `真实请求超过 10 秒后显示 spinner：${JSON.stringify({ ...delayedLoading, elapsedMs: Date.now() - submittedAt })}`);
+  assert.equal(delayedLoading.statusVisible, true, '真实请求超过 10 秒后显示进度状态');
+  assert.ok(delayedLoading.statusText.length > 0);
+  const delayedLoadingStates = await endCreateLoadingObservation(window);
+  assert.ok(delayedLoadingStates.some(item => item.spinner && item.status), 'DOM 变化记录必须观察到延迟状态真正出现');
+  await click(window, '#createDialog [data-close="createDialog"]', '取消生成并关闭新建窗口');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '取消生成后新建窗口关闭');
+  const cancelDeadline = Date.now() + 5000;
+  while (!cancelRecord.responseAborted && Date.now() < cancelDeadline) await delay(50);
+  cancelGate.release();
+  assert.equal(cancelRecord.responseAborted, true, '关闭窗口应取消并中断正在等待的模型 HTTP 请求');
+  state = await readState(window);
+  assert.equal(state.tasks.some(task => task.title === '取消中的计划'), false, '取消后不得保存半成品任务');
+  assert.equal(state.tasks.some(task => task.exam?.description === '仅用于验证异步取消时不保存考纲草稿。'), false, '取消异步创建后不得把待处理考纲写入任何任务');
+  await click(window, '[data-action="new-task"]', '重新打开新建计划以检查取消清理');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '取消后重新打开新建计划');
+  const cleanedCreateState = await window.webContents.executeJavaScript(`({
+    enabled: !document.querySelector('#createSubmit').disabled,
+    spinner: document.querySelector('#createSubmit').classList.contains('is-busy'),
+    statusHidden: document.querySelector('#createLoadingStatus').hidden,
+    errorHidden: document.querySelector('#createError').hidden
+  })`);
+  assert.deepEqual(cleanedCreateState, { enabled: true, spinner: false, statusHidden: true, errorHidden: true }, '取消后不得残留 spinner、状态或错误');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭已清理的新建窗口');
+  window.hide();
+  assert.ok(cancelPayload && cancelRecord.payload.purpose === '生成学习计划概要与知识清单');
+
+  currentStage = '修改已有计划频率预览取消不改任务并确认保留历史及缓存';
+  const cadenceToday = testLocalDate();
+  const cadenceStart = schedule.formatDate(cadenceToday, -7);
+  const cadenceDates = schedule.learningDates({ startDate: cadenceStart, calendarDays: 14, cadence: { mode: 'daily' } });
+  const cadenceDays = cadenceDates.map((date, index) => ({
+    day: index + 1,
+    date,
+    title: `历史计划第 ${index + 1} 天`,
+    minutes: 30,
+    tasks: [`复习 Python 第 ${index + 1} 天内容`],
+    source: '主题与学习目标',
+    completed: index === 8
+  }));
+  const cadenceFixture = {
+    id: 'cadence-history-preservation-fixture',
+    title: '频率修改历史保留测试',
+    goal: '练习 Python 变量和循环。',
+    level: 'beginner',
+    learningMode: 'balanced',
+    startDate: cadenceStart,
+    days: 14,
+    calendarDays: 14,
+    cadence: { mode: 'daily', weekdays: [] },
+    minutesPerDay: 45,
+    materials: [],
+    plan: {
+      mode: 'ai', summary: '保留已有学习报告与缓存。', difficulty: '入门', warnings: [],
+      knowledge: [{ title: '变量与循环', priority: '重点', explanation: '变量保存值，循环重复处理任务。', source: '主题与学习目标' }],
+      days: cadenceDays
+    },
+    dailyQuizzes: {},
+    lessons: {},
+    tutorChats: {},
+    createdAt: `${cadenceToday}T00:00:00.000Z`
+  };
+  const retainedCacheIndices = [0, 8];
+  for (const dayIndex of retainedCacheIndices) {
+    const day = cadenceFixture.plan.days[dayIndex];
+    const quiz = makeDailyReadinessQuiz(dayIndex, day.date);
+    cadenceFixture.dailyQuizzes[String(dayIndex)] = quiz;
+    cadenceFixture.lessons[String(dayIndex)] = {
+      brief: {
+        text: `第 ${dayIndex + 1} 天的已保存讲解缓存。`,
+        sources: ['主题与学习目标'],
+        limitations: [],
+        generatedDate: cadenceToday,
+        dayTitle: day.title,
+        dayTasks: day.tasks.slice(),
+        daySource: day.source
+      }
+    };
+    cadenceFixture.tutorChats[`daily:${dayIndex}:q1`] = {
+      kind: 'daily',
+      dayIndex,
+      questionId: 'q1',
+      question: quiz.questions[0].question,
+      answer: quiz.answers.q1.text,
+      feedback: quiz.result.items.find(item => item.id === 'q1').feedback,
+      messages: [
+        { role: 'user', text: '请解释这个已保存的问题。' },
+        { role: 'assistant', text: '这个答案对应已保存的参考选项。', sources: ['主题与学习目标'], limitations: [] }
+      ]
+    };
+  }
+  const originalCadenceFixture = JSON.parse(JSON.stringify(cadenceFixture));
+  await window.webContents.executeJavaScript(`window.studyApp.saveTask(${JSON.stringify(cadenceFixture)})`);
+  const seededTaskCount = (await readState(window)).tasks.length;
+  window = await reloadWindow(window, true, seededTaskCount);
+  await click(window, '[data-nav="plans"]', '打开全部计划列表');
+  await waitForJS(window, 'document.querySelector("#appView h1")?.textContent === "全部计划"', '全部计划列表就绪');
+  const tasksFileBeforeCadencePreview = fs.readFileSync(path.join(dataDir, 'tasks.json'), 'utf8');
+  const cadenceRecordsBeforeCancel = apiRecords.length;
+  await clickAction(window, 'edit-cadence', cadenceFixture.id);
+  await waitForJS(window, 'document.querySelector("#cadenceDialog")?.open', '已有计划频率对话框');
+  await setValue(window, '#cadenceForm [name="cadenceMode"]', 'weekly');
+  for (const weekday of [0, 1, 2, 3, 4, 5, 6]) {
+    await setChecked(window, `#cadenceWeekdays [name="cadenceWeekday"][value="${weekday}"]`, [1, 3, 5].includes(weekday));
+  }
+  await click(window, '#previewCadence', '预览周一三五新频率');
+  await waitForJS(window, '!document.querySelector("#cadencePreview").hidden && !document.querySelector("#confirmCadence").hidden', '已有计划新频率预览完成');
+  const cancelledCadencePreview = await window.webContents.executeJavaScript('document.querySelector("#cadencePreview").innerText');
+  assert.match(cancelledCadencePreview, /已完成与历史安排会保留/);
+  assert.equal(apiRecords.slice(cadenceRecordsBeforeCancel).filter(record => record.purpose === '按学习频率重拟未来计划').length, 1, '频率预览应只重拟当前未来日期');
+  let stateAfterPreview = await readState(window);
+  assert.deepEqual(stateAfterPreview.tasks.find(task => task.id === cadenceFixture.id), originalCadenceFixture, '预览阶段不得修改内存任务');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'tasks.json'), 'utf8'), tasksFileBeforeCadencePreview, '预览阶段不得写入 tasks.json');
+  await click(window, '#cadenceDialog [data-close="cadenceDialog"]', '取消频率预览');
+  await waitForJS(window, '!document.querySelector("#cadenceDialog")?.open', '频率预览已取消');
+  stateAfterPreview = await readState(window);
+  assert.deepEqual(stateAfterPreview.tasks.find(task => task.id === cadenceFixture.id), originalCadenceFixture, '取消预览后原任务必须保持不变');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'tasks.json'), 'utf8'), tasksFileBeforeCadencePreview, '取消预览后不得写入任务文件');
+
+  const cadenceRecordsBeforeApplyPreview = apiRecords.length;
+  await clickAction(window, 'edit-cadence', cadenceFixture.id);
+  await waitForJS(window, 'document.querySelector("#cadenceDialog")?.open', '重新打开频率对话框');
+  await setValue(window, '#cadenceForm [name="cadenceMode"]', 'weekly');
+  for (const weekday of [0, 1, 2, 3, 4, 5, 6]) {
+    await setChecked(window, `#cadenceWeekdays [name="cadenceWeekday"][value="${weekday}"]`, [1, 3, 5].includes(weekday));
+  }
+  await click(window, '#previewCadence', '重新预览周一三五频率');
+  await waitForJS(window, '!document.querySelector("#cadencePreview").hidden && !document.querySelector("#confirmCadence").hidden', '确认用频率预览完成');
+  const cadenceRequest = apiRecords.slice(cadenceRecordsBeforeApplyPreview).find(record => record.purpose === '按学习频率重拟未来计划');
+  assert.ok(cadenceRequest);
+  assert.deepEqual(cadenceRequest.payload.cadence, { mode: 'weekly', weekdays: [1, 3, 5] });
+  const expectedNewDates = schedule.learningDates({ startDate: cadenceStart, calendarDays: 14, cadence: { mode: 'weekly', weekdays: [1, 3, 5] } })
+    .filter(date => date >= cadenceToday && !originalCadenceFixture.plan.days.some(day => day.date === date && (day.date < cadenceToday || day.completed)));
+  assert.deepEqual(cadenceRequest.payload.sessions.map(session => session.date), expectedNewDates, '频率模型只收到未来且未完成的新日期');
+  await click(window, '#confirmCadence', '确认并应用周一三五频率');
+  await waitForJS(window, '!document.querySelector("#cadenceDialog")?.open', '新频率已确认并关闭');
+  const updatedCadenceTask = (await readState(window)).tasks.find(task => task.id === cadenceFixture.id);
+  assert.equal(updatedCadenceTask.cadence.mode, 'weekly');
+  assert.deepEqual(updatedCadenceTask.cadence.weekdays, [1, 3, 5]);
+  assert.equal(updatedCadenceTask.calendarDays, 14);
+  assert.equal(updatedCadenceTask.plan.days.length, updatedCadenceTask.days);
+  for (const oldDay of originalCadenceFixture.plan.days.filter(day => day.date < cadenceToday || day.completed)) {
+    const kept = updatedCadenceTask.plan.days.find(day => day.date === oldDay.date);
+    assert.ok(kept, `历史或已完成日期 ${oldDay.date} 必须保留`);
+    assert.deepEqual({ ...kept, day: oldDay.day }, oldDay, `历史或已完成日期 ${oldDay.date} 的内容必须保留`);
+  }
+  for (const oldIndex of retainedCacheIndices) {
+    const oldDay = originalCadenceFixture.plan.days[oldIndex];
+    const newIndex = updatedCadenceTask.plan.days.findIndex(day => day.date === oldDay.date);
+    assert.ok(newIndex >= 0, `报告日期 ${oldDay.date} 必须保留`);
+    const oldQuiz = originalCadenceFixture.dailyQuizzes[String(oldIndex)];
+    const keptQuiz = updatedCadenceTask.dailyQuizzes[String(newIndex)];
+    assert.deepEqual(keptQuiz.answers, oldQuiz.answers, `日期 ${oldDay.date} 的历史作答必须保留`);
+    assert.deepEqual(keptQuiz.result, oldQuiz.result, `日期 ${oldDay.date} 的历史报告必须保留`);
+    assert.deepEqual(updatedCadenceTask.lessons[String(newIndex)].brief, originalCadenceFixture.lessons[String(oldIndex)].brief, `日期 ${oldDay.date} 的讲解缓存必须保留`);
+    const oldChat = originalCadenceFixture.tutorChats[`daily:${oldIndex}:q1`];
+    const keptChat = updatedCadenceTask.tutorChats[`daily:${newIndex}:q1`];
+    assert.ok(keptChat, `日期 ${oldDay.date} 的追问缓存必须保留`);
+    assert.deepEqual({ ...keptChat, dayIndex: oldChat.dayIndex }, oldChat, `日期 ${oldDay.date} 的追问内容必须保留`);
+  }
+  const addedCadenceRecords = apiRecords.slice(cadenceRecordsBeforeCancel).filter(record => record.purpose === '按学习频率重拟未来计划');
+  assert.equal(addedCadenceRecords.length, 2, '预览取消与预览确认各生成一次模型请求');
+
+  currentStage = '验证可选考试大纲、材料授权、总量限制与测验请求边界';
+  window.show();
+  assert.equal(fs.statSync(screenshotDir).isDirectory(), true, '指定截图目录应预先存在，测试不会创建目录');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examDescription").maxLength'), 8000, '考试范围文本输入最多 8,000 字符');
+
+  async function openCreateFixture(title, goal = '理解变量与循环并完成 Python 练习。') {
+    await clickAction(window, 'new-task');
+    await waitForJS(window, 'document.querySelector("#createDialog")?.open', `${title}新建计划对话框`);
+    await setValue(window, '#createForm [name="title"]', title);
+    await setValue(window, '#createForm [name="goal"]', goal);
+    await setValue(window, '#createForm [name="days"]', 2);
+    return testLocalDate();
+  }
+
+  async function dropMaterial(filePath, zone, host, fileName) {
+    const result = await dispatchActualFileDrop(window, filePath, zone);
+    assert.equal(result.prepared, true, `真实 CDP 文件拖放应到达 ${zone}`);
+    await waitForJS(window, `document.querySelector(${JSON.stringify(host)})?.innerText.includes(${JSON.stringify(fileName)})`, `材料已加入 ${zone}`);
+  }
+
+  async function dropMaterials(filePaths, zone, host, fileNames) {
+    const result = await dispatchActualFileDrop(window, filePaths, zone);
+    assert.equal(result.prepared, true, `真实 CDP 多文件拖放应到达 ${zone}`);
+    assert.equal(result.fileCount, filePaths.length, `CDP 应保留该批次全部 ${filePaths.length} 个材料`);
+    const names = JSON.stringify(fileNames);
+    const status = zone === '#examMaterialDropZone' ? '#examMaterialImportStatus' : '#createMaterialImportStatus';
+    await waitForJS(window, `${names}.every(name => document.querySelector(${JSON.stringify(host)})?.innerText.includes(name)) && document.querySelector(${JSON.stringify(status)}).hidden`, `多批材料已加入 ${zone}`);
+  }
+
+  async function saveCreatedPlan(title) {
+    const before = apiRecords.length;
+    await click(window, '#createSubmit', `${title}提交计划`);
+    await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.some(task => task.title === ${JSON.stringify(title)}))`, `${title}计划保存`);
+    await waitForJS(window, '!document.querySelector("#createDialog")?.open', `${title}创建对话框关闭`);
+    const saved = (await readState(window)).tasks.find(task => task.title === title);
+    assert.ok(saved, `${title}应保存到隔离用户数据`);
+    const plannerRequests = apiRecords.slice(before).filter(record => record.purpose === '生成学习计划');
+    assert.equal(plannerRequests.length, 1, `${title}一次提交只发出一次计划请求`);
+    assert.equal(plannerRequests[0].requestBody.max_tokens, undefined, `${title}计划请求继续省略 max_tokens`);
+    return { saved, request: plannerRequests[0] };
+  }
+
+  currentStage = '通过隔离 OCR mock 验证候选页进度与取消';
+  const mockOcrPath = path.join(dataDir, 'mock-ocr-progress.pdf');
+  fs.writeFileSync(mockOcrPath, '% mock OCR fixture; parser is replaced for this test');
+  const originalParseMaterial = services.parseMaterial;
+  const originalShowOpenDialog = dialog.showOpenDialog;
+  let resolveMockParseStarted;
+  let resolveMockParseAborted;
+  const mockParseStarted = new Promise(resolve => { resolveMockParseStarted = resolve; });
+  const mockParseAborted = new Promise(resolve => { resolveMockParseAborted = resolve; });
+  let mockParseCalls = 0;
+  try {
+    services.parseMaterial = (filePath, options = {}) => {
+      mockParseCalls += 1;
+      resolveMockParseStarted(filePath);
+      options.onProgress?.({ stage: 'ocr', page: 150, completed: 3, total: 137 });
+      return new Promise((resolve, reject) => {
+        const abort = () => {
+          resolveMockParseAborted(filePath);
+          reject(new Error('材料导入已取消。'));
+        };
+        options.signal?.addEventListener('abort', abort, { once: true });
+        if (options.signal?.aborted) abort();
+      });
+    };
+    dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [mockOcrPath] });
+    await openCreateFixture('OCR 进度与取消 mock');
+    const apiRequestsBeforeOcr = apiRecords.length;
+    await click(window, '#materialDropZone [data-action="import-create"]', 'mock 选择扫描 PDF');
+    await waitForJS(window,
+      '!document.querySelector("#createMaterialImportStatus").hidden && document.querySelector("#createMaterialImportMessage").textContent.includes("第 150 页")',
+      'OCR 进度通过真实 materials:progress IPC 显示');
+    const ocrStatusText = await window.webContents.executeJavaScript('document.querySelector("#createMaterialImportMessage").textContent');
+    assert.match(ocrStatusText, /第 150 页/);
+    assert.match(ocrStatusText, /已完成 3 \/ 137 页/);
+    assert.match(ocrStatusText, /不会发送给模型服务/);
+    assert.equal(await mockParseStarted, mockOcrPath, 'main 进程应将隔离 fixture 交给 mock parser');
+    assert.equal(mockParseCalls, 1);
+    assert.equal(apiRecords.length, apiRequestsBeforeOcr, '本地 OCR 进度与取消不得调用模型服务');
+    await click(window, '#createMaterialImportStatus [data-action="cancel-material-import"]', '取消 mock OCR 导入');
+    assert.equal(await Promise.race([mockParseAborted, delay(5000).then(() => null)]), mockOcrPath, '取消按钮应通过 materials:cancel 中断当前解析');
+    await waitForJS(window, 'document.querySelector("#createMaterialImportStatus").hidden', '取消后 OCR 状态隐藏');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#createMaterials .attachment-item").length'), 0, '取消解析不得添加半成品材料');
+    assert.equal(apiRecords.length, apiRequestsBeforeOcr, '取消 OCR 后仍不得请求模型服务');
+    await click(window, '#createDialog [data-close="createDialog"]', '关闭 OCR mock 新建对话框');
+    await waitForJS(window, '!document.querySelector("#createDialog")?.open', 'OCR mock 对话框已清理');
+  } finally {
+    services.parseMaterial = originalParseMaterial;
+    dialog.showOpenDialog = originalShowOpenDialog;
+  }
+
+  currentStage = '验证多批材料达到10份后编辑删1再新增，并拒绝第11份';
+  await openCreateFixture('考纲材料10份编辑边界');
+  const studyBatchOne = Array.from({ length: 5 }, (_, index) => writeMarkdownFixture(`count-study-a-${index + 1}.md`, `学习资料 A${index + 1}`));
+  const studyBatchOneNames = studyBatchOne.map(filePath => path.basename(filePath));
+  await dropMaterials(studyBatchOne, '#materialDropZone', '#createMaterials', studyBatchOneNames);
+  const studyBatchTwo = Array.from({ length: 4 }, (_, index) => writeMarkdownFixture(`count-study-b-${index + 1}.md`, `学习资料 B${index + 1}`));
+  const studyBatchTwoNames = studyBatchTwo.map(filePath => path.basename(filePath));
+  await dropMaterials(studyBatchTwo, '#materialDropZone', '#createMaterials', studyBatchTwoNames);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#createMaterials .attachment-item").length'), 9, '前两批普通材料合计应保存9份');
+
+  await click(window, '#createExamButton', '为9份普通材料打开考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '10份上限考纲对话框');
+  const oldOutlineName = 'count-outline-old.md';
+  await dropMaterial(writeMarkdownFixture(oldOutlineName, '旧考纲。'), '#examMaterialDropZone', '#examMaterials', oldOutlineName);
+  await click(window, '#saveExamDraft', '保存第10份考纲附件');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#createExamSummary").innerText.includes("1")', '第10份材料成功暂存');
+
+  await click(window, '#createExamButton', '编辑已有的10份材料考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open && document.querySelectorAll("#examMaterials .attachment-item").length === 1', '原考纲附件重新进入编辑草稿');
+  await click(window, '#examMaterials [data-action="remove-exam-material"][data-material-index="0"]', '从10份材料中移除旧考纲');
+  await waitForJS(window, 'document.querySelectorAll("#examMaterials .attachment-item").length === 0', '删除考纲附件后草稿空位已释放');
+  const replacementOutlineName = 'count-outline-replacement.md';
+  await dropMaterial(writeMarkdownFixture(replacementOutlineName, '替换后的考纲。'), '#examMaterialDropZone', '#examMaterials', replacementOutlineName);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examError").hidden'), true, '删除一份后新增一份不得因旧材料计数而误拒绝');
+  await click(window, '#saveExamDraft', '保存替换后的10份材料考纲');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#createExamSummary").innerText.includes("1")', '替换考纲保存后总量仍为10份');
+
+  await click(window, '#createExamButton', '确认替换后的考纲附件');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open && document.querySelectorAll("#examMaterials .attachment-item").length === 1', '替换后的考纲再次进入编辑');
+  const replacementState = await window.webContents.executeJavaScript(`({
+    text: document.querySelector('#examMaterials').innerText,
+    count: document.querySelectorAll('#examMaterials .attachment-item').length
+  })`);
+  assert.equal(replacementState.count, 1);
+  assert.match(replacementState.text, /count-outline-replacement\.md/);
+  assert.doesNotMatch(replacementState.text, /count-outline-old\.md/);
+
+  const overflowName = 'count-overflow-11.md';
+  const overflowDrop = await dispatchActualFileDrop(window, writeMarkdownFixture(overflowName, '第11份材料。'), '#examMaterialDropZone');
+  assert.equal(overflowDrop.prepared, true);
+  await waitForJS(window, '!document.querySelector("#examError").hidden', '连续多批材料达到10份后拒绝第11份');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#examError").innerText'), /最多 10 份/);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#examMaterials .attachment-item").length'), 1, '超限材料不得进入草稿');
+  await click(window, '#examDialog [data-close="examDialog"]', '关闭10份材料边界考纲');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭10份材料边界计划');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '10份材料边界测试完成');
+
+  await openCreateFixture('可跳过考纲的自学计划', '自学 Python 基础并练习循环。');
+  await setValue(window, '#createForm [name="learningMode"]', 'deep');
+  await click(window, '#createExamButton', '打开空白自学计划的考纲草稿');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '空白考纲对话框');
+  await setValue(window, '#examDescription', '关闭时应丢弃的未保存考纲草稿。');
+  await click(window, '#examDialog [data-close="examDialog"]', '取消未保存的考纲草稿');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open', '未保存考纲已取消');
+  await click(window, '#createExamButton', '重新打开考纲以确认取消语义');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '重新打开的空白考纲对话框');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examDescription").value'), '', '关闭考纲子对话框应丢弃未保存描述');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#examMaterials .attachment-item").length'), 0, '关闭考纲子对话框应丢弃未保存附件');
+  await click(window, '#examDialog [data-close="examDialog"]', '关闭空白考纲对话框');
+  const blankExamPlan = await saveCreatedPlan('可跳过考纲的自学计划');
+  assert.equal(Object.hasOwn(blankExamPlan.saved, 'exam'), false, '完全空白的考纲不得写入 task.exam');
+  assert.equal(blankExamPlan.request.payload.examContext, null, '自学计划请求应明确没有考试范围');
+
+  await openCreateFixture('仅文字考试范围计划');
+  await click(window, '#createExamButton', '打开仅文字考试范围');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '仅文字考试范围对话框');
+  const textOnlyDescription = '重点复习第 2 至 5 章的变量、条件与循环。';
+  await setValue(window, '#examDescription', textOnlyDescription);
+  await click(window, '#saveExamDraft', '保存仅文字考试范围');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open', '仅文字考试范围已暂存');
+  const textOnlyExamPlan = await saveCreatedPlan('仅文字考试范围计划');
+  assert.deepEqual(textOnlyExamPlan.saved.exam, { description: textOnlyDescription, materialIds: [] });
+  assert.deepEqual(textOnlyExamPlan.request.payload.examContext, { description: textOnlyDescription, materials: [] }, '计划请求只包含一次文字考纲描述');
+  assert.equal(textOnlyExamPlan.saved.materials.length, 0);
+
+  await openCreateFixture('仅附件考试范围计划');
+  await click(window, '#createExamButton', '打开仅附件考试范围');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '仅附件考试范围对话框');
+  const examOnlyMarker = 'EXAM_ONLY_BODY_MARKER_0610';
+  const examOnlyName = 'exam-only-outline.md';
+  const examOnlyPath = writeMarkdownFixture(examOnlyName, `考试范围文件：${examOnlyMarker}\n变量与循环。`);
+  await dropMaterial(examOnlyPath, '#examMaterialDropZone', '#examMaterials', examOnlyName);
+  await click(window, '#saveExamDraft', '暂存仅附件考试范围');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open && !document.querySelector("#createConsentWrap").hidden', '仅附件考试范围已合并并要求材料授权');
+  const beforeUnconsentedSubmit = apiRecords.length;
+  await click(window, '#createSubmit', '尝试在未授权时提交附件计划');
+  await waitForJS(window, '!document.querySelector("#createError").hidden', '未授权附件计划显示本地提示');
+  assert.equal(apiRecords.length, beforeUnconsentedSubmit, '未授权时不得将考纲附件发给模型');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createDialog").open'), true, '未授权提交应留在创建对话框');
+  await setChecked(window, '#createConsent', true);
+  const fileOnlyExamPlan = await saveCreatedPlan('仅附件考试范围计划');
+  assert.equal(fileOnlyExamPlan.saved.exam.description, '');
+  assert.equal(fileOnlyExamPlan.saved.exam.materialIds.length, 1);
+  assert.equal(fileOnlyExamPlan.saved.materials.length, 1, '考纲附件应只在统一材料数组保存一次');
+  assert.ok(fileOnlyExamPlan.saved.materials.some(material => material.id === fileOnlyExamPlan.saved.exam.materialIds[0]));
+  assert.deepEqual(fileOnlyExamPlan.request.payload.examContext.materials.map(material => material.name), [examOnlyName]);
+  const fileOnlyBody = fileOnlyExamPlan.request.requestBody.messages[1].content;
+  assert.equal(fileOnlyBody.split(examOnlyMarker).length - 1, 1, '仅附件考纲原文应只发送一次');
+
+  await openCreateFixture('文字和双材料考试范围计划');
+  const studyMarker = 'STUDY_MATERIAL_BODY_MARKER_0610';
+  const studyMaterialName = 'study-notes.md';
+  await dropMaterial(writeMarkdownFixture(studyMaterialName, `学习材料：${studyMarker}\n循环应用练习。`), '#materialDropZone', '#createMaterials', studyMaterialName);
+  await click(window, '#createExamButton', '打开组合考试范围');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '组合考试范围对话框');
+  const combinedDescription = '考试覆盖循环边界条件，并要求解释代码运行结果。';
+  const combinedExamMarker = 'COMBINED_EXAM_BODY_MARKER_0610';
+  const combinedExamName = 'combined-exam-scope.md';
+  await setValue(window, '#examDescription', combinedDescription);
+  await dropMaterial(writeMarkdownFixture(combinedExamName, `考试附件：${combinedExamMarker}\n重点是循环边界。`), '#examMaterialDropZone', '#examMaterials', combinedExamName);
+  await click(window, '#saveExamDraft', '暂存文字与附件组合考纲');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open && !document.querySelector("#createConsentWrap").hidden', '组合考纲已合并并要求材料授权');
+  await setChecked(window, '#createConsent', true);
+  const combinedExamPlan = await saveCreatedPlan('文字和双材料考试范围计划');
+  assert.deepEqual(combinedExamPlan.saved.exam, { description: combinedDescription, materialIds: [combinedExamPlan.saved.materials.find(material => material.name === combinedExamName).id] });
+  assert.equal(combinedExamPlan.saved.materials.length, 2, '学习材料和考纲附件应共用唯一材料数组');
+  assert.equal(new Set(combinedExamPlan.saved.materials.map(material => material.id)).size, 2, '材料合并后编号不得重复');
+  const combinedRequest = combinedExamPlan.request;
+  assert.deepEqual(combinedRequest.payload.examContext, {
+    description: combinedDescription,
+    materials: [{ id: combinedExamPlan.saved.exam.materialIds[0], name: combinedExamName }]
+  }, '模型计划请求应将考试范围附件与普通学习材料区分');
+  const combinedBody = combinedRequest.requestBody.messages[1].content;
+  assert.equal(combinedBody.split(combinedDescription).length - 1, 1, '考纲文字应只出现在一次计划输入中');
+  assert.equal(combinedBody.split(studyMarker).length - 1, 1, '普通学习材料原文应只发送一次');
+  assert.equal(combinedBody.split(combinedExamMarker).length - 1, 1, '考纲附件原文应只发送一次');
+
+  const assessmentRequestsBefore = apiRecords.length;
+  await openAssessmentThroughUI(window, combinedExamPlan.saved.id, 'daily', 0, true);
+  const generatedAssessmentRequest = apiRecords.slice(assessmentRequestsBefore).find(record => record.purpose === '生成每日小测');
+  assert.ok(generatedAssessmentRequest, '含考纲计划的明确测验生成应发送一次 assessment 请求');
+  assert.deepEqual(generatedAssessmentRequest.payload.examContext, {
+    description: combinedDescription,
+    materials: [{ id: combinedExamPlan.saved.exam.materialIds[0], name: combinedExamName }]
+  }, '测验生成请求应包含精简后的考纲元数据');
+  assert.doesNotMatch(generatedAssessmentRequest.requestBody.messages[1].content, /STUDY_MATERIAL_BODY_MARKER_0610|COMBINED_EXAM_BODY_MARKER_0610/, '已有知识清单时测验请求不得重复携带附件原文');
+  for (const [index, question] of makeAssessmentQuestions('daily').entries()) {
+    if (question.type === 'choice') await chooseRadio(window, `#quizForm input[type="radio"][data-qid="q${index + 1}"][value="A"]`);
+    else await setValue(window, `#quizForm [data-answer][data-qid="q${index + 1}"]`, '用循环逐项检查并汇总数据。');
+  }
+  const gradeRequestStart = apiRecords.length;
+  await click(window, '#submitQuiz', '提交组合考纲计划的每日测验');
+  await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(task => task.id === ${JSON.stringify(combinedExamPlan.saved.id)})?.dailyQuizzes?.['0']?.result))`, '组合考纲计划的测验报告已保存');
+  const gradeRecord = apiRecords.slice(gradeRequestStart).find(record => record.purpose === '评分并生成学习报告');
+  assert.ok(gradeRecord);
+  assert.equal(Object.hasOwn(gradeRecord.payload, 'exam'), false, '评分请求不应再次发送考纲元数据');
+  assert.equal(Object.hasOwn(gradeRecord.payload, 'examContext'), false, '评分请求不应重复发送考试范围上下文');
+  assert.doesNotMatch(gradeRecord.requestBody.messages[1].content, /考试覆盖循环边界条件|COMBINED_EXAM_BODY_MARKER_0610/, '评分请求不应重复携带考纲文字或附件');
+
+  currentStage = '阻止考纲与学习材料合计超过200000字';
+  await openCreateFixture('学习材料总量边界测试');
+  const budgetStudyName = 'budget-study-120001.md';
+  await dropMaterial(writeMarkdownFixture(budgetStudyName, 'a'.repeat(120001)), '#materialDropZone', '#createMaterials', budgetStudyName);
+  await click(window, '#createExamButton', '打开材料总量边界考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '材料总量边界考纲对话框');
+  const budgetExamName = 'budget-exam-80001.md';
+  const budgetExamDrop = await dispatchActualFileDrop(window, writeMarkdownFixture(budgetExamName, 'b'.repeat(80001)), '#examMaterialDropZone');
+  assert.equal(budgetExamDrop.prepared, true, '超限考纲文件仍应通过真实文件拖放流程到达 UI');
+  await waitForJS(window, '!document.querySelector("#examError").hidden && document.querySelector("#examMaterialImportStatus").hidden', '超出 200,000 字的合计材料量被拒绝并结束导入');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#examError").textContent'), /200,000/);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#examMaterials .attachment-item").length'), 0, '超限考纲附件不得进入草稿');
+  await click(window, '#examDialog [data-close="examDialog"]', '取消超限考纲草稿');
+  await click(window, '#createDialog [data-close="createDialog"]', '取消材料总量边界计划');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '材料总量边界测试已清理');
+  assert.equal(apiRecords.some(record => record.purpose === '生成学习计划' && record.payload.title === '学习材料总量边界测试'), false, '超限材料测试不得调用模型');
+
+  currentStage = '分别展示新 studyNotes、旧 warning 分类与材料阅读提示';
+  let visualTask = JSON.parse(JSON.stringify((await readState(window)).tasks.find(task => task.id === combinedExamPlan.saved.id)));
+  visualTask.plan.studyNotes = ['重点：理解循环边界条件。', '易错点：不要把结束条件写反。'];
+  visualTask.plan.warnings = ['生成提示：材料解析有一页未能识别。'];
+  const visualExamMaterial = visualTask.materials.find(material => material.id === visualTask.exam.materialIds[0]);
+  visualExamMaterial.readingWarnings = ['PDF 中有扫描页，阅读时请对照原文件核查。'];
+  const visualFirstDay = visualTask.plan.days[0];
+  visualTask.lessons ||= {};
+  visualTask.lessons['0'] = { brief: {
+    text: '概念：循环重复执行操作。例子：逐项累加账目。易错点：结束条件必须能停止。',
+    sources: [combinedExamName], limitations: [], generatedDate: visualFirstDay.date,
+    dayTitle: visualFirstDay.title, dayTasks: [...visualFirstDay.tasks], daySource: visualFirstDay.source
+  } };
+  visualTask.finalQuizHistory = [JSON.parse(JSON.stringify(originalLegacyTask.quiz))];
+  const pendingVisualQuiz = makeDailyReadinessQuiz(1, visualTask.plan.days[1].date);
+  delete pendingVisualQuiz.answers;
+  delete pendingVisualQuiz.result;
+  delete pendingVisualQuiz.resultDate;
+  visualTask.dailyQuizzes['1'] = pendingVisualQuiz;
+  await window.webContents.executeJavaScript(`window.studyApp.saveTask(${JSON.stringify(visualTask)})`);
+
+  const legacyWarningFixture = JSON.parse(JSON.stringify(originalLegacyTask));
+  legacyWarningFixture.id = 'desktop-legacy-warning-classification-fixture';
+  legacyWarningFixture.title = '旧版警告分类视觉测试';
+  legacyWarningFixture.plan.warnings = ['循环概念容易混淆，请先区分条件与重复次数。', '定义不能凭名称猜测含义。', '材料解析缺页，安排范围有限。', '内容可能不完整。'];
+  delete legacyWarningFixture.plan.studyNotes;
+  legacyWarningFixture.createdAt = `${testLocalDate()}T00:00:00.000Z`;
+  await window.webContents.executeJavaScript(`window.studyApp.saveTask(${JSON.stringify(legacyWarningFixture)})`);
+  let visualState = await readState(window);
+  assert.ok(visualState.tasks.some(task => task.id === legacyWarningFixture.id));
+  window = await reloadWindow(window, true, visualState.tasks.length);
+  await clickAction(window, 'open-plan', legacyWarningFixture.id);
+  await waitForJS(window, `document.querySelector("#appView h1")?.textContent === ${JSON.stringify(legacyWarningFixture.title)}`, '旧计划警告分类详情');
+  const legacyWarningSections = await window.webContents.executeJavaScript(`({
+    notes: document.querySelector('.plan-study-notes')?.innerText || '',
+    warnings: document.querySelector('.plan-warnings')?.innerText || ''
+  })`);
+  assert.match(legacyWarningSections.notes, /循环概念容易混淆/);
+  assert.match(legacyWarningSections.notes, /定义不能凭名称猜测含义/);
+  assert.doesNotMatch(legacyWarningSections.notes, /材料解析|内容可能不完整/);
+  assert.match(legacyWarningSections.warnings, /材料解析缺页/);
+  assert.match(legacyWarningSections.warnings, /内容可能不完整/, '无法安全分类的旧警告应留在生成提示区');
+
+  currentStage = '真实 Electron 双语言双尺寸主视图与对话框布局截图';
+  async function capturePage(name, language, width) {
+    await captureVisualScreenshot(window, `0.6-ui-${language}-${width}x${width === 850 ? 650 : 800}-${name}.png`);
+  }
+  async function captureDialog(name, selector, language, width) {
+    await captureVisualScreenshot(window, `0.6-ui-${language}-${width}x${width === 850 ? 650 : 800}-${name}.png`, selector);
+  }
+  async function captureMainViews(language, width) {
+    await click(window, '[data-nav="overview"]', '截图：学习概览');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .welcome-panel"))', '概览视图已加载');
+    await capturePage('overview', language, width);
+    await click(window, '[data-nav="today"]', '截图：今日安排');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .page-head"))', '今日安排视图已加载');
+    await capturePage('today', language, width);
+    await click(window, '[data-nav="plans"]', '截图：全部计划');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .plan-card"))', '计划列表视图已加载');
+    await capturePage('plans', language, width);
+    await clickAction(window, 'open-plan', visualTask.id);
+    await waitForJS(window, `document.querySelector("#appView h1")?.textContent === ${JSON.stringify(visualTask.title)}`, '考试范围计划详情已加载');
+    const planDetail = await window.webContents.executeJavaScript(`({
+      notes: document.querySelector('.plan-study-notes')?.innerText || '',
+      warnings: document.querySelector('.plan-warnings')?.innerText || '',
+      exam: document.querySelector('.plan-exam-summary')?.innerText || ''
+    })`);
+    assert.match(planDetail.notes, /理解循环边界条件/);
+    assert.match(planDetail.warnings, /材料解析有一页未能识别/);
+    assert.match(planDetail.exam, /循环边界条件/);
+    assert.match(planDetail.exam, /combined-exam-scope\.md/);
+    await capturePage('detail', language, width);
+    await click(window, '[data-nav="materials"]', '截图：材料库');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .material-card"))', '材料库视图已加载');
+    const materialWarning = await window.webContents.executeJavaScript('document.querySelector("#appView .material-reading-summary")?.innerText || ""');
+    assert.match(materialWarning, /PDF 中有扫描页/);
+    await capturePage('materials', language, width);
+    await click(window, '[data-nav="plans"]', '从材料库返回计划');
+    await clickAction(window, 'open-plan', visualTask.id);
+    await openAssessmentThroughUI(window, visualTask.id, 'daily', 1, false);
+    await waitForJS(window, 'document.querySelectorAll("#quizForm .quiz-question").length === 5', '未提交的每日测验界面');
+    await capturePage('quiz', language, width);
+    await clickAction(window, 'open-plan', visualTask.id);
+    await openAssessmentThroughUI(window, visualTask.id, 'daily', 0, false);
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .learning-report"))', '已提交的每日报告界面');
+    await capturePage('report', language, width);
+  }
+
+  async function captureStandardDialogs(language, width) {
+    await clickAction(window, 'new-task');
+    await waitForJS(window, 'document.querySelector("#createDialog")?.open', '截图：创建对话框已打开');
+    await captureDialog('dialog-create', '#createDialog', language, width);
+    await click(window, '#createExamButton', '打开截图考纲对话框');
+    await waitForJS(window, 'document.querySelector("#examDialog")?.open', '截图：考纲对话框已打开');
+    await captureDialog('dialog-exam', '#examDialog', language, width);
+    await click(window, '#examDialog [data-close="examDialog"]', '关闭截图考纲对话框');
+    await click(window, '#createDialog [data-close="createDialog"]', '关闭截图创建对话框');
+    await click(window, '#profileButton', '截图：打开个人资料');
+    await waitForJS(window, 'document.querySelector("#profileDialog")?.open', '截图：个人资料对话框已打开');
+    await captureDialog('dialog-profile', '#profileDialog', language, width);
+    await click(window, '#profileDialog [data-close="profileDialog"]', '关闭截图个人资料');
+    await clickAction(window, 'settings');
+    await waitForJS(window, 'document.querySelector("#settingsDialog")?.open', '截图：设置对话框已打开');
+    await captureDialog('dialog-settings', '#settingsDialog', language, width);
+    await click(window, '#settingsDialog [data-close="settingsDialog"]', '关闭截图设置');
+    await clickAction(window, 'open-plan', visualTask.id);
+    await clickAction(window, 'edit-day', visualTask.id, { dayIndex: 0 });
+    await waitForJS(window, 'document.querySelector("#editDayDialog")?.open', '截图：编辑日程对话框已打开');
+    await captureDialog('dialog-edit', '#editDayDialog', language, width);
+    await click(window, '#editDayDialog [data-close="editDayDialog"]', '关闭截图编辑日程');
+    await click(window, '[data-nav="materials"]', '打开材料库以截图预览');
+    await click(window, `[data-action="preview-library-material"][data-material-id="${visualExamMaterial.id}"]`, '截图：打开材料预览');
+    await waitForJS(window, 'document.querySelector("#materialDialog")?.open', '截图：材料预览对话框已打开');
+    const previewWarning = await window.webContents.executeJavaScript('document.querySelector("#materialWarnings")?.innerText || ""');
+    assert.match(previewWarning, /PDF 中有扫描页/);
+    await captureDialog('dialog-material', '#materialDialog', language, width);
+    await click(window, '#materialDialog [data-close="materialDialog"]', '关闭截图材料预览');
+    await clickAction(window, 'open-plan', visualTask.id);
+    await clickAction(window, 'edit-cadence', visualTask.id);
+    await waitForJS(window, 'document.querySelector("#cadenceDialog")?.open', '截图：频率调整对话框已打开');
+    await captureDialog('dialog-cadence', '#cadenceDialog', language, width);
+    await click(window, '#cadenceDialog [data-close="cadenceDialog"]', '关闭截图频率调整');
+    await clickAction(window, 'view-final-history', visualTask.id);
+    await waitForJS(window, 'document.querySelector("#finalHistoryDialog")?.open', '截图：历史周期报告对话框已打开');
+    await captureDialog('dialog-final-history', '#finalHistoryDialog', language, width);
+    await click(window, '#finalHistoryDialog [data-close="finalHistoryDialog"]', '关闭截图历史周期报告');
+    await clickAction(window, 'open-lesson', visualTask.id, { dayIndex: 0 });
+    await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open', '截图：讲解对话框已打开');
+    await captureDialog('dialog-tutoring', '#tutoringDialog', language, width);
+    await click(window, '#tutoringDialog [data-close="tutoringDialog"]', '关闭截图讲解对话框');
+  }
+
+  const visualAdjustmentRecords = [];
+  for (const language of ['zh-CN', 'en']) {
+    const imageLanguage = language === 'zh-CN' ? 'zh' : 'en';
+    await setUiLanguage(window, language);
+    for (const width of [850, 1320]) {
+      const height = width === 850 ? 650 : 800;
+      await setVisualViewport(window, width, height);
+      await captureMainViews(imageLanguage, width);
+      await captureStandardDialogs(imageLanguage, width);
+      if (width === 850) {
+        await clickAction(window, 'open-plan', visualTask.id);
+        await openAssessmentThroughUI(window, visualTask.id, 'daily', 0, false);
+        const adjustmentBefore = apiRecords.length;
+        await clickAction(window, 'propose-adjustment', visualTask.id, { dayIndex: 0 });
+        await waitForJS(window, 'document.querySelector("#adjustmentDialog")?.open && !document.querySelector("#adjustmentPreview").hidden', '截图：后续调整预览对话框已打开');
+        const adjustmentRecord = apiRecords.slice(adjustmentBefore).find(record => record.purpose === '调整后续学习规划' && record.payload?.title === visualTask.title);
+        assert.ok(adjustmentRecord, '真实打开后续调整预览应使用 localhost mock');
+        visualAdjustmentRecords.push(adjustmentRecord);
+        await captureDialog('dialog-adjustment', '#adjustmentDialog', imageLanguage, 850);
+        await setVisualViewport(window, 1320, 800);
+        await captureDialog('dialog-adjustment', '#adjustmentDialog', imageLanguage, 1320);
+        await click(window, '#adjustmentDialog [data-action="cancel-adjustment"]', '取消截图后续调整预览');
+        await waitForJS(window, '!document.querySelector("#adjustmentDialog")?.open', '截图后续调整预览已取消');
+      }
+    }
+  }
+  assert.equal(visualAdjustmentRecords.length, 2, '中文和英文讲解布局各使用一次真实后续调整预览');
+  assert.deepEqual(visualAdjustmentRecords.map(record => record.payload.outputLanguage), ['zh-CN', 'en']);
+
   currentStage = '清除 Key、重新锁定并确认任务磁盘内容不变';
   const taskFilePath = path.join(dataDir, 'tasks.json');
   const taskFileBeforeRelock = fs.readFileSync(taskFilePath, 'utf8');
@@ -1490,8 +2431,19 @@ async function run() {
     '生成每日小测', '生成周期测验', '评分并生成学习报告',
     '生成每日小测', '评分并生成学习报告',
     '生成每日小测', '评分并生成学习报告',
-    '调整后续学习规划', '调整后续学习规划'
+    '调整后续学习规划', '调整后续学习规划',
+    '生成学习计划', '生成学习计划',
+    '生成学习计划概要与知识清单',
+    ...Array.from({ length: Math.ceil(60 / 7) }, () => '生成学习计划每日安排'),
+    '生成学习计划概要与知识清单',
+    '按学习频率重拟未来计划', '按学习频率重拟未来计划',
+    '生成学习计划', '生成学习计划', '生成学习计划', '生成学习计划',
+    '生成每日小测', '评分并生成学习报告',
+    '调整后续学习规划'
   ]);
+  const plannerPurposes = new Set(['生成学习计划', '生成学习计划概要与知识清单', '生成学习计划每日安排', '按学习频率重拟未来计划']);
+  assert.ok(apiRecords.filter(record => plannerPurposes.has(record.purpose)).every(record => record.requestBody.max_tokens === undefined), '所有新旧计划生成与频率重排请求都必须省略 max_tokens');
+  assert.ok(apiRecords.find(record => record.purpose === '连接测试').requestBody.max_tokens >= 512, '连接测试仍须留出足够的输出空间');
   console.log(`PASS desktop flow: old history and profile gates restored; native file drop imported; ${newTask.plan.knowledge.length} knowledge points; daily report ${adjustedTask.dailyQuizzes['0'].result.score}/100; future adjustment preserved completed history`);
 }
 

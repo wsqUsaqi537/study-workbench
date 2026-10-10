@@ -2,6 +2,7 @@
 
 const services = require('./services.cjs');
 const assessment = require('./assessment.cjs');
+const schedule = require('./schedule.js');
 const { EXAMPASS_RULES } = require('./exampass.cjs');
 const { languageInstruction, normalizeLanguage } = require('./i18n.js');
 
@@ -43,6 +44,7 @@ function validateLessonRecord(record, task, dayIndex, depth) {
   if (!validDate(record.generatedDate)) fail('讲解缓存生成日期无效。');
   if (!Number.isInteger(task.days) || dayIndex < 0 || dayIndex >= task.days || !plain(task.plan) ||
       !Array.isArray(task.plan.days) || task.plan.days.length !== task.days) fail('讲解缓存对应的学习日期无效。');
+  schedule.validateTimeline(task);
   const day = task.plan && task.plan.days && task.plan.days[dayIndex];
   if (!plain(day) || typeof day.title !== 'string' || !Array.isArray(day.tasks) || day.tasks.length < 1 || day.tasks.length > 20 ||
       day.tasks.some(item => typeof item !== 'string' || item.length > 2000) ||
@@ -140,9 +142,10 @@ function validateTutoringRecords(task) {
 function validatePlanDay(task, dayIndex) {
   services.validateInput(task);
   if (!plain(task.plan) || !Array.isArray(task.plan.days) || task.plan.days.length !== task.days) fail('学习计划与学习周期不一致。');
+  schedule.validateTimeline(task);
   if (!Number.isInteger(dayIndex) || dayIndex < 0 || dayIndex >= task.days) fail('讲解日期超出学习周期。');
   const day = task.plan.days[dayIndex];
-  if (!plain(day) || day.day !== dayIndex + 1 || day.date !== services.formatDate(task.startDate, dayIndex)) fail('学习计划日期或顺序无效。');
+  if (!plain(day) || day.day !== dayIndex + 1) fail('学习计划日期或顺序无效。');
   services.requireString(day.title, '每日标题', 1, 300);
   if (!Array.isArray(day.tasks) || day.tasks.length < 1 || day.tasks.length > 20 ||
       day.tasks.some(item => typeof item !== 'string' || !item.trim() || item.length > 2000)) fail('每日学习任务格式无效。');
@@ -252,7 +255,7 @@ async function generateLesson(task, dayIndex, depth, settings = {}) {
   sources.forEach(source => services.validateSource(source, task, '讲解来源'));
   const materials = relevantMaterials(task, sources, target + '\n' + knowledge.map(item => item.title).join('\n'));
   const supplementLabel = normalizeLanguage(settings.language) === 'en' ? 'General background' : '通识补充';
-  const systemMessage = [
+  let systemMessage = [
     '你是每日学习讲解助手。只讲解给出的当前日任务，不提前讲未来学习内容。',
     EXAMPASS_RULES,
     depth === 'brief' ? '使用简洁讲解，重点帮助学习者快速理解并完成当天任务。' : '使用展开讲解，说明原理、步骤和边界，但严格限定在当天任务。',
@@ -261,6 +264,7 @@ async function generateLesson(task, dayIndex, depth, settings = {}) {
     '材料证据有限时，在 limitations 中说明；不要声称覆盖了未提供或未发送的内容。不要泄露 API 配置或隐藏信息。',
     languageInstruction(settings.language)
   ].join('\n');
+  systemMessage += '\n' + services.documentReadingRules(materials);
   const payload = {
     purpose: '讲解当前日学习内容',
     outputLanguage: normalizeLanguage(settings.language),

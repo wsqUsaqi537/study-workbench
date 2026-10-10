@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="styles.css">
   <script src="ui-messages.js" defer></script>
   <script src="i18n.js" defer></script>
+  <script src="schedule.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -70,7 +71,21 @@
         <label class="field"><span data-i18n="当前基础">当前基础</span><select name="level"><option value="beginner" data-i18n="刚刚开始">刚刚开始</option><option value="intermediate" data-i18n="有一些基础">有一些基础</option><option value="advanced" data-i18n="希望深入掌握">希望深入掌握</option></select></label>
         <label class="field"><span data-i18n="学习方式">学习方式</span><select name="learningMode"><option value="exam" data-i18n="备考">备考</option><option value="balanced" selected data-i18n="平衡">平衡</option><option value="deep" data-i18n="深度学习">深度学习</option></select></label>
         <label class="field"><span data-i18n="开始日期">开始日期</span><input name="startDate" type="date" required></label>
-        <label class="field"><span data-i18n="学习周期">学习周期</span><span class="input-suffix"><input name="days" type="number" min="2" max="180" value="14" required><em data-i18n="天">天</em></span></label>
+        <label class="field"><span data-i18n="日历跨度">日历跨度</span><span class="input-suffix"><input name="days" type="number" min="2" max="180" value="14" required><em data-i18n="天">天</em></span></label>
+        <label class="field"><span data-i18n="学习频率">学习频率</span><select name="cadenceMode"><option value="daily" data-i18n="每天">每天</option><option value="alternate" data-i18n="隔日">隔日</option><option value="weekly" data-i18n="每周指定星期">每周指定星期</option></select></label>
+        <fieldset id="createWeekdays" class="cadence-weekday-field field-wide" hidden>
+          <legend data-i18n="每周学习日">每周学习日</legend>
+          <div class="weekday-choice-list">
+            <label><input type="checkbox" name="cadenceWeekday" value="1"><span data-i18n="星期一">星期一</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="2"><span data-i18n="星期二">星期二</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="3"><span data-i18n="星期三">星期三</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="4"><span data-i18n="星期四">星期四</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="5"><span data-i18n="星期五">星期五</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="6"><span data-i18n="星期六">星期六</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="0"><span data-i18n="星期日">星期日</span></label>
+          </div>
+        </fieldset>
+        <p id="createCadenceSummary" class="cadence-summary field-wide" aria-live="polite"></p>
         <label class="field"><span data-i18n="每天投入">每天投入</span><span class="input-suffix"><input name="minutesPerDay" type="number" min="15" max="480" value="60" required><em data-i18n="分钟">分钟</em></span></label>
       </div>
       <section class="goal-discussion" aria-labelledby="discussionTitle">
@@ -82,13 +97,37 @@
         <label class="field discussion-input"><span data-i18n="补充说明或回复">补充说明或回复</span><textarea id="clarifyInput" rows="2" maxlength="4000" data-i18n-placeholder="例如：我会参加期末考试，希望多安排真题练习。" placeholder="例如：我会参加期末考试，希望多安排真题练习。"></textarea></label>
         <div class="discussion-actions"><span class="discussion-hint" data-i18n="讨论内容仅用于本次计划。">讨论内容仅用于本次计划。</span><button id="clarifySubmit" class="button button-small button-outline" type="button" data-i18n="开始讨论目标">开始讨论目标</button><button id="confirmBrief" class="button button-small button-primary" type="button" data-i18n="确认学习范围" hidden>确认学习范围</button></div>
       </section>
+      <section class="exam-outline-entry" aria-labelledby="examOutlineTitle">
+        <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选 · 备考">可选 · 备考</span><h3 id="examOutlineTitle" data-i18n="考试大纲">考试大纲</h3></div><button id="createExamButton" class="button button-small button-outline" type="button" data-action="open-exam-dialog" data-i18n="添加考试大纲">添加考试大纲</button></div>
+        <p data-i18n="可填写考试范围或上传大纲文件；自学计划可以跳过。">可填写考试范围或上传大纲文件；自学计划可以跳过。</p>
+        <div id="createExamSummary" class="exam-outline-summary" hidden></div>
+      </section>
       <section id="materialDropZone" class="attachment-box" aria-labelledby="attachmentTitle">
         <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选">可选</span><h3 id="attachmentTitle" data-i18n="学习材料">学习材料</h3></div><button class="button button-small button-outline" type="button" data-action="import-create"><span data-i18n="＋ 添加材料">＋ 添加材料</span></button></div>
-        <p data-i18n="点击添加，或将 PDF、DOCX、PPTX、MD、TEX 拖入此处。旧版 DOC/PPT 请先转换；扫描件暂不识别。">点击添加，或将 PDF、DOCX、PPTX、MD、TEX 拖入此处。旧版 DOC/PPT 请先转换；扫描件暂不识别。</p>
+        <p data-i18n="点击添加，或将 PDF、DOCX、PPTX、MD、TEX 拖入此处。旧版 DOC/PPT 请先转换；扫描 PDF 将尝试在本机识别。">点击添加，或将 PDF、DOCX、PPTX、MD、TEX 拖入此处。旧版 DOC/PPT 请先转换；扫描 PDF 将尝试在本机识别。</p>
         <div id="createMaterials" class="attachment-list"></div>
+        <div id="createMaterialImportStatus" class="material-import-status" hidden><p id="createMaterialImportMessage" role="status" aria-live="polite"></p><button class="inline-remove" type="button" data-action="cancel-material-import" data-import-target="study" data-i18n="取消导入">取消导入</button></div>
       </section>
       <label id="createConsentWrap" class="consent-row" hidden><input id="createConsent" type="checkbox"><span><strong data-i18n="我同意发送本次添加的材料文字">我同意发送本次添加的材料文字</strong><small data-i18n="生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。">生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。</small></span></label>
+      <p id="createLoadingStatus" class="delayed-loading-status" role="status" aria-live="polite" hidden></p>
       <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="createDialog" data-i18n="取消">取消</button><button id="createSubmit" class="button button-primary" type="submit"><span class="button-label" data-i18n="生成学习计划">生成学习计划</span><span class="button-spinner" aria-hidden="true"></span></button></div>
+    </form>
+  </dialog>
+
+  <dialog id="examDialog" class="app-dialog exam-dialog" aria-labelledby="examDialogTitle">
+    <form id="examForm" novalidate>
+      <div class="dialog-topline"><span class="eyebrow" data-i18n="考试范围">考试范围</span><button class="dialog-close" type="button" data-close="examDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+      <h2 id="examDialogTitle" data-i18n="添加考试大纲">添加考试大纲</h2>
+      <p class="dialog-intro" data-i18n="写下考试范围、章节或题型，也可以添加 PDF、DOCX、PPTX、MD、TEX 文件。自学可跳过。">写下考试范围、章节或题型，也可以添加 PDF、DOCX、PPTX、MD、TEX 文件。自学可跳过。</p>
+      <div id="examError" class="form-message error-message" role="alert" hidden></div>
+      <label class="field"><span data-i18n="考试范围补充">考试范围补充</span><textarea id="examDescription" name="description" rows="5" maxlength="8000" data-i18n-placeholder="例如：重点考查第 2 至 5 章，包含基础概念、公式应用和实验分析。" placeholder="例如：重点考查第 2 至 5 章，包含基础概念、公式应用和实验分析。"></textarea><small class="field-hint" data-i18n="最多 8,000 个字符。">最多 8,000 个字符。</small></label>
+      <section id="examMaterialDropZone" class="attachment-box exam-material-zone" aria-labelledby="examMaterialTitle">
+        <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选">可选</span><h3 id="examMaterialTitle" data-i18n="大纲文件">大纲文件</h3></div><button class="button button-small button-outline" type="button" data-action="import-exam-material"><span data-i18n="＋ 添加材料">＋ 添加材料</span></button></div>
+        <p data-i18n="点击添加，或将支持的文件拖入此处。">点击添加，或将支持的文件拖入此处。</p>
+        <div id="examMaterials" class="attachment-list"></div>
+        <div id="examMaterialImportStatus" class="material-import-status" hidden><p id="examMaterialImportMessage" role="status" aria-live="polite"></p><button class="inline-remove" type="button" data-action="cancel-material-import" data-import-target="exam" data-i18n="取消导入">取消导入</button></div>
+      </section>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="examDialog" data-i18n="取消">取消</button><button id="saveExamDraft" class="button button-primary" type="button" data-action="save-exam-draft" data-i18n="保存到计划">保存到计划</button></div>
     </form>
   </dialog>
 
@@ -143,6 +182,7 @@
     <div class="dialog-topline"><span class="eyebrow" data-i18n="材料预览">材料预览</span><button class="dialog-close" type="button" data-close="materialDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
     <h2 id="materialTitle" data-i18n="材料名称">材料名称</h2>
     <div class="material-meta" id="materialMeta"></div>
+    <div id="materialWarnings" class="material-reading-warnings" hidden></div>
     <pre id="materialText" class="material-text"></pre>
     <div class="dialog-actions"><button class="button button-primary" type="button" data-close="materialDialog" data-i18n="完成">完成</button></div>
   </dialog>
@@ -153,6 +193,38 @@
     <p class="dialog-intro" data-i18n="请检查调整内容。确认后会替换所列未完成日期，并清除这些日期的每日小测和原期末测验。">请检查调整内容。确认后会替换所列未完成日期，并清除这些日期的每日小测和原期末测验。</p>
     <div id="adjustmentPreview"></div>
     <div class="dialog-actions"><button class="button button-quiet" type="button" data-action="cancel-adjustment" data-i18n="取消">取消</button><button class="button button-primary" type="button" data-action="confirm-adjustment" data-i18n="确认并应用">确认并应用</button></div>
+  </dialog>
+  <dialog id="cadenceDialog" class="app-dialog cadence-dialog" aria-labelledby="cadenceTitle">
+    <form id="cadenceForm" novalidate>
+      <div class="dialog-topline"><span class="eyebrow" data-i18n="学习频率">学习频率</span><button class="dialog-close" type="button" data-close="cadenceDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+      <h2 id="cadenceTitle" data-i18n="调整学习频率">调整学习频率</h2>
+      <p class="dialog-intro" data-i18n="预览只会列出未来未完成的学习安排；已完成和历史记录会保留。">预览只会列出未来未完成的学习安排；已完成和历史记录会保留。</p>
+      <div id="cadenceError" class="form-message error-message" role="alert" hidden></div>
+      <fieldset id="cadenceFields" class="cadence-controls">
+        <label class="field"><span data-i18n="学习频率">学习频率</span><select name="cadenceMode"><option value="daily" data-i18n="每天">每天</option><option value="alternate" data-i18n="隔日">隔日</option><option value="weekly" data-i18n="每周指定星期">每周指定星期</option></select></label>
+        <fieldset id="cadenceWeekdays" class="cadence-weekday-field" hidden>
+          <legend data-i18n="每周学习日">每周学习日</legend>
+          <div class="weekday-choice-list">
+            <label><input type="checkbox" name="cadenceWeekday" value="1"><span data-i18n="星期一">星期一</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="2"><span data-i18n="星期二">星期二</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="3"><span data-i18n="星期三">星期三</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="4"><span data-i18n="星期四">星期四</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="5"><span data-i18n="星期五">星期五</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="6"><span data-i18n="星期六">星期六</span></label>
+            <label><input type="checkbox" name="cadenceWeekday" value="0"><span data-i18n="星期日">星期日</span></label>
+          </div>
+        </fieldset>
+      </fieldset>
+      <p id="cadenceLoadingStatus" class="delayed-loading-status" role="status" aria-live="polite" hidden></p>
+      <div id="cadencePreview" class="cadence-preview" hidden></div>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="cadenceDialog" data-i18n="取消">取消</button><button id="previewCadence" class="button button-outline" type="submit"><span class="button-label" data-i18n="预览新频率">预览新频率</span><span class="button-spinner" aria-hidden="true"></span></button><button id="confirmCadence" class="button button-primary" type="button" data-action="confirm-cadence" hidden><span class="button-label" data-i18n="确认并应用">确认并应用</span><span class="button-spinner" aria-hidden="true"></span></button></div>
+    </form>
+  </dialog>
+  <dialog id="finalHistoryDialog" class="app-dialog final-history-dialog" aria-labelledby="finalHistoryTitle">
+    <div class="dialog-topline"><span class="eyebrow" data-i18n="历史周期报告">历史周期报告</span><button class="dialog-close" type="button" data-close="finalHistoryDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
+    <h2 id="finalHistoryTitle"></h2>
+    <div id="finalHistoryContent" class="final-history-content"></div>
+    <div class="dialog-actions"><button class="button button-primary" type="button" data-close="finalHistoryDialog" data-i18n="完成">完成</button></div>
   </dialog>
   <dialog id="tutoringDialog" class="app-dialog tutoring-dialog" aria-labelledby="tutoringTitle">
     <div class="dialog-topline"><span class="eyebrow" data-i18n="理解与练习">理解与练习</span><button class="dialog-close" type="button" data-close="tutoringDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>

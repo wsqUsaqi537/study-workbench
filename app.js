@@ -4,6 +4,7 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const api = window.studyApp;
+  const schedule = window.StudySchedule;
   const viewHost = $('#appView');
   const state = {
     tasks: [],
@@ -15,7 +16,12 @@
   let currentView = 'overview';
   let selectedTaskId = null;
   let createMaterials = [];
+  let createExamDescription = '';
+  let createExamMaterials = [];
+  let examDraft = null;
+  let examDialogSessionId = 0;
   let materialImportBusy = false;
+  let activeMaterialImport = null;
   let editingTaskId = null;
   let toastTimer = null;
   let assessmentSelector = { kind: 'final' };
@@ -25,6 +31,12 @@
   let settingsRequestId = 0;
   let createSessionId = 0;
   let createActivity = null;
+  let planProgressUnsubscribe = null;
+  let materialProgressUnsubscribe = null;
+  let cadenceContext = null;
+  let cadenceActivity = null;
+  let cadenceSessionId = 0;
+  let cadenceApplyBusy = false;
   let discussionMessages = [];
   let discussionBrief = null;
   let confirmedBrief = null;
@@ -174,6 +186,51 @@
     return Array.isArray(task?.materials) ? task.materials : [];
   }
 
+  function materialReadingWarnings(material) {
+    return Array.isArray(material?.readingWarnings)
+      ? material.readingWarnings.filter(item => typeof item === 'string' && item.trim()).slice(0, 10)
+      : [];
+  }
+
+  function materialReadingSummaryHTML(material) {
+    const warnings = materialReadingWarnings(material);
+    if (!warnings.length) return '';
+    const translated = warnings.map(warning => t(warning));
+    const summary = translated[0];
+    const title = translated.join(state.preferences.language === 'en' ? ' · ' : '；');
+    return `<small class="material-reading-summary" title="${escapeHTML(title)}"><strong>${t("阅读提示")} · </strong>${escapeHTML(summary)}${warnings.length > 1 ? ` ${t`另有 ${warnings.length - 1} 条`}` : ''}</small>`;
+  }
+
+  function planWarningSections(plan) {
+    const warnings = Array.isArray(plan?.warnings) ? plan.warnings.filter(item => typeof item === 'string' && item.trim()) : [];
+    if (Array.isArray(plan?.studyNotes)) {
+      return {
+        warnings,
+        studyNotes: plan.studyNotes.filter(item => typeof item === 'string' && item.trim())
+      };
+    }
+    const generationWarnings = [];
+    const studyNotes = [];
+    const studyPattern = /知识点|考点|概念|重点|难点|易错|易混|混淆|辨析|区分|条件|公式|原理|定义|性质|定理|前提|不代表|提醒|definition|property|theorem|assumption|does not imply|prerequisite|concept|key point|difficult|common mistake|confus|distinguish|condition|formula|principle/i;
+    const generationPattern = /材料|附件|文件|大纲|考纲|缺少|缺乏|不足|截断|上限|范围|日历|安排|进度|时间|解析|识别|扫描|质量|解析失败|material|attachment|file|outline|syllabus|missing|shortened|truncat|limit|calendar|schedule|scope|parse|scan|quality/i;
+    warnings.forEach(item => {
+      if (studyPattern.test(item) && !generationPattern.test(item)) studyNotes.push(item);
+      else generationWarnings.push(item);
+    });
+    return { warnings: generationWarnings, studyNotes };
+  }
+
+  function examSummaryMarkup(task) {
+    const exam = task?.exam;
+    if (!exam || typeof exam !== 'object') return '';
+    const description = typeof exam.description === 'string' ? exam.description.trim() : '';
+    const ids = Array.isArray(exam.materialIds) ? new Set(exam.materialIds) : new Set();
+    const names = taskMaterials(task).filter(material => ids.has(material.id)).map(material => material.name || t("未命名材料"));
+    if (!description && !names.length) return '';
+    const excerpt = description.length > 180 ? `${description.slice(0, 180).trimEnd()}…` : description;
+    return `<div class="plan-exam-summary"><strong>${t("考试大纲")}</strong>${excerpt ? `<p>${escapeHTML(excerpt)}</p>` : ''}${names.length ? `<small>${t("大纲文件：")}${names.map(escapeHTML).join(state.preferences.language === 'en' ? ', ' : '、')}</small>` : ''}</div>`;
+  }
+
   function hasMaterialText(task) {
     return taskMaterials(task).some(material => typeof material?.text === 'string' && material.text.trim().length > 0);
   }
@@ -188,6 +245,41 @@
 
   function countDays(task) {
     return Array.isArray(task?.plan?.days) ? task.plan.days : [];
+  }
+
+  function selectedCadence(form) {
+    return {
+      mode: form.elements.cadenceMode?.value || 'daily',
+      weekdays: $$('[name="cadenceWeekday"]:checked', form).map(input => Number(input.value))
+    };
+  }
+
+  function cadenceLabel(value) {
+    let cadence;
+    try { cadence = schedule.normalizeCadence(value); } catch { cadence = { mode: 'daily', weekdays: [] }; }
+    if (cadence.mode === 'alternate') return t("隔日");
+    if (cadence.mode !== 'weekly') return t("每天");
+    const labels = { 0: '星期日', 1: '星期一', 2: '星期二', 3: '星期三', 4: '星期四', 5: '星期五', 6: '星期六' };
+    return `${t("每周")} ${cadence.weekdays.map(day => t(labels[day])).join(state.preferences.language === 'en' ? ', ' : '、')}`;
+  }
+
+  function cadenceSnapshot(task) {
+    return JSON.stringify(task);
+  }
+
+  function beginDelayedLoading(activity, isCurrent, update) {
+    activity.showLoading = false;
+    activity.loadingTimer = window.setTimeout(() => {
+      if (!isCurrent()) return;
+      activity.showLoading = true;
+      update();
+    }, 10000);
+  }
+
+  function clearDelayedLoading(activity) {
+    if (activity?.loadingTimer === undefined || activity.loadingTimer === null) return;
+    window.clearTimeout(activity.loadingTimer);
+    activity.loadingTimer = null;
   }
 
   function assessmentKey(taskId, selector) {
@@ -453,18 +545,23 @@
   function planCard(task, expanded = true) {
     const days = countDays(task);
     const completed = days.filter(day => day.completed).length;
+    const calendarDays = Number(task.calendarDays) || Number(task.days) || days.length;
     const summary = task.plan?.summary || task.goal || '';
     const mode = task.plan?.mode === 'ai' ? 'ai' : 'history';
     const modeLabel = task.plan?.mode === 'ai' ? t("AI 计划") : t("历史计划");
-    const warnings = Array.isArray(task.plan?.warnings) ? task.plan.warnings.filter(item => typeof item === 'string' && item.trim()) : [];
+    const { warnings, studyNotes } = planWarningSections(task.plan);
     const knowledge = Array.isArray(task.plan?.knowledge) && task.plan.knowledge.length
       ? `<section class="plan-knowledge" aria-label="${escapeHTML(t("知识清单"))}"><div class="knowledge-heading"><span class="panel-kicker">${t("KNOWLEDGE / 知识清单")}</span><strong>${task.plan.knowledge.length} ${t("个知识点")}</strong></div><div class="knowledge-list">${task.plan.knowledge.map(item => `<article class="knowledge-item"><div class="knowledge-item-heading"><strong>${escapeHTML(item.title || t("未命名知识点"))}</strong><span class="knowledge-priority ${item.priority === '重点' ? 'is-focus' : ''}">${escapeHTML(displayPriority(item.priority) || t("了解"))}</span></div><p>${escapeHTML(item.explanation || '')}</p>${item.source ? `<small>${t("来源：")}${escapeHTML(displaySource(item.source))}</small>` : ''}</article>`).join('')}</div></section>`
       : `<section class="plan-knowledge plan-knowledge-history"><span class="panel-kicker">${t("KNOWLEDGE / 知识清单")}</span><p>${t("这份旧计划没有单独保存知识清单，原有学习日程仍可查看。")}</p></section>`;
     const body = expanded ? `${knowledge}<div class="plan-days">${days.map((day, index) => dayRow(task, day, index)).join('')}</div>` : '';
     const warningMarkup = warnings.length ? `<div class="plan-warnings" role="note"><strong>${t("生成提示")}</strong><ul>${warnings.map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : '';
+    const studyNotesMarkup = studyNotes.length ? `<div class="plan-study-notes" role="note"><strong>${t("重点、难点与易错点")}</strong><ul>${studyNotes.map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : '';
+    const examMarkup = examSummaryMarkup(task);
     const finalLabel = task.quiz?.result ? t("查看周期报告") : task.quiz?.version === 2 && task.quiz?.questions?.length ? t("继续期末测验") : task.quiz && task.quiz.mode === 'ai' && !task.quiz.version ? t("继续旧版测验") : t("生成10题期末测验");
     const finalRetake = Boolean(task.quiz && task.quiz.mode !== 'ai' && !task.quiz.result);
-    return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(task.title)}</h3><p>${escapeHTML(summary)} · ${days.length} ${t("天 · 已完成")} ${completed} ${t("天 · 开始于")} ${escapeHTML(formatDate(task.startDate, { year: 'numeric', month: 'numeric', day: 'numeric' }))} <span class="mode-badge ${mode}">${modeLabel}</span></p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="final" ${finalRetake ? 'data-retake="true"' : ''}>${finalLabel}</button><button class="button button-small button-outline" type="button" data-action="export-task" data-task-id="${escapeHTML(task.id)}">${t("导出 JSON")}</button><button class="button button-small button-quiet" type="button" data-action="delete-task" data-task-id="${escapeHTML(task.id)}">${t("删除")}</button></div></div>${warningMarkup}${body}</article>`;
+    const finalHistory = Array.isArray(task.finalQuizHistory) ? task.finalQuizHistory.filter(quiz => quiz?.result) : [];
+    const historyAction = finalHistory.length ? `<button class="button button-small button-outline" type="button" data-action="view-final-history" data-task-id="${escapeHTML(task.id)}">${t("历史周期报告")} · ${finalHistory.length}</button>` : '';
+    return `<article class="plan-card"><div class="plan-card-head"><div class="plan-card-title"><h3>${escapeHTML(task.title)}</h3><p>${escapeHTML(summary)} · ${calendarDays} ${t("个日历日")} · ${days.length} ${t("次学习")} · ${escapeHTML(cadenceLabel(task.cadence))} · ${escapeHTML(t`已完成 ${completed} / ${days.length} 次`)} · ${t("开始于")} ${escapeHTML(formatDate(task.startDate, { year: 'numeric', month: 'numeric', day: 'numeric' }))} <span class="mode-badge ${mode}">${modeLabel}</span></p></div><div class="plan-card-actions"><button class="button button-small button-outline" type="button" data-action="edit-cadence" data-task-id="${escapeHTML(task.id)}">${t("调整学习频率")}</button>${historyAction}<button class="button button-small button-outline" type="button" data-action="open-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="final" ${finalRetake ? 'data-retake="true"' : ''}>${finalLabel}</button><button class="button button-small button-outline" type="button" data-action="export-task" data-task-id="${escapeHTML(task.id)}">${t("导出 JSON")}</button><button class="button button-small button-quiet" type="button" data-action="delete-task" data-task-id="${escapeHTML(task.id)}">${t("删除")}</button></div></div>${examMarkup}${studyNotesMarkup}${warningMarkup}${body}</article>`;
   }
 
   function summaryRow() {
@@ -501,7 +598,7 @@
     if (!materials.length) return `${head}<section class="empty-state"><div class="empty-state-copy"><span class="eyebrow">NO MATERIALS YET</span><h2>${t("材料会跟着计划，一起留在这里。")}</h2><p>${t("创建学习计划时，可以从本机选择 PDF、DOCX、PPTX、MD 或 TEX 文件，之后随时预览文字内容。")}</p><div class="empty-actions"><button class="button button-primary" type="button" data-action="new-task">${t("创建计划并添加材料")}</button></div></div><div class="empty-illustration" aria-hidden="true"><span class="empty-spark one">✳</span><span class="empty-spark two">✦</span><div class="empty-page"><i class="empty-sprout"></i></div></div></section>`;
     return `${head}<div class="materials-grid"><section class="panel"><div class="panel-heading"><div><span class="panel-kicker">SAVED TEXTS</span><h2>${t("已导入的材料")}</h2><p>${materials.length} ${t("份文件 · 来自已保存的计划")}</p></div></div><div class="material-list">${materials.map(material => {
       const ext = String(material.name || '').split('.').pop().slice(0, 4).toUpperCase();
-      return `<article class="material-card"><span class="file-mark" aria-hidden="true">${escapeHTML(ext || t("文档"))}</span><div class="material-card-copy"><strong>${escapeHTML(material.name || t("未命名材料"))}</strong><small>${Number(material.units) || 0} ${t("个章节 ·")} ${Number(material.chars) || 0} ${t("字 ·")} ${escapeHTML(material.attachedTo.join(state.preferences.language === 'en' ? ', ' : '、'))}</small></div><div class="material-card-actions"><button class="button button-small button-outline" type="button" data-action="preview-library-material" data-material-id="${escapeHTML(material.id)}">${t("预览文字")}</button></div></article>`;
+      return `<article class="material-card"><span class="file-mark" aria-hidden="true">${escapeHTML(ext || t("文档"))}</span><div class="material-card-copy"><strong>${escapeHTML(material.name || t("未命名材料"))}</strong><small>${Number(material.units) || 0} ${t("个章节 ·")} ${Number(material.chars) || 0} ${t("字 ·")} ${escapeHTML(material.attachedTo.join(state.preferences.language === 'en' ? ', ' : '、'))}</small>${materialReadingSummaryHTML(material)}</div><div class="material-card-actions"><button class="button button-small button-outline" type="button" data-action="preview-library-material" data-material-id="${escapeHTML(material.id)}">${t("预览文字")}</button></div></article>`;
     }).join('')}</div></section><aside class="panel source-card"><span class="panel-kicker">ON YOUR DEVICE</span><h3>${t("一页一页，慢慢读。")}</h3><p>${t("导入的材料会附在对应的学习计划中。只有你勾选同意后，已配置的模型服务才会收到本次计划或测验使用的材料文字。")}</p><div class="source-card-ornament" aria-hidden="true">${t("页 · 章 · 节")}</div></aside></div>`;
   }
 
@@ -536,22 +633,39 @@
     return !quiz?.readinessStale && quiz?.result?.report?.readyForNext === false && countDays(task).some((day, index) => index > dayIndex && day.date >= today && !day.completed);
   }
 
-  function renderAssessmentReport(task, selector, quiz) {
+  function renderAssessmentReport(task, selector, quiz, options = {}) {
     const result = quiz.result;
     const report = result.report && typeof result.report === 'object' ? result.report : {};
     const isDaily = selector.kind === 'daily';
     const readinessStale = Boolean(quiz.readinessStale);
     const readiness = readinessStale ? t("判断已过期") : report.readyForNext === true ? t("可以继续下一步") : report.readyForNext === false ? t("建议先补齐基础") : t("本次不判断准备程度");
-    const decisionText = readinessStale ? '' : quiz.decision === 'adjusted'
+    const staleNotice = options.readOnly
+      ? t("学习安排已变更，这份历史报告的准备程度已失效；成绩和作答仍保留。")
+      : t("下一日任务已变更，这份报告的继续学习判断需重新评估。成绩和作答仍保留；重新生成并提交测评后会更新判断。");
+    const decisionText = options.readOnly || readinessStale ? '' : quiz.decision === 'adjusted'
       ? `<p class="result-feedback">${t("后续未完成日程已按你确认的调整方案更新。")}</p>`
       : quiz.decision === 'extra'
         ? `<p class="result-feedback">${t("本次选择了补学方案，")}${quiz.supplementCompleted ? t("已标记完成。") : t("尚未标记完成。")}</p>`
         : '';
-    const decisionActions = readinessStale ? '' : quiz.decision === 'extra'
+    const decisionActions = options.readOnly || readinessStale ? '' : quiz.decision === 'extra'
       ? `<button class="button button-small button-outline" type="button" data-action="toggle-supplement" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${quiz.supplementCompleted ? t("撤销补学完成") : t("标记补学完成")}</button>`
       : quiz.decision === 'adjusted' ? '' : report.readyForNext === false ? `<button class="button button-small button-outline" type="button" data-action="choose-extra" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("按补学任务继续")}</button>${canAdjustAfter(task, selector.dayIndex, quiz) ? `<button class="button button-small button-primary" type="button" data-action="propose-adjustment" data-task-id="${escapeHTML(task.id)}" data-day-index="${selector.dayIndex}">${t("预览调整后续计划")}</button>` : ''}` : '';
     const feedbackMarkup = result.feedback && result.feedback !== report.summary ? `<p class="result-feedback">${escapeHTML(result.feedback)}</p>` : '';
-    return `<section class="learning-report" aria-live="polite"><div class="result-panel-head"><div><span class="panel-kicker">${isDaily ? t("每日学习报告") : t("周期学习报告")}</span><h3>${isDaily ? t("本日掌握情况") : t("阶段学习回顾")}</h3></div><div class="result-score">${escapeHTML(result.score)}<small>${t("满分 100")}</small></div></div><p class="result-feedback">${escapeHTML(report.summary || result.feedback || t("本次反馈已保存。"))}</p>${feedbackMarkup}<div class="report-readiness ${readinessStale ? 'readiness-stale' : ''}"><strong>${t("准备程度：")}${readiness}</strong>${readinessStale ? `<p>${t("下一日任务已变更，这份报告的继续学习判断需重新评估。成绩和作答仍保留；重新生成并提交测评后会更新判断。")}</p>` : report.reason ? `<p>${escapeHTML(report.reason)}</p>` : ''}</div>${reportList(t("薄弱点"), result.weakPoints)}${reportList(t("本次表现"), report.strengths)}${reportList(t("下一步建议"), report.nextSteps)}${report.extraMinutes ? `<div class="report-list"><strong>${t("建议补学 ·")} ${Number(report.extraMinutes) || 0} ${t("分钟")}</strong><ul>${(Array.isArray(report.extraTasks) ? report.extraTasks : []).map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : ''}${decisionText}<div class="report-actions"><button class="button button-small button-outline" type="button" data-action="export-report" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("导出纯文本报告")}</button>${decisionActions}</div></section>`;
+    const actions = options.readOnly ? '' : `<div class="report-actions"><button class="button button-small button-outline" type="button" data-action="export-report" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("导出纯文本报告")}</button>${decisionActions}</div>`;
+    return `<section class="learning-report" aria-live="polite"><div class="result-panel-head"><div><span class="panel-kicker">${isDaily ? t("每日学习报告") : t(options.readOnly ? "历史周期报告" : "周期学习报告")}</span><h3>${isDaily ? t("本日掌握情况") : t("阶段学习回顾")}</h3></div><div class="result-score">${escapeHTML(result.score)}<small>${t("满分 100")}</small></div></div><p class="result-feedback">${escapeHTML(report.summary || result.feedback || t("本次反馈已保存。"))}</p>${feedbackMarkup}<div class="report-readiness ${readinessStale ? 'readiness-stale' : ''}"><strong>${t("准备程度：")}${readiness}</strong>${readinessStale ? `<p>${staleNotice}</p>` : report.reason ? `<p>${escapeHTML(report.reason)}</p>` : ''}</div>${reportList(t("薄弱点"), result.weakPoints)}${reportList(t("本次表现"), report.strengths)}${reportList(t("下一步建议"), report.nextSteps)}${report.extraMinutes ? `<div class="report-list"><strong>${t("建议补学 ·")} ${Number(report.extraMinutes) || 0} ${t("分钟")}</strong><ul>${(Array.isArray(report.extraTasks) ? report.extraTasks : []).map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : ''}${decisionText}${actions}</section>`;
+  }
+
+  function openFinalHistory(taskId) {
+    const task = getTask(taskId);
+    if (!task) return;
+    const history = Array.isArray(task.finalQuizHistory) ? task.finalQuizHistory.filter(quiz => quiz?.result) : [];
+    if (!history.length) return;
+    $('#finalHistoryTitle').textContent = task.title;
+    $('#finalHistoryContent').innerHTML = history.map((quiz, index) => {
+      const date = quiz.resultDate ? formatDate(quiz.resultDate, { year: 'numeric', month: 'long', day: 'numeric' }) : t("时间未记录");
+      return `<article class="final-history-entry"><div class="final-history-entry-head"><strong>${t("历史周期报告")} ${index + 1}</strong><span>${escapeHTML(date)}</span></div>${renderAssessmentReport(task, { kind: 'final' }, quiz, { readOnly: true })}</article>`;
+    }).join('');
+    $('#finalHistoryDialog').showModal();
   }
 
   function renderQuiz(task) {
@@ -650,7 +764,8 @@
     if (selectedTaskId && !getTask(selectedTaskId)) selectedTaskId = null;
     if (!apiEnabled()) {
       sessionConsent.clear();
-      ['createDialog', 'editDayDialog', 'materialDialog', 'tutoringDialog'].forEach(id => {
+      cancelMaterialImport();
+      ['examDialog', 'createDialog', 'editDayDialog', 'materialDialog', 'tutoringDialog', 'cadenceDialog', 'finalHistoryDialog'].forEach(id => {
         const dialog = document.getElementById(id);
         if (dialog?.open) dialog.close();
       });
@@ -739,32 +854,72 @@
 
   function updateCreateControls() {
     const busy = Boolean(createActivity);
-    setBusy($('#createSubmit'), createActivity?.type === 'plan', t("正在生成学习计划"));
-    $('#createSubmit').disabled = busy;
-    $('#clarifySubmit').disabled = busy;
-    $('#confirmBrief').disabled = busy;
+    const planLoading = createActivity?.type === 'plan' && createActivity.showLoading;
+    setBusy($('#createSubmit'), Boolean(planLoading), t("正在生成学习计划"));
+    $('#createSubmit').disabled = busy || materialImportBusy;
+    $('#createLoadingStatus').hidden = !planLoading;
+    $('#createLoadingStatus').textContent = planLoading ? planProgressMessage(createActivity.progress) : '';
+    $('#clarifySubmit').disabled = busy || materialImportBusy;
+    $('#confirmBrief').disabled = busy || materialImportBusy;
+    $('#createExamButton').disabled = busy || materialImportBusy;
+    $('#saveExamDraft').disabled = busy || materialImportBusy;
     $('#clarifyInput').disabled = createActivity?.type === 'clarify';
+    $$('#createForm input, #createForm select, #createForm textarea').forEach(field => { field.disabled = createActivity?.type === 'plan'; });
     if (createActivity?.type === 'clarify') $('#clarifySubmit').textContent = t("正在讨论…");
     else if ($('#createDialog').open) renderGoalDiscussion();
   }
 
+  function planProgressMessage(progress) {
+    const hasCounts = Number.isFinite(Number(progress?.completed)) && Number.isFinite(Number(progress?.total));
+    if (progress?.stage === 'days' && hasCounts) {
+      return t`正在安排学习日程 ${Number(progress.completed)} / ${Number(progress.total)}`;
+    }
+    if (progress?.stage === 'outline' && hasCounts) return t`正在梳理学习框架 ${Number(progress.completed)} / ${Number(progress.total)}`;
+    if (progress?.stage === 'outline') return t("正在梳理学习框架…");
+    return t("正在生成学习计划，请稍候…");
+  }
+
+  function updateCreateCadenceControls() {
+    const form = $('#createForm');
+    const mode = form.elements.cadenceMode.value;
+    $('#createWeekdays').hidden = mode !== 'weekly';
+    const calendarDays = Number(form.elements.days.value);
+    const cadence = selectedCadence(form);
+    let sessionCount = 0;
+    try {
+      sessionCount = schedule.learningDates({ startDate: form.elements.startDate.value, calendarDays, cadence }).length;
+    } catch { /* The submit validation displays invalid dates or empty weekday selections. */ }
+    $('#createCadenceSummary').textContent = sessionCount
+      ? t`${calendarDays} 个日历日 · ${sessionCount} 次学习 · ${cadenceLabel(cadence)}`
+      : t("当前频率至少需要安排两次学习。");
+  }
+
   function currentCreateInput() {
     const form = $('#createForm');
+    const calendarDays = Number(form.elements.days.value);
+    const cadence = selectedCadence(form);
+    let days = 0;
+    try { days = schedule.learningDates({ startDate: form.elements.startDate.value, calendarDays, cadence }).length; } catch { /* Invalid fields are reported by validateCreateInput. */ }
     return {
       title: form.elements.title.value.trim(),
       goal: form.elements.goal.value.trim(),
       level: form.elements.level.value,
       learningMode: form.elements.learningMode.value,
       startDate: form.elements.startDate.value,
-      days: Number(form.elements.days.value),
+      days,
+      calendarDays,
+      cadence,
       minutesPerDay: Number(form.elements.minutesPerDay.value),
-      materials: clone(createMaterials)
+      materials: clone([...createMaterials, ...createExamMaterials]),
+      ...(createExamDescription.trim() || createExamMaterials.length
+        ? { exam: { description: createExamDescription.trim(), materialIds: createExamMaterials.map(material => material.id) } }
+        : {})
     };
   }
 
   function createInputSnapshot() {
     const input = currentCreateInput();
-    return JSON.stringify({ ...input, materials: input.materials.map(material => ({ id: material.id, name: material.name, chars: material.chars, text: material.text })) });
+    return JSON.stringify({ ...input, materials: input.materials.map(material => ({ id: material.id, name: material.name, chars: material.chars, text: material.text, readingWarnings: material.readingWarnings })) });
   }
 
   function invalidateGoalDiscussion() {
@@ -779,20 +934,32 @@
     form.elements.startDate.value = localDateString();
     form.elements.days.value = '14';
     form.elements.minutesPerDay.value = '60';
+    form.elements.cadenceMode.value = 'daily';
+    $$('[name="cadenceWeekday"]', form).forEach(input => { input.checked = false; });
     createMaterials = [];
+    createExamDescription = '';
+    createExamMaterials = [];
+    examDraft = null;
+    examDialogSessionId += 1;
     createSessionId += 1;
     createActivity = null;
     resetGoalDiscussion();
     $('#createConsent').checked = false;
     setMessage($('#createError'), '');
     renderCreateMaterials();
+    renderCreateExamSummary();
+    updateCreateCadenceControls();
     refreshCreateConsent();
     $('#createDialog').showModal();
     window.setTimeout(() => form.elements.title.focus(), 0);
   }
 
+  function currentCreateMaterials(useExamDraft = false) {
+    return [...createMaterials, ...(useExamDraft && examDraft ? examDraft.materials : createExamMaterials)];
+  }
+
   function refreshCreateConsent() {
-    const shouldShow = apiEnabled() && createMaterials.some(material => typeof material.text === 'string' && material.text.trim());
+    const shouldShow = apiEnabled() && currentCreateMaterials().some(material => typeof material.text === 'string' && material.text.trim());
     $('#createConsentWrap').hidden = !shouldShow;
     if (!shouldShow) $('#createConsent').checked = false;
   }
@@ -804,64 +971,189 @@
       refreshCreateConsent();
       return;
     }
-    host.innerHTML = createMaterials.map((material, index) => `<div class="attachment-item"><span class="attachment-name" title="${escapeHTML(material.name)}">${escapeHTML(material.name)} <span>· ${Number(material.chars) || 0} ${t("字")}</span></span><span class="attachment-item-actions"><button class="inline-link" type="button" data-action="preview-create-material" data-material-index="${index}">${t("预览")}</button><button class="inline-remove" type="button" data-action="remove-create-material" data-material-index="${index}" aria-label="${escapeHTML(t("移除"))} ${escapeHTML(material.name)}">${t("移除")}</button></span></div>`).join('');
+    host.innerHTML = createMaterials.map((material, index) => `<div class="attachment-item"><div class="attachment-name-wrap"><span class="attachment-name" title="${escapeHTML(material.name)}">${escapeHTML(material.name)} <span>· ${Number(material.chars) || 0} ${t("字")}</span></span>${materialReadingSummaryHTML(material)}</div><span class="attachment-item-actions"><button class="inline-link" type="button" data-action="preview-create-material" data-material-index="${index}">${t("预览")}</button><button class="inline-remove" type="button" data-action="remove-create-material" data-material-index="${index}" aria-label="${escapeHTML(t("移除"))} ${escapeHTML(material.name)}">${t("移除")}</button></span></div>`).join('');
     refreshCreateConsent();
   }
 
-  function addImportedMaterials(imported, sessionId, epoch) {
-    if (sessionId !== createSessionId || epoch !== configEpoch || !apiEnabled() || !$('#createDialog').open) return;
-    if (!Array.isArray(imported) || imported.length === 0) return;
-    const existing = new Set(createMaterials.map(item => item.id));
-    const added = imported.filter(item => item && !existing.has(item.id));
-    if (!added.length) return;
-    const totalCount = createMaterials.length + added.length;
-    const totalChars = createMaterials.reduce((sum, item) => sum + (typeof item.text === 'string' ? item.text.length : Number(item.chars) || 0), 0)
-      + added.reduce((sum, item) => sum + (typeof item.text === 'string' ? item.text.length : Number(item.chars) || 0), 0);
-    if (totalCount > 10) throw new Error(t("一个学习计划最多添加 10 份材料。"));
-    if (totalChars > 200000) throw new Error(t("材料文字总量不能超过 200,000 字，请移除部分材料后重试。"));
-    createMaterials.push(...added);
-    setMessage($('#createError'), '');
+  function renderCreateExamSummary() {
+    const host = $('#createExamSummary');
+    const description = createExamDescription.trim();
+    const fileCount = createExamMaterials.length;
+    if (!description && !fileCount) {
+      host.innerHTML = '';
+      host.hidden = true;
+      $('#createExamButton').textContent = t("添加考试大纲");
+      return;
+    }
+    const preview = description.length > 130 ? `${description.slice(0, 130).trimEnd()}…` : description;
+    host.innerHTML = `<strong>${t("已添加考试范围")}</strong>${preview ? `<p>${escapeHTML(preview)}</p>` : ''}${fileCount ? `<small>${fileCount} ${t("份大纲文件")}</small>` : ''}`;
+    host.hidden = false;
+    $('#createExamButton').textContent = t("编辑考试大纲");
+  }
+
+  function openExamDialog() {
+    if (!$('#createDialog').open) return;
+    if (createActivity) return toast(t("当前生成操作完成后再继续。"));
+    if (materialImportBusy) return toast(t("正在导入材料，请稍候。"));
+    examDialogSessionId += 1;
+    examDraft = { description: createExamDescription, materials: clone(createExamMaterials) };
+    $('#examDescription').value = examDraft.description;
+    $('#examMaterials').innerHTML = '';
+    setMessage($('#examError'), '');
+    renderExamMaterials();
+    $('#examDialog').showModal();
+    window.setTimeout(() => $('#examDescription').focus(), 0);
+  }
+
+  function saveExamDraft() {
+    if (!examDraft || !$('#examDialog').open) return;
+    if (materialImportBusy) return setMessage($('#examError'), t("正在导入材料，请稍候。"), 'warning');
+    const description = $('#examDescription').value;
+    if (description.length > 8000) return setMessage($('#examError'), t("考试范围补充最多 8,000 个字符。"), 'warning');
+    const materials = [...createMaterials, ...examDraft.materials];
+    const totalChars = materials.reduce((sum, item) => sum + (typeof item.text === 'string' ? item.text.length : Number(item.chars) || 0), 0);
+    if (materials.length > 10) return setMessage($('#examError'), t("学习材料与大纲文件合计最多 10 份。"), 'warning');
+    if (totalChars > 200000) return setMessage($('#examError'), t("学习材料与大纲文件的文字总量不能超过 200,000 字。"), 'warning');
+    createExamDescription = description.trim();
+    createExamMaterials = clone(examDraft.materials);
+    examDraft = null;
     invalidateGoalDiscussion();
-    renderCreateMaterials();
+    renderCreateExamSummary();
+    refreshCreateConsent();
+    setMessage($('#createError'), '');
+    $('#examDialog').close();
+    toast(t("考试大纲已添加到新建计划。"));
+  }
+
+  function renderExamMaterials() {
+    const host = $('#examMaterials');
+    const materials = examDraft?.materials || [];
+    host.innerHTML = materials.map((material, index) => `<div class="attachment-item"><div class="attachment-name-wrap"><span class="attachment-name" title="${escapeHTML(material.name)}">${escapeHTML(material.name)} <span>· ${Number(material.chars) || 0} ${t("字")}</span></span>${materialReadingSummaryHTML(material)}</div><span class="attachment-item-actions"><button class="inline-link" type="button" data-action="preview-exam-material" data-material-index="${index}">${t("预览")}</button><button class="inline-remove" type="button" data-action="remove-exam-material" data-material-index="${index}" aria-label="${escapeHTML(t("移除"))} ${escapeHTML(material.name)}">${t("移除")}</button></span></div>`).join('');
+  }
+
+  function materialImportContext(target, requestId) {
+    const activity = { requestId, target, epoch: configEpoch, createSessionId };
+    if (target === 'exam') activity.examSessionId = examDialogSessionId;
+    return activity;
+  }
+
+  function materialImportIsCurrent(activity) {
+    if (!activity || activeMaterialImport?.requestId !== activity.requestId || activity.epoch !== configEpoch || activity.createSessionId !== createSessionId || !apiEnabled() || !$('#createDialog').open) return false;
+    return activity.target === 'exam'
+      ? activity.examSessionId === examDialogSessionId && $('#examDialog').open && Boolean(examDraft)
+      : activity.target === 'study';
+  }
+
+  function materialImportMessage(progress) {
+    if (progress?.stage === 'ocr' && Number(progress.total) > 0) {
+      const page = Number(progress.page) || Math.max(1, Number(progress.completed) || 1);
+      const completed = Math.max(0, Number(progress.completed) || 0);
+      return t`正在本地识别 PDF，第 ${page} 页 · 已完成 ${completed} / ${Number(progress.total)} 页 · 不会发送给模型服务。`;
+    }
+    return t("正在导入材料…");
+  }
+
+  function renderMaterialImportStatus() {
+    const active = activeMaterialImport;
+    const forStudy = materialImportIsCurrent(active) && active.target === 'study';
+    const forExam = materialImportIsCurrent(active) && active.target === 'exam';
+    $('#createMaterialImportStatus').hidden = !forStudy;
+    $('#examMaterialImportStatus').hidden = !forExam;
+    if (forStudy) $('#createMaterialImportMessage').textContent = materialImportMessage(active.progress);
+    if (forExam) $('#examMaterialImportMessage').textContent = materialImportMessage(active.progress);
+  }
+
+  function subscribeMaterialProgress() {
+    if (materialProgressUnsubscribe || typeof api?.onMaterialProgress !== 'function') return;
+    try {
+      const unsubscribe = api.onMaterialProgress(progress => {
+        if (!activeMaterialImport || progress?.requestId !== activeMaterialImport.requestId || !materialImportIsCurrent(activeMaterialImport)) return;
+        activeMaterialImport.progress = progress;
+        renderMaterialImportStatus();
+      });
+      if (typeof unsubscribe === 'function') materialProgressUnsubscribe = unsubscribe;
+    } catch { /* Progress is optional; material import still works without it. */ }
+  }
+
+  function cancelMaterialImport(target = null) {
+    const active = activeMaterialImport;
+    if (!active || (target && active.target !== target)) return;
+    activeMaterialImport = null;
+    materialImportBusy = false;
+    renderMaterialImportStatus();
+    updateCreateControls();
+    if (typeof api?.cancelMaterialImport === 'function') {
+      try { Promise.resolve(api.cancelMaterialImport(active.requestId)).catch(() => {}); } catch { /* Local state is cleared even when cancellation is unavailable. */ }
+    }
+  }
+
+  function materialTextLength(material) {
+    return typeof material?.text === 'string' ? material.text.length : Number(material?.chars) || 0;
+  }
+
+  function addImportedMaterials(imported, activity) {
+    if (!materialImportIsCurrent(activity)) return;
+    if (!Array.isArray(imported) || imported.length === 0) return;
+    const existingMaterials = currentCreateMaterials(activity.target === 'exam');
+    const existing = new Set(existingMaterials.map(item => item.id));
+    const added = [];
+    imported.forEach(item => {
+      if (!item || existing.has(item.id)) return;
+      existing.add(item.id);
+      added.push(item);
+    });
+    if (!added.length) return;
+    const totalCount = existingMaterials.length + added.length;
+    const totalChars = [...existingMaterials, ...added].reduce((sum, item) => sum + materialTextLength(item), 0);
+    if (totalCount > 10) throw new Error(t("学习材料与大纲文件合计最多 10 份。"));
+    if (totalChars > 200000) throw new Error(t("学习材料与大纲文件的文字总量不能超过 200,000 字。"));
+    if (activity.target === 'exam') {
+      examDraft.materials.push(...added);
+      renderExamMaterials();
+      setMessage($('#examError'), '');
+    } else {
+      createMaterials.push(...added);
+      setMessage($('#createError'), '');
+      invalidateGoalDiscussion();
+      renderCreateMaterials();
+    }
     toast(`${t("已添加")} ${added.length} ${t("份材料，可预览或移除。")}`);
   }
 
-  async function importMaterials() {
+  async function importMaterials(target = 'study', files = null) {
     if (!apiEnabled()) return openSettings();
     if (createActivity) return toast(t("当前操作完成后再添加材料。"));
     if (materialImportBusy) return toast(t("正在导入材料，请稍候。"));
-    if (!api?.importMaterials) return toast(t("当前运行环境没有文件导入服务。"));
-    const sessionId = createSessionId;
-    const epoch = configEpoch;
+    if (target === 'exam' && (!$('#examDialog').open || !examDraft)) return;
+    if (!api?.importMaterials && !files) return toast(t("当前运行环境没有文件导入服务。"));
+    if (files && !api?.importDroppedMaterials) return toast(t("当前运行环境没有拖入材料服务。"));
+    if (files && currentCreateMaterials(target === 'exam').length + files.length > 10) return setMessage(target === 'exam' ? $('#examError') : $('#createError'), t("学习材料与大纲文件合计最多 10 份。"));
+    const activity = materialImportContext(target, makeId());
+    activeMaterialImport = activity;
     materialImportBusy = true;
+    renderMaterialImportStatus();
+    updateCreateControls();
     try {
-      const imported = await api.importMaterials();
-      addImportedMaterials(imported, sessionId, epoch);
+      const imported = files
+        ? await api.importDroppedMaterials(files, activity.requestId)
+        : await api.importMaterials(activity.requestId);
+      if (!materialImportIsCurrent(activity)) return;
+      addImportedMaterials(imported, activity);
     } catch (error) {
-      if (sessionId === createSessionId && epoch === configEpoch && $('#createDialog').open) setMessage($('#createError'), error.message || t("导入材料失败，请检查文件后重试。"));
+      if (materialImportIsCurrent(activity)) setMessage(target === 'exam' ? $('#examError') : $('#createError'), error.message || t("导入材料失败，请检查文件后重试。"));
     } finally {
-      materialImportBusy = false;
+      if (activeMaterialImport?.requestId === activity.requestId) {
+        activeMaterialImport = null;
+        materialImportBusy = false;
+        renderMaterialImportStatus();
+        updateCreateControls();
+      }
     }
   }
 
-  async function importDroppedMaterials(files) {
-    if (!apiEnabled()) return openSettings();
-    if (createActivity) return toast(t("当前操作完成后再添加材料。"));
-    if (!api?.importDroppedMaterials) return toast(t("当前运行环境没有拖入材料服务。"));
+  async function importDroppedMaterials(files, target = 'study') {
     if (!files.length) return;
-    if (materialImportBusy) return toast(t("正在导入材料，请稍候。"));
-    if (createMaterials.length + files.length > 10) return setMessage($('#createError'), t("一个学习计划最多添加 10 份材料。"));
-    const sessionId = createSessionId;
-    const epoch = configEpoch;
-    materialImportBusy = true;
-    try {
-      const imported = await api.importDroppedMaterials(files);
-      addImportedMaterials(imported, sessionId, epoch);
-    } catch (error) {
-      if (sessionId === createSessionId && epoch === configEpoch && $('#createDialog').open) setMessage($('#createError'), error.message || t("导入材料失败，请检查文件后重试。"));
-    } finally {
-      materialImportBusy = false;
-    }
+    return importMaterials(target, files);
   }
 
   function showMaterial(material) {
@@ -875,6 +1167,9 @@
     if (!previewedMaterial) return;
     $('#materialTitle').textContent = previewedMaterial.name || t("未命名材料");
     $('#materialMeta').textContent = `${Number(previewedMaterial.units) || 0} ${t("个章节 ·")} ${Number(previewedMaterial.chars) || 0} ${t("字")}`;
+    const warnings = materialReadingWarnings(previewedMaterial);
+    $('#materialWarnings').innerHTML = warnings.length ? `<strong>${t("阅读提示")}</strong><ul>${warnings.map(item => `<li>${escapeHTML(t(item))}</li>`).join('')}</ul>` : '';
+    $('#materialWarnings').hidden = !warnings.length;
     $('#materialText').textContent = typeof previewedMaterial.text === 'string' ? previewedMaterial.text : t("这份材料没有可预览的文字内容。");
   }
 
@@ -889,7 +1184,8 @@
   function validateCreateInput(input, errorElement = $('#createError')) {
     if (!input.title || !input.goal) return setMessage(errorElement, t("请填写学习主题和目标。"), 'warning'), false;
     if (!input.startDate || !dateObject(input.startDate)) return setMessage(errorElement, t("请选择有效的开始日期。")), false;
-    if (!Number.isInteger(input.days) || input.days < 2 || input.days > 180) return setMessage(errorElement, t("学习周期需要在 2 到 180 天之间。")), false;
+    if (!Number.isInteger(input.calendarDays) || input.calendarDays < 2 || input.calendarDays > 180) return setMessage(errorElement, t("日历跨度需要在 2 到 180 天之间。")), false;
+    try { schedule.validateScheduleInput(input); } catch (error) { return setMessage(errorElement, t(error.message)), false; }
     if (!Number.isInteger(input.minutesPerDay) || input.minutesPerDay < 15 || input.minutesPerDay > 480) return setMessage(errorElement, t("每天投入需要在 15 到 480 分钟之间。")), false;
     if (!['exam', 'balanced', 'deep'].includes(input.learningMode)) return setMessage(errorElement, t("请选择有效的学习方式。")), false;
     return true;
@@ -902,6 +1198,7 @@
   async function clarifyGoal() {
     if (!apiEnabled()) return openSettings();
     if (createActivity) return;
+    if (materialImportBusy) return setMessage($('#clarifyError'), t("正在导入材料，请稍候。"), 'warning');
     const input = currentCreateInput();
     setMessage($('#clarifyError'), '');
     if (!input.goal) return setMessage($('#clarifyError'), t("请先填写学习目标，再开始讨论。"), 'warning');
@@ -947,6 +1244,7 @@
     event?.preventDefault();
     if (!apiEnabled()) return openSettings();
     if (createActivity) return toast(t("当前生成操作完成后再继续。"));
+    if (materialImportBusy) return setMessage($('#createError'), t("正在导入材料，请稍候。"), 'warning');
     const form = $('#createForm');
     const error = $('#createError');
     setMessage(error, '');
@@ -957,12 +1255,19 @@
     const epoch = configEpoch;
     const snapshot = createInputSnapshot();
     const requestId = makeId();
-    createActivity = { id: requestId, type: 'plan' };
+    createActivity = { id: requestId, type: 'plan', progress: null };
     const briefSnapshot = confirmedBrief ? clone(confirmedBrief) : null;
+    beginDelayedLoading(createActivity, () => createActivity?.id === requestId, updateCreateControls);
     updateCreateControls();
     try {
       const requestInput = briefSnapshot ? { ...input, brief: briefSnapshot } : input;
-      const plan = await api.generatePlan(requestInput);
+      const plan = await api.generatePlan(requestInput, requestId);
+      if (createActivity?.id === requestId) {
+        clearDelayedLoading(createActivity);
+        createActivity.generationFinished = true;
+        createActivity.showLoading = false;
+        updateCreateControls();
+      }
       if (sessionId !== createSessionId || epoch !== configEpoch || !apiEnabled() || snapshot !== createInputSnapshot() || createActivity?.id !== requestId) return;
       if (!plan || !Array.isArray(plan.days) || plan.days.length !== input.days) throw new Error(t("服务返回的计划天数与学习周期不一致，请重试。"));
       if (!Array.isArray(plan.knowledge) || plan.knowledge.length < 1 || plan.knowledge.length > 30) throw new Error(t("服务没有返回有效的知识清单，请检查模型配置后重试。"));
@@ -976,9 +1281,178 @@
       if (sessionId === createSessionId && epoch === configEpoch) setMessage(error, errorValue.message || t("生成学习计划失败，请稍后重试。"));
     } finally {
       if (createActivity?.id === requestId) {
+        clearDelayedLoading(createActivity);
         createActivity = null;
         updateCreateControls();
       }
+    }
+  }
+
+  function subscribePlanProgress() {
+    if (planProgressUnsubscribe || typeof api?.onPlanProgress !== 'function') return;
+    try {
+      const unsubscribe = api.onPlanProgress(progress => {
+        if (!createActivity || createActivity.type !== 'plan' || progress?.requestId !== createActivity.id) return;
+        createActivity.progress = progress;
+        if (createActivity.showLoading) updateCreateControls();
+      });
+      if (typeof unsubscribe === 'function') planProgressUnsubscribe = unsubscribe;
+    } catch { /* Progress is optional; generation still works without it. */ }
+  }
+
+  function cadenceFormValue() {
+    const form = $('#cadenceForm');
+    return schedule.normalizeCadence(selectedCadence(form));
+  }
+
+  function updateCadenceControls() {
+    const waiting = Boolean(cadenceActivity);
+    const proposal = cadenceContext?.proposal;
+    const previewButton = $('#previewCadence');
+    const confirmButton = $('#confirmCadence');
+    const loading = cadenceActivity?.showLoading;
+    setBusy(previewButton, Boolean(loading), t("正在生成新频率预览"));
+    previewButton.disabled = waiting || cadenceApplyBusy;
+    setBusy(confirmButton, cadenceApplyBusy, t("正在应用新频率"));
+    confirmButton.disabled = waiting || cadenceApplyBusy || !proposal;
+    confirmButton.hidden = !proposal;
+    $$('#cadenceFields input, #cadenceFields select').forEach(field => { field.disabled = waiting || cadenceApplyBusy; });
+    $$('#cadenceDialog [data-close]').forEach(button => { button.disabled = cadenceApplyBusy; });
+    $('#cadenceLoadingStatus').hidden = !loading;
+    $('#cadenceLoadingStatus').textContent = loading ? t("正在生成新的学习安排，请稍候…") : '';
+    const mode = $('#cadenceForm').elements.cadenceMode.value;
+    $('#cadenceWeekdays').hidden = mode !== 'weekly';
+  }
+
+  function renderCadencePreview(context) {
+    const proposal = context?.proposal;
+    const host = $('#cadencePreview');
+    if (!proposal) {
+      host.innerHTML = '';
+      host.hidden = true;
+      return;
+    }
+    const rows = proposal.days.map((day, index) => `<li><strong>${escapeHTML(formatDate(day.date, { month: 'numeric', day: 'numeric' }))} · ${escapeHTML(t`第 ${Number(day.day) || index + 1} 天`)}</strong><span>${escapeHTML(day.title || t("学习安排"))}</span><small>${Number(day.minutes) || 0} ${t("分钟")} · ${escapeHTML((Array.isArray(day.tasks) ? day.tasks : []).join(' · '))}</small></li>`).join('');
+    const preservedCount = Array.isArray(proposal.preserved) ? proposal.preserved.length : 0;
+    host.innerHTML = `<div class="cadence-preview-copy"><p>${escapeHTML(proposal.summary || t("以下仅列出未来未完成的学习安排。"))}</p><p><strong>${t`已完成与历史安排会保留，共 ${preservedCount} 项。`}</strong> ${t("已保存的历史周期报告也会保留。")}</p>${proposal.warning ? `<p class="cadence-preview-warning">${escapeHTML(proposal.warning)}</p>` : ''}</div>${rows ? `<ul>${rows}</ul>` : `<p class="empty-inline-copy">${t("当前没有未来未完成的学习安排。")}</p>`}`;
+    host.hidden = false;
+  }
+
+  function openCadence(taskId) {
+    const task = getTask(taskId);
+    if (!task) return;
+    cadenceSessionId += 1;
+    cadenceContext = { taskId, epoch: configEpoch, snapshot: cadenceSnapshot(task), proposal: null };
+    cadenceActivity = null;
+    cadenceApplyBusy = false;
+    const cadence = schedule.normalizeCadence(task.cadence);
+    const form = $('#cadenceForm');
+    form.elements.cadenceMode.value = cadence.mode;
+    $$('[name="cadenceWeekday"]', form).forEach(input => { input.checked = cadence.weekdays.includes(Number(input.value)); });
+    setMessage($('#cadenceError'), '');
+    renderCadencePreview(null);
+    updateCadenceControls();
+    $('#cadenceDialog').showModal();
+  }
+
+  async function previewCadence() {
+    const context = cadenceContext;
+    if (!context || cadenceActivity || cadenceApplyBusy) return;
+    const task = getTask(context.taskId);
+    if (!task || context.epoch !== configEpoch || cadenceSnapshot(task) !== context.snapshot) {
+      setMessage($('#cadenceError'), t("计划已更新，请重新打开频率设置。"));
+      context.proposal = null;
+      renderCadencePreview(null);
+      updateCadenceControls();
+      return;
+    }
+    let cadence;
+    try { cadence = cadenceFormValue(); } catch (error) { setMessage($('#cadenceError'), t(error.message)); return; }
+    setMessage($('#cadenceError'), '');
+    context.proposal = null;
+    renderCadencePreview(null);
+    updateCadenceControls();
+    const sessionId = cadenceSessionId;
+    const epoch = configEpoch;
+    const activity = { id: makeId(), taskId: context.taskId };
+    cadenceActivity = activity;
+    beginDelayedLoading(activity, () => cadenceActivity === activity && cadenceSessionId === sessionId, updateCadenceControls);
+    updateCadenceControls();
+    try {
+      if (typeof api?.proposeCadence !== 'function') throw new Error(t("当前运行环境尚未提供学习频率预览服务。"));
+      const proposal = await api.proposeCadence({ taskId: context.taskId, cadence });
+      if (epoch !== configEpoch || sessionId !== cadenceSessionId || cadenceActivity !== activity || !$('#cadenceDialog').open) return;
+      const latest = getTask(context.taskId);
+      if (!latest || cadenceSnapshot(latest) !== context.snapshot) throw new Error(t("学习计划已变化，请重新生成频率预览。"));
+      const today = localDateString();
+      const proposedRows = Array.isArray(proposal?.days) ? proposal.days : [];
+      const rowsAreUpcoming = proposedRows.every(day => day && schedule.validDate(day.date) && day.date >= today && day.completed !== true);
+      if (!proposal || proposal.taskId !== context.taskId || !proposal.id || !Array.isArray(proposal.days) || !Array.isArray(proposal.preserved) || !rowsAreUpcoming || Number(proposal.calendarDays) !== (Number(task.calendarDays) || Number(task.days)) || !sameValue(schedule.normalizeCadence(proposal.cadence), cadence)) {
+        throw new Error(t("服务返回的学习频率预览无效，请重试。"));
+      }
+      context.proposal = clone(proposal);
+      renderCadencePreview(context);
+      updateCadenceControls();
+    } catch (error) {
+      if (epoch === configEpoch && sessionId === cadenceSessionId && cadenceActivity === activity) setMessage($('#cadenceError'), error.message || t("生成学习频率预览失败，请重试。"));
+    } finally {
+      if (cadenceActivity === activity) {
+        clearDelayedLoading(activity);
+        cadenceActivity = null;
+        updateCadenceControls();
+      }
+    }
+  }
+
+  async function applyCadence() {
+    const context = cadenceContext;
+    const proposal = context?.proposal;
+    if (!context || !proposal || cadenceApplyBusy) return;
+    const task = getTask(context.taskId);
+    if (!task || context.epoch !== configEpoch || cadenceSnapshot(task) !== context.snapshot) {
+      setMessage($('#cadenceError'), t("学习计划已变化，请重新生成频率预览。"));
+      context.proposal = null;
+      renderCadencePreview(null);
+      updateCadenceControls();
+      return;
+    }
+    cadenceApplyBusy = true;
+    setMessage($('#cadenceError'), '');
+    updateCadenceControls();
+    try {
+      const savedTask = await withTaskSaveLock(context.taskId, async () => {
+        if (context.epoch !== configEpoch || !apiEnabled()) return null;
+        const fresh = await api.loadState();
+        if (context.epoch !== configEpoch) return null;
+        state.settings = fresh?.settings || state.settings;
+        if (!apiEnabled()) return null;
+        const latest = Array.isArray(fresh?.tasks) ? fresh.tasks.find(item => item.id === context.taskId) : null;
+        if (!latest || cadenceSnapshot(latest) !== context.snapshot) throw new Error(t("学习计划已变化，请重新生成频率预览。"));
+        if (typeof api?.applyCadence !== 'function') throw new Error(t("当前运行环境尚未提供学习频率保存服务。"));
+        const applied = await api.applyCadence(proposal.id);
+        if (context.epoch !== configEpoch || !apiEnabled()) return null;
+        const after = await api.loadState();
+        if (context.epoch !== configEpoch) return null;
+        state.settings = after?.settings || state.settings;
+        if (!apiEnabled()) return null;
+        const refreshed = Array.isArray(after?.tasks) ? after.tasks.find(item => item.id === context.taskId) : null;
+        const result = refreshed || (applied?.id === context.taskId ? applied : null);
+        if (!result) throw new Error(t("学习频率没有保存，请重试。"));
+        const existingIndex = state.tasks.findIndex(item => item.id === context.taskId);
+        state.tasks = existingIndex < 0
+          ? [...state.tasks, result]
+          : state.tasks.map(item => item.id === context.taskId ? result : item);
+        render();
+        return result;
+      });
+      if (!savedTask || context.epoch !== configEpoch || !apiEnabled()) return;
+      $('#cadenceDialog').close();
+      toast(t("学习频率已更新，历史记录已保留。"));
+    } catch (error) {
+      if (context.epoch === configEpoch && apiEnabled()) setMessage($('#cadenceError'), error.message || t("保存学习频率失败，请重试。"));
+    } finally {
+      cadenceApplyBusy = false;
+      updateCadenceControls();
     }
   }
 
@@ -1095,9 +1569,11 @@
       updateProfilePreview();
       if ($('#createDialog').open) {
         renderCreateMaterials();
+        renderCreateExamSummary();
         renderGoalDiscussion();
         updateCreateControls();
       }
+      if ($('#examDialog').open) renderExamMaterials();
       if ($('#settingsDialog').open) renderSettingsKeyState();
       if ($('#editDayDialog').open) updateEditDayEyebrow();
       if ($('#materialDialog').open) renderMaterialPreview();
@@ -1160,6 +1636,7 @@
       return;
     }
     const requestId = ++settingsRequestId;
+    cancelMaterialImport();
     const epoch = ++configEpoch;
     setBusy(saveButton, true);
     setBusy(testButton, true);
@@ -1799,20 +2276,25 @@
   }
 
   function eventDropZone(event) {
-    return event.target?.closest?.('#materialDropZone') || null;
+    return event.target?.closest?.('#materialDropZone, #examMaterialDropZone') || null;
+  }
+
+  function dropZoneIsOpen(zone) {
+    if (zone?.id === 'materialDropZone') return $('#createDialog').open;
+    return zone?.id === 'examMaterialDropZone' && $('#createDialog').open && $('#examDialog').open;
   }
 
   window.addEventListener('dragenter', event => {
     if (!dragHasFiles(event)) return;
     event.preventDefault();
     const zone = eventDropZone(event);
-    if (zone && $('#createDialog').open) zone.classList.add('is-dragging');
+    if (dropZoneIsOpen(zone)) zone.classList.add('is-dragging');
   });
 
   window.addEventListener('dragover', event => {
     if (!dragHasFiles(event)) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = eventDropZone(event) ? 'copy' : 'none';
+    if (event.dataTransfer) event.dataTransfer.dropEffect = dropZoneIsOpen(eventDropZone(event)) ? 'copy' : 'none';
   });
 
   window.addEventListener('dragleave', event => {
@@ -1825,7 +2307,8 @@
     event.preventDefault();
     const zone = eventDropZone(event);
     $('#materialDropZone')?.classList.remove('is-dragging');
-    if (zone && $('#createDialog').open) importDroppedMaterials(Array.from(event.dataTransfer.files || []));
+    $('#examMaterialDropZone')?.classList.remove('is-dragging');
+    if (dropZoneIsOpen(zone)) importDroppedMaterials(Array.from(event.dataTransfer.files || []), zone.id === 'examMaterialDropZone' ? 'exam' : 'study');
   });
 
   function openPlan(taskId) {
@@ -1845,6 +2328,7 @@
   document.addEventListener('click', async event => {
     const closeButton = event.target.closest('[data-close]');
     if (closeButton) {
+      if (closeButton.disabled) return;
       const dialog = document.getElementById(closeButton.dataset.close);
       if (dialog?.open) dialog.close();
       return;
@@ -1867,6 +2351,14 @@
       await applyAdjustment();
       return;
     }
+    if (action === 'confirm-cadence') {
+      await applyCadence();
+      return;
+    }
+    if (action === 'open-exam-dialog') { openExamDialog(); return; }
+    if (action === 'save-exam-draft') { saveExamDraft(); return; }
+    if (action === 'import-exam-material') { await importMaterials('exam'); return; }
+    if (action === 'cancel-material-import') { cancelMaterialImport(button.dataset.importTarget); return; }
     if (action === 'open-lesson') openTutoring(taskId, { mode: 'lesson', dayIndex: Number(button.dataset.dayIndex) });
     else if (action === 'ask-question') openTutoring(taskId, { mode: 'question', ...selectorFromButton(button), questionId: button.dataset.questionId });
     else if (action === 'lesson-depth' && tutoringContext) { tutoringContext.depth = button.dataset.depth; setMessage($('#tutoringError'), ''); renderTutoring(); }
@@ -1875,6 +2367,10 @@
     else if (action === 'settings') openSettings();
     else if (action === 'profile') openProfile();
     else if (action === 'import-create') await importMaterials();
+    else if (action === 'remove-exam-material') {
+      examDraft?.materials.splice(Number(button.dataset.materialIndex), 1);
+      renderExamMaterials();
+    } else if (action === 'preview-exam-material') showMaterial(examDraft?.materials[Number(button.dataset.materialIndex)]);
     else if (action === 'remove-create-material') {
       createMaterials.splice(Number(button.dataset.materialIndex), 1);
       invalidateGoalDiscussion();
@@ -1882,6 +2378,8 @@
     } else if (action === 'preview-create-material') showMaterial(createMaterials[Number(button.dataset.materialIndex)]);
     else if (action === 'preview-library-material') showMaterial(findMaterial(button.dataset.materialId));
     else if (action === 'open-plan') openPlan(taskId);
+    else if (action === 'edit-cadence') openCadence(taskId);
+    else if (action === 'view-final-history') openFinalHistory(taskId);
     else if (action === 'toggle-day') await toggleDay(taskId, Number(button.dataset.dayIndex));
     else if (action === 'edit-day') openEditDay(taskId, Number(button.dataset.dayIndex));
     else if (action === 'delete-task') await deleteTask(taskId);
@@ -1906,17 +2404,29 @@
 
   $('#createForm').addEventListener('submit', event => createPlan(event));
   $('#createForm').addEventListener('input', event => {
-    if (['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay'].includes(event.target.name)) {
+    if (['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay', 'cadenceMode', 'cadenceWeekday'].includes(event.target.name)) {
       invalidateGoalDiscussion();
       setMessage($('#createError'), '');
+      updateCreateCadenceControls();
     }
   });
   $('#createForm').addEventListener('change', event => {
-    if (['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay'].includes(event.target.name)) {
+    if (['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay', 'cadenceMode', 'cadenceWeekday'].includes(event.target.name)) {
       invalidateGoalDiscussion();
       setMessage($('#createError'), '');
+      updateCreateCadenceControls();
     }
   });
+  $('#cadenceForm').addEventListener('submit', event => { event.preventDefault(); previewCadence(); });
+  const invalidateCadencePreview = event => {
+    if (!['cadenceMode', 'cadenceWeekday'].includes(event.target.name)) return;
+    if (cadenceContext) cadenceContext.proposal = null;
+    setMessage($('#cadenceError'), '');
+    renderCadencePreview(null);
+    updateCadenceControls();
+  };
+  $('#cadenceForm').addEventListener('input', invalidateCadencePreview);
+  $('#cadenceForm').addEventListener('change', invalidateCadencePreview);
   $('#clarifySubmit').addEventListener('click', clarifyGoal);
   $('#confirmBrief').addEventListener('click', () => {
     if (createActivity || !discussionReady || !discussionBrief) return;
@@ -1940,24 +2450,63 @@
   viewHost.addEventListener('input', event => {
     if (event.target.matches('[data-answer]')) saveQuizDraft(event.target);
   });
-  ['createDialog', 'settingsDialog', 'profileDialog', 'editDayDialog', 'materialDialog', 'adjustmentDialog', 'tutoringDialog'].forEach(id => {
+  ['createDialog', 'examDialog', 'settingsDialog', 'profileDialog', 'editDayDialog', 'materialDialog', 'adjustmentDialog', 'tutoringDialog', 'cadenceDialog', 'finalHistoryDialog'].forEach(id => {
     const dialog = document.getElementById(id);
-    dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+    dialog.addEventListener('click', event => { if (event.target === dialog && !(id === 'cadenceDialog' && cadenceApplyBusy)) dialog.close(); });
   });
   $('#tutoringDialog').addEventListener('close', () => { if (!$('#tutoringDialog').open) tutoringContext = null; });
   $('#adjustmentDialog').addEventListener('close', () => {
     if (!$('#adjustmentDialog').open) proposedAdjustment = null;
   });
   $('#createDialog').addEventListener('close', () => {
+    if ($('#createDialog').open) return;
+    if ($('#examDialog').open) $('#examDialog').close();
+    const activity = createActivity;
     createSessionId += 1;
     $('#materialDropZone').classList.remove('is-dragging');
+    $('#examMaterialDropZone').classList.remove('is-dragging');
+    cancelMaterialImport();
+    clearDelayedLoading(activity);
+    if (activity?.type === 'plan' && !activity.generationFinished && typeof api?.cancelPlanGeneration === 'function') {
+      try { Promise.resolve(api.cancelPlanGeneration(activity.id)).catch(() => {}); } catch { /* Closing the dialog still clears local loading state. */ }
+    }
     createActivity = null;
     resetGoalDiscussion();
     setBusy($('#createSubmit'), false);
+    $('#createLoadingStatus').hidden = true;
+    $('#createLoadingStatus').textContent = '';
     setMessage($('#createError'), '');
+    createMaterials = [];
+    createExamDescription = '';
+    createExamMaterials = [];
+    examDraft = null;
+    renderCreateExamSummary();
   });
+  $('#examDialog').addEventListener('close', () => {
+    if ($('#examDialog').open) return;
+    examDialogSessionId += 1;
+    $('#examMaterialDropZone').classList.remove('is-dragging');
+    examDraft = null;
+    cancelMaterialImport('exam');
+    setMessage($('#examError'), '');
+    renderMaterialImportStatus();
+  });
+  $('#cadenceDialog').addEventListener('close', () => {
+    if ($('#cadenceDialog').open) return;
+    cadenceSessionId += 1;
+    clearDelayedLoading(cadenceActivity);
+    cadenceActivity = null;
+    cadenceContext = null;
+    cadenceApplyBusy = false;
+    renderCadencePreview(null);
+    setMessage($('#cadenceError'), '');
+    updateCadenceControls();
+  });
+  $('#cadenceDialog').addEventListener('cancel', event => { if (cadenceApplyBusy) event.preventDefault(); });
 
   async function initialize() {
+    subscribePlanProgress();
+    subscribeMaterialProgress();
     applyStaticTranslations();
     if (!api?.loadState) {
       viewHost.innerHTML = `<section class="panel"><div class="panel-heading"><div><span class="panel-kicker">${t("启动异常")}</span><h2>${t("暂时无法打开学习工作台")}</h2><p>${t("无法连接本地学习服务，请重新打开应用。")}</p></div></div></section>`;
