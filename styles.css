@@ -382,6 +382,7 @@ h1, h2 { font-family: var(--serif); font-weight: 500; letter-spacing: .015em; }
 .dialog-topline { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .dialog-close { display: grid; place-items: center; width: 31px; height: 31px; border: 1px solid #e7e7de; border-radius: 50%; color: #7d877d; background: #fafaf5; cursor: pointer; font-size: 21px; line-height: 1; }
 .dialog-close:hover { color: #344c39; background: #eff2e9; }
+.dialog-close:focus-visible { outline: 2px solid rgba(49, 87, 68, .55); outline-offset: 2px; }
 .app-dialog h2 { margin: 0 0 8px; color: #324738; font-size: 25px; line-height: 1.35; overflow-wrap: anywhere; }
 .dialog-intro { margin: 6px 0 18px; color: #828b82; font-size: 15px; line-height: 1.7; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 15px; }
@@ -530,7 +531,11 @@ h1, h2 { font-family: var(--serif); font-weight: 500; letter-spacing: .015em; }
   .sidebar { padding-right: 12px; padding-left: 12px; }
   .dashboard-grid { grid-template-columns: minmax(0,1fr); }
   .column-stack:last-child { grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; }
-  .quiz-layout { grid-template-columns: minmax(0,1fr) 215px; }
+  .plan-day-row { grid-template-columns: 76px minmax(0, 1fr); }
+  .plan-day-right { grid-column: 2; justify-content: flex-start; }
+  .plan-source { text-align: left; }
+  .quiz-layout { grid-template-columns: minmax(0, 1fr); }
+  .quiz-side { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .view-host { padding-right: 28px; padding-left: 28px; }
 }
 @media (max-width: 850px) {
@@ -645,9 +650,33 @@ h1, h2 { font-family: var(--serif); font-weight: 500; letter-spacing: .015em; }
 
 /* 按需讲解与错题追问 */
 .tutoring-content { display: grid; gap: 14px; max-height: min(48vh, 520px); max-height: min(48dvh, 520px); margin: 18px 0; overflow: auto; overscroll-behavior: contain; }
+#tutoringContent:not(.is-lesson) { max-height: min(28vh, 340px); max-height: min(28dvh, 340px); }
+.tutoring-content::-webkit-scrollbar { width: 6px; }
+.tutoring-content::-webkit-scrollbar-thumb { border-radius: 3px; background: #c7d3c3; }
 .tutor-text { color: #506356; font-size: 16px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
 .tutor-message { padding: 14px 16px; border: 1px solid #dce5d9; border-radius: 8px; background: #f4f7f0; }
 .tutor-message.is-user { background: #fbf5e9; border-color: #e6dcc7; }
 .tutor-message > strong { display: block; margin-bottom: 7px; color: #54735a; font-size: 13px; }
 .tutor-question, .tutor-empty { color: #6b796d; font-size: 15px; line-height: 1.7; }
-#lessonControls .is-selected { background: #e8f0e3; border-color: #9caf97; }
+#tutoringDialog { width: min(700px, calc(100vw - 28px)); max-width: min(700px, calc(100vw - 28px)); }
+#tutoringDialog .dialog-topline { margin-bottom: 3px; }
+#tutoringDialog h2 { margin-bottom: 3px; }
+#tutoringIntro { margin: 0 0 14px; }
+.lesson-depth-switch { display: grid; width: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; margin-top: 14px; padding: 4px; border: 1px solid #e3e7dd; border-radius: 8px; background: #f7f7f1; }
+.lesson-depth-switch .button { min-width: 0; min-height: 40px; padding: 7px 10px; border-color: transparent; border-radius: 5px; background: transparent; }
+.lesson-depth-switch .button.is-selected { border-color: #ccdac8; color: #355941; background: #e8f0e3; box-shadow: 0 1px 2px rgba(48, 77, 53, .06); }
+#tutoringContent.is-lesson { min-height: 120px; align-content: start; margin: 14px 0 0; }
+.lesson-state { display: grid; min-height: 120px; align-content: center; gap: 4px; padding: 15px 18px; border: 1px solid #dce5d9; border-radius: 8px; color: #657565; background: #f5f8f2; }
+.lesson-state strong { color: #46634b; font-weight: 600; }
+.lesson-state.is-loading { grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 10px; }
+.lesson-spinner { width: 16px; height: 16px; border: 2px solid #d6e0d3; border-top-color: #5f8062; border-radius: 50%; animation: spin .8s linear infinite; }
+.tutor-response { display: grid; min-width: 0; gap: 12px; }
+.tutor-notes { display: grid; gap: 4px; padding-left: 12px; border-left: 2px solid #e7dcc8; }
+.tutor-notes .field-hint { margin: 0; }
+#tutoringContent.is-lesson > .tutor-response > .tutor-text { padding: 18px 20px; border: 1px solid #e3e8df; border-radius: 8px; background: #f8f9f5; }
+#lessonActions { margin-top: 20px; padding-top: 15px; }
+
+@media (min-width: 1121px) {
+  .plan-day-row { grid-template-columns: 76px minmax(0, 1fr) minmax(220px, 232px); }
+  .plan-source { flex: 0 0 100%; max-width: none; text-align: right; }
+}

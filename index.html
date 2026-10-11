@@ -232,7 +232,7 @@
     <p id="tutoringIntro" class="dialog-intro"></p>
     <div id="tutoringError" class="form-message error-message" role="alert" hidden></div>
     <label id="tutoringConsentWrap" class="consent-row" hidden><input id="tutoringConsent" type="checkbox"><span><strong data-i18n="同意发送相关学习内容与作答">同意发送相关学习内容与作答</strong><small data-i18n="讲解按需生成，内容保存到本机供再次查看。">讲解按需生成，内容保存到本机供再次查看。</small></span></label>
-    <div id="lessonControls" class="report-actions"><button class="button button-outline" type="button" data-action="lesson-depth" data-depth="brief" data-i18n="简要讲解">简要讲解</button><button class="button button-outline" type="button" data-action="lesson-depth" data-depth="detailed" data-i18n="展开讲解">展开讲解</button></div>
+    <div id="lessonControls" class="lesson-depth-switch" role="group" data-i18n-aria-label="讲解篇幅" aria-label="讲解篇幅"><button class="button button-outline" type="button" data-action="lesson-depth" data-depth="brief" data-i18n="简要讲解" aria-pressed="false">简要讲解</button><button class="button button-outline" type="button" data-action="lesson-depth" data-depth="detailed" data-i18n="展开讲解" aria-pressed="false">展开讲解</button></div>
     <div id="tutoringContent" class="tutoring-content"></div>
     <div id="lessonActions" class="dialog-actions"><button id="generateLesson" class="button button-primary" type="button" data-action="generate-lesson" data-i18n="生成讲解">生成讲解</button></div>
     <form id="questionFollowUpForm" hidden>

@@ -6,8 +6,8 @@ A desktop learning planner for macOS and Windows. Turn your learning goals and m
 
 Get the app from [Releases](https://github.com/wsqUsaqi537/study-workbench/releases/latest):
 
-- **macOS — Apple Silicon:** [Download ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v0.6.0/study-workbench-0.6.0-mac-arm64.zip). Unzip it and move “学习工作台” to Applications.
-- **Windows — x64:** [Download EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v0.6.0/study-workbench-0.6.0-windows-x64.exe). Run the installer and follow the prompts.
+- **macOS — Apple Silicon:** [Download ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v0.6.1/study-workbench-0.6.1-mac-arm64.zip). Unzip it and move “学习工作台” to Applications.
+- **Windows — x64:** [Download EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v0.6.1/study-workbench-0.6.1-windows-x64.exe). Run the installer and follow the prompts.
 
 Packages are unsigned, and the Mac app is not notarized. The Windows package has not yet been tested on a Windows PC.
 

@@ -21,6 +21,7 @@ Object.defineProperty(safeStorage, 'isEncryptionAvailable', { configurable: true
 
 const apiRecords = [];
 let clarifyCount = 0;
+let longTutorReplies = false;
 function pngChunk(type, data) {
   const chunkType = Buffer.from(type);
   const payload = Buffer.concat([chunkType, data]);
@@ -231,6 +232,18 @@ function makeCadenceBatch(payload) {
   };
 }
 
+function makeLongTutorResponse(payload) {
+  const paragraphs = Array.from({ length: payload.outputLanguage === 'en' ? 32 : 80 }, (_, index) => payload.outputLanguage === 'en'
+    ? `Section ${index + 1}: store each transaction date, category, and amount as separate values, then validate empty input, decimal precision, and boundary cases before calculating a total. Process each record once, check the running sum after every step, and compare the result with a small known example.`
+    : `第 ${index + 1} 段：将每笔账目的日期、类别和金额分别保存，再在计算总额前检查空输入、小数精度和边界情况。循环处理记录时每笔只累计一次，并在每一步核对当前总额，最后用一组已知样例复查结果。`);
+  const longToken = payload.outputLanguage === 'en' ? `\n\n${'UnbrokenLearningToken'.repeat(45)}` : '';
+  return {
+    text: `${paragraphs.join('\n\n')}${longToken}`,
+    sources: payload.allowedSources.slice(0, 1),
+    limitations: payload.outputLanguage === 'en' ? ['This example focuses on the current day.'] : ['本例只说明当天学习内容。']
+  };
+}
+
 function responseFor(purpose, payload) {
   if (payload.outputLanguage === 'en') {
     if (purpose === '生成学习计划') {
@@ -240,7 +253,10 @@ function responseFor(purpose, payload) {
       plan.days = plan.days.map((day, index) => ({ ...day, title: index ? 'Practice and review' : 'Variables and examples', tasks: ['Practice the concepts', 'Take a 5-question daily quiz (10 minutes)', ...(index === plan.days.length - 1 ? ['Take a 10-question final test (15 minutes)'] : [])] }));
       return plan;
     }
-    if (purpose === '讲解当前日学习内容') return { text: 'Concept: variables store values.\nExample: record a purchase.\nCommon pitfall: mixing text and numbers.\nExercise: create a record.', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+    if (purpose === '讲解当前日学习内容') return longTutorReplies
+      ? makeLongTutorResponse(payload)
+      : { text: 'Concept: variables store values.\nExample: record a purchase.\nCommon pitfall: mixing text and numbers.\nExercise: create a record.', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+    if (purpose === '解释当前测验题和评分反馈') return { text: 'Check the input before calculating a total. Then use one small example to trace each step and explain why the result is correct.', sources: payload.allowedSources.slice(0, 1), limitations: [] };
     if (purpose === '生成每日小测' || purpose === '生成周期测验') {
       return { questions: makeAssessmentQuestions(purpose === '生成每日小测' ? 'daily' : 'final').map(q => ({ ...q, question: q.type === 'choice' ? 'Which explanation is correct?' : 'Explain how to use this concept.', options: q.type === 'choice' ? ['Correct explanation', 'Distractor one', 'Distractor two', 'Distractor three'] : [], answer: q.type === 'choice' ? 'A' : 'Use the concept in practice.', alternatives: q.type === 'fill' ? ['Apply it to a practical example.'] : [], reference: 'Explain the concept with a concrete example.', rubric: 'Assess accuracy and application.' })) };
     }
@@ -259,7 +275,10 @@ function responseFor(purpose, payload) {
       ? { reply: '你希望覆盖变量、循环和函数，并完成记账小程序，对吗？', ready: false, brief: null }
       : { reply: '学习范围已经整理好，请确认。', ready: true, brief: expectedBrief };
   }
-  if (purpose === '讲解当前日学习内容') return { text: '概念：变量保存信息。\n例子：记录一笔账目。\n易错点：混淆数字与文本。\n练习：写出一笔记录。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+  if (purpose === '讲解当前日学习内容') {
+    if (longTutorReplies) return makeLongTutorResponse(payload);
+    return { text: '概念：变量保存信息。\n例子：记录一笔账目。\n易错点：混淆数字与文本。\n练习：写出一笔记录。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
+  }
   if (purpose === '解释当前测验题和评分反馈') return { text: '把记录拆分后，先校验输入，再汇总数值；用一个简单例子逐步检查。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
   if (purpose === '生成学习计划概要与知识清单') return makePlanOutline(payload);
   if (purpose === '生成学习计划每日安排') return makePlanBatch(payload);
@@ -335,6 +354,12 @@ const apiServer = http.createServer(async (request, response) => {
       gate.resolveObserved(payload);
       await gate.released;
     }
+    if (nextTutoringGate && nextTutoringGate.purpose === purpose) {
+      const gate = nextTutoringGate;
+      nextTutoringGate = null;
+      gate.resolveObserved(payload);
+      await gate.released;
+    }
     const result = responseFor(purpose, payload || {});
     if (response.destroyed) return;
     response.writeHead(200, { 'Content-Type': 'application/json' });
@@ -350,6 +375,7 @@ const apiStarted = new Promise((resolve, reject) => {
   apiServer.listen(0, '127.0.0.1', resolve);
 });
 let nextPlanGate = null;
+let nextTutoringGate = null;
 
 function delayNextPlanResponse(purpose = '生成学习计划') {
   let resolveObserved;
@@ -357,6 +383,15 @@ function delayNextPlanResponse(purpose = '生成学习计划') {
   const observed = new Promise(resolve => { resolveObserved = resolve; });
   const released = new Promise(resolve => { releaseResponse = resolve; });
   nextPlanGate = { purpose, resolveObserved, released };
+  return { observed, release: () => releaseResponse() };
+}
+
+function delayNextTutoringResponse(purpose = '讲解当前日学习内容') {
+  let resolveObserved;
+  let releaseResponse;
+  const observed = new Promise(resolve => { resolveObserved = resolve; });
+  const released = new Promise(resolve => { releaseResponse = resolve; });
+  nextTutoringGate = { purpose, resolveObserved, released };
   return { observed, release: () => releaseResponse() };
 }
 
@@ -764,6 +799,45 @@ async function captureVisualScreenshot(window, name, dialogSelector = '') {
   fs.writeFileSync(filePath, bytes);
   console.log(`TEMP_SCREENSHOT ${filePath} ${size.width}x${size.height}`);
   return layout;
+}
+
+async function inspectTutoringState(window) {
+  return window.webContents.executeJavaScript(`(() => {
+    const visible = element => Boolean(element && !element.hidden && element.getClientRects().length);
+    const consent = document.querySelector('#tutoringConsentWrap');
+    const depthSwitch = document.querySelector('#lessonControls');
+    const content = document.querySelector('#tutoringContent');
+    const state = content?.querySelector('.lesson-state');
+    const consentBox = consent?.getBoundingClientRect();
+    const depthBox = depthSwitch?.getBoundingClientRect();
+    return {
+      consentVisible: visible(consent),
+      depthSwitchVisible: visible(depthSwitch),
+      consentDepthGap: visible(consent) && visible(depthSwitch) ? depthBox.top - consentBox.bottom : null,
+      depthButtons: [...(depthSwitch?.querySelectorAll('[data-depth]') || [])].map(button => ({
+        depth: button.dataset.depth,
+        pressed: button.getAttribute('aria-pressed'),
+        selected: button.classList.contains('is-selected')
+      })),
+      emptyState: visible(state) ? {
+        loading: state.classList.contains('is-loading'),
+        title: state.querySelector('strong')?.textContent || '',
+        hint: [...state.querySelectorAll('span')].map(span => span.textContent).join(' ').trim(),
+        minHeight: parseFloat(getComputedStyle(state).minHeight) || 0,
+        background: getComputedStyle(state).backgroundColor,
+        role: state.getAttribute('role'),
+        ariaLive: state.getAttribute('aria-live'),
+        spinnerVisible: visible(state.querySelector('.lesson-spinner'))
+      } : null,
+      lessonActionsHidden: Boolean(document.querySelector('#lessonActions')?.hidden),
+      generateLessonHidden: Boolean(document.querySelector('#generateLesson')?.hidden),
+      generateLessonDisabled: Boolean(document.querySelector('#generateLesson')?.disabled),
+      contentOverflow: Boolean(content && content.scrollWidth > content.clientWidth + 1),
+      contentTextLength: content?.innerText.length || 0,
+      contentChildClass: content?.firstElementChild?.className || '',
+      depthSwitchBackground: depthSwitch ? getComputedStyle(depthSwitch).backgroundColor : ''
+    };
+  })()`);
 }
 
 function pngDimensions(dataURL) {
@@ -1233,6 +1307,36 @@ async function run() {
   assert.deepEqual(planPayload.brief, expectedBrief);
   assert.equal(apiRecords.filter(record => record.purpose === '澄清学习需求').length, 2);
 
+  if (process.env.STUDY_TEST_REPRODUCE_TUTOR_GAP === '1') {
+    currentStage = '复现修复前讲解授权卡与篇幅按钮 0px 间距';
+    const baselineTask = JSON.parse(JSON.stringify(newTask));
+    baselineTask.id = 'desktop-tutor-gap-legacy-baseline';
+    baselineTask.title = '讲解授权间距基线复现';
+    delete baselineTask.lessons;
+    delete baselineTask.tutorChats;
+    const baselineTaskCount = (await readState(window)).tasks.length;
+    await window.webContents.executeJavaScript(`window.studyApp.saveTask(${JSON.stringify(baselineTask)})`);
+    window = await reloadWindow(window, true, baselineTaskCount + 1);
+    await setVisualViewport(window, 850, 650);
+    await click(window, '[data-nav="plans"]', '基线复现打开计划列表');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .plan-card"))', '基线计划列表已加载');
+    await clickAction(window, 'open-plan', baselineTask.id);
+    await waitForJS(window, `document.querySelector('#appView h1')?.textContent === ${JSON.stringify(baselineTask.title)}`, '打开讲解间距基线计划');
+    await clickAction(window, 'open-lesson', baselineTask.id, { dayIndex: 0 });
+    await waitForJS(window, '!document.querySelector("#tutoringConsentWrap").hidden && document.querySelector("#tutoringDialog")?.open', '基线讲解显示未授权卡');
+    await window.webContents.insertCSS(`#lessonControls.lesson-depth-switch {
+      display: flex !important; grid-template-columns: none !important; gap: 8px !important;
+      margin-top: 0 !important; padding: 0 !important; border: 0 !important;
+      border-radius: 0 !important; background: transparent !important;
+    }`);
+    const baselineLayout = await inspectTutoringState(window);
+    console.log(`LEGACY_GAP_REPRO ${JSON.stringify({ gap: baselineLayout.consentDepthGap, consentVisible: baselineLayout.consentVisible })}`);
+    await captureVisualScreenshot(window, 'gap-repro-legacy-css-zh-850x650.png', '#tutoringDialog');
+    assert.ok(baselineLayout.consentDepthGap >= 12,
+      `预期基线应复现授权卡与深度按钮的 0px 间距失败：${JSON.stringify(baselineLayout)}`);
+    return;
+  }
+
   currentStage = '展示知识清单并保存新版知识视图截图';
   await waitForJS(window, 'document.querySelectorAll(".plan-knowledge .knowledge-item").length === 2', '计划详情展示知识清单');
   const knowledgeText = await window.webContents.executeJavaScript('document.querySelector(".plan-knowledge").innerText');
@@ -1383,7 +1487,8 @@ async function run() {
   await clickAction(window, 'open-lesson', newTask.id, { dayIndex: 1 });
   await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open', '打开每日讲解');
   const beforeLessons = apiRecords.length;
-  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#tutoringContent").innerText.includes("尚未生成")'), true);
+  assert.equal(await window.webContents.executeJavaScript('Boolean(document.querySelector("#tutoringContent .lesson-state strong")?.textContent.includes("尚未生成"))'), true);
+  assert.deepEqual((await inspectTutoringState(window)).depthButtons.map(button => [button.depth, button.pressed]), [['brief', 'true'], ['detailed', 'false']]);
   await click(window, '#generateLesson');
   await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.lessons?.['1']?.brief))`, '简要讲解保存');
   assert.equal(apiRecords.at(-1).purpose, '讲解当前日学习内容');
@@ -1391,8 +1496,10 @@ async function run() {
   await click(window, '#tutoringDialog [data-close]');
   await clickAction(window, 'open-lesson', newTask.id, { dayIndex: 1 });
   await waitForJS(window, 'document.querySelector("#generateLesson").hidden', '再次查看直接使用缓存');
+  await waitForJS(window, 'document.querySelector("#lessonActions").hidden', '缓存简要讲解隐藏整个操作区');
   assert.equal(apiRecords.length, beforeLessons + 1);
   await click(window, '#lessonControls [data-depth="detailed"]');
+  await waitForJS(window, 'document.querySelector("#lessonControls [data-depth=detailed]").getAttribute("aria-pressed") === "true" && document.querySelector("#lessonControls [data-depth=brief]").getAttribute("aria-pressed") === "false"', '深度按钮更新 aria-pressed 状态');
   await click(window, '#generateLesson');
   await waitForJS(window, `window.studyApp.loadState().then(s => Boolean(s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.lessons?.['1']?.detailed))`, '展开讲解单独缓存');
   assert.equal(apiRecords.at(-1).purpose, '讲解当前日学习内容');
@@ -1403,6 +1510,8 @@ async function run() {
   await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open', '重新打开已缓存的每日讲解');
   await click(window, '#lessonControls [data-depth="detailed"]');
   await waitForJS(window, 'document.querySelector("#generateLesson").hidden', '重新打开后直接使用展开讲解缓存');
+  await waitForJS(window, 'document.querySelector("#lessonActions").hidden', '缓存展开讲解隐藏整个操作区');
+  assert.deepEqual((await inspectTutoringState(window)).depthButtons.map(button => [button.depth, button.pressed]), [['brief', 'false'], ['detailed', 'true']]);
   assert.equal(apiRecords.length, beforeLessons + 2, '重新打开已缓存的展开讲解不应再次请求模型');
   await click(window, '#tutoringDialog [data-close]');
 
@@ -2283,11 +2392,12 @@ async function run() {
   assert.match(legacyWarningSections.warnings, /内容可能不完整/, '无法安全分类的旧警告应留在生成提示区');
 
   currentStage = '真实 Electron 双语言双尺寸主视图与对话框布局截图';
+  const screenshotHeight = width => width === 850 ? 650 : width === 1000 ? 750 : 800;
   async function capturePage(name, language, width) {
-    await captureVisualScreenshot(window, `0.6-ui-${language}-${width}x${width === 850 ? 650 : 800}-${name}.png`);
+    await captureVisualScreenshot(window, `0.6-ui-${language}-${width}x${screenshotHeight(width)}-${name}.png`);
   }
-  async function captureDialog(name, selector, language, width) {
-    await captureVisualScreenshot(window, `0.6-ui-${language}-${width}x${width === 850 ? 650 : 800}-${name}.png`, selector);
+async function captureDialog(name, selector, language, width) {
+    await captureVisualScreenshot(window, `0.6-ui-${language}-${width}x${screenshotHeight(width)}-${name}.png`, selector);
   }
   async function captureMainViews(language, width) {
     await click(window, '[data-nav="overview"]', '截图：学习概览');
@@ -2367,8 +2477,192 @@ async function run() {
     await click(window, '#finalHistoryDialog [data-close="finalHistoryDialog"]', '关闭截图历史周期报告');
     await clickAction(window, 'open-lesson', visualTask.id, { dayIndex: 0 });
     await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open', '截图：讲解对话框已打开');
+    await waitForJS(window, 'document.querySelector("#lessonActions").hidden && document.querySelector("#generateLesson").hidden', '截图：已缓存讲解隐藏生成操作');
+    const cachedTutoringState = await inspectTutoringState(window);
+    assert.equal(cachedTutoringState.depthButtons.find(button => button.depth === 'brief')?.pressed, 'true');
     await captureDialog('dialog-tutoring', '#tutoringDialog', language, width);
     await click(window, '#tutoringDialog [data-close="tutoringDialog"]', '关闭截图讲解对话框');
+  }
+
+  async function captureTutoringStates(language, width) {
+    const currentTasks = await readState(window);
+    const sourceTask = currentTasks.tasks.find(task => task.id === newTask.id);
+    assert.ok(sourceTask?.materials.some(material => material.text?.trim()), '讲解视觉任务必须含需授权的本地 mock 材料');
+    const tutorTask = JSON.parse(JSON.stringify(sourceTask));
+    tutorTask.id = `desktop-tutor-visual-${language}-${width}`;
+    tutorTask.title = `讲解视觉回归 ${language} ${width}`;
+    delete tutorTask.lessons;
+    delete tutorTask.tutorChats;
+    const finalQuestions = makeAssessmentQuestions('final');
+    const finalItems = finalQuestions.map(question => ({
+      id: question.id,
+      score: question.id === 'q9' ? 4 : 10,
+      feedback: question.id === 'q9' ? '还需要补充输入校验步骤。' : '回答包含核心概念。'
+    }));
+    tutorTask.quiz = {
+      version: 2,
+      mode: 'ai',
+      kind: 'final',
+      dayIndex: null,
+      questions: finalQuestions,
+      answers: Object.fromEntries(finalQuestions.map(question => [question.id, { text: question.type === 'choice' ? 'A' : '已作答。' }])),
+      generatedDate: testLocalDate(),
+      resultDate: testLocalDate(),
+      result: {
+        mode: 'ai',
+        score: finalItems.reduce((sum, item) => sum + item.score, 0),
+        feedback: '复习输入校验，再用小例子核对计算过程。',
+        items: finalItems,
+        weakPoints: ['输入校验'],
+        report: {
+          summary: '阶段测验已经完成。',
+          strengths: ['能识别主要概念。'],
+          nextSteps: ['检查输入后再计算。'],
+          readyForNext: null,
+          reason: '期末报告不判断下一日准备程度。',
+          extraMinutes: 0,
+          extraTasks: []
+        }
+      }
+    };
+    const taskCountBeforeFixture = currentTasks.tasks.length;
+    await window.webContents.executeJavaScript(`window.studyApp.saveTask(${JSON.stringify(tutorTask)})`);
+    window = await reloadWindow(window, true, taskCountBeforeFixture + 1);
+
+    await click(window, '[data-nav="plans"]', '打开讲解视觉任务列表');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .plan-card"))', '讲解视觉任务列表已加载');
+    await clickAction(window, 'open-plan', tutorTask.id);
+    await waitForJS(window, `document.querySelector('#appView h1')?.textContent === ${JSON.stringify(tutorTask.title)}`, '打开含 mock 材料的讲解视觉任务');
+    await clickAction(window, 'open-lesson', tutorTask.id, { dayIndex: 0 });
+    await waitForJS(window, '!document.querySelector("#tutoringConsentWrap").hidden && document.querySelector("#tutoringDialog")?.open && document.querySelector("#tutoringContent .lesson-state:not(.is-loading)")', '授权讲解空状态显示');
+    let tutorState = await inspectTutoringState(window);
+    assert.equal(tutorState.consentVisible, true, '空状态截图必须显示材料授权卡');
+    assert.equal(tutorState.depthSwitchVisible, true);
+    assert.ok(tutorState.consentDepthGap >= 12, `授权卡与深度按钮应至少间隔 12px：${JSON.stringify(tutorState)}`);
+    assert.ok(tutorState.emptyState?.title, '空状态应有清晰标题');
+    assert.ok(tutorState.emptyState?.hint.length > 0 && tutorState.emptyState.hint.length <= 120, '空状态应提供简短操作提示');
+    assert.ok(tutorState.emptyState.minHeight >= 110, '空状态应保持卡片层次与可读空间');
+    assert.notEqual(tutorState.emptyState.background, tutorState.depthSwitchBackground, '空状态卡与篇幅控制区应有不同底色层次');
+    assert.deepEqual(tutorState.depthButtons.map(button => [button.depth, button.pressed]), [['brief', 'true'], ['detailed', 'false']]);
+    assert.equal(tutorState.lessonActionsHidden, false);
+    assert.equal(tutorState.generateLessonHidden, false);
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#generateLesson").textContent'), language === 'en' ? 'Generate brief lesson' : '生成简要讲解');
+    await captureVisualScreenshot(window, `0.6.1-tutor-empty-consent-${language}-${width}x${width === 850 ? 650 : 800}.png`, '#tutoringDialog');
+
+    await setChecked(window, '#tutoringConsent', true);
+    const tutoringGate = delayNextTutoringResponse();
+    longTutorReplies = true;
+    const tutorRequestCount = apiRecords.length;
+    await click(window, '#generateLesson', '生成视觉回归长讲解');
+    const observedPayload = await Promise.race([tutoringGate.observed, delay(5000).then(() => null)]);
+    assert.ok(observedPayload, '长讲解生成态必须真实到达 localhost API mock');
+    assert.equal(apiRecords.length, tutorRequestCount + 1);
+    assert.equal(apiRecords.at(-1).purpose, '讲解当前日学习内容');
+    assert.equal(observedPayload.outputLanguage, language === 'en' ? 'en' : 'zh-CN');
+    await waitForJS(window, 'document.querySelector("#tutoringContent .lesson-state.is-loading .lesson-spinner") && document.querySelector("#generateLesson").disabled', '真实 mock 延迟期间显示加载状态');
+    tutorState = await inspectTutoringState(window);
+    assert.equal(tutorState.emptyState?.role, 'status');
+    assert.equal(tutorState.emptyState?.ariaLive, 'polite');
+    assert.equal(tutorState.emptyState?.spinnerVisible, true);
+    assert.equal(tutorState.generateLessonDisabled, true);
+    await captureVisualScreenshot(window, `0.6.1-tutor-generating-${language}-${width}x${width === 850 ? 650 : 800}.png`, '#tutoringDialog');
+    tutoringGate.release();
+
+    const cachedLesson = `window.studyApp.loadState().then(s => {
+      const lesson = s.tasks.find(task => task.id === ${JSON.stringify(tutorTask.id)})?.lessons?.['0']?.brief;
+      return Boolean(lesson && lesson.text.length > 7000);
+    })`;
+    await waitForJS(window, cachedLesson, '长讲解已保存到任务缓存', 15000);
+    longTutorReplies = false;
+    tutorState = await inspectTutoringState(window);
+    assert.ok(tutorState.contentTextLength > 7000, `缓存讲解应为长正文：${JSON.stringify(tutorState)}`);
+    assert.equal(tutorState.contentOverflow, false, '长讲解正文不得横向溢出');
+    assert.equal(tutorState.lessonActionsHidden, true, '命中缓存时应隐藏整个讲解操作区');
+    assert.equal(tutorState.generateLessonHidden, true, '命中缓存时保留生成按钮 hidden');
+    assert.deepEqual(tutorState.depthButtons.map(button => [button.depth, button.pressed]), [['brief', 'true'], ['detailed', 'false']]);
+    await captureVisualScreenshot(window, `0.6.1-tutor-generated-long-${language}-${width}x${width === 850 ? 650 : 800}.png`, '#tutoringDialog');
+    await click(window, '#tutoringDialog [data-close="tutoringDialog"]', '关闭缓存讲解');
+    await clickAction(window, 'open-lesson', tutorTask.id, { dayIndex: 0 });
+    await waitForJS(window, 'document.querySelector("#lessonActions").hidden && document.querySelector("#generateLesson").hidden', '重新打开时复用缓存且隐藏整个操作区');
+    assert.equal(apiRecords.length, tutorRequestCount + 1, '重新打开缓存讲解不应再次请求 mock');
+
+    await click(window, '#tutoringDialog [data-close="tutoringDialog"]', '关闭缓存讲解后打开错题追问');
+    await click(window, '[data-nav="plans"]', '转到计划列表以打开错题报告');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .plan-card"))', '错题视觉任务列表已加载');
+    await clickAction(window, 'open-plan', tutorTask.id);
+    await openAssessmentThroughUI(window, tutorTask.id, 'final', undefined, false);
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .learning-report"))', '打开错题来源的期末报告');
+    await clickAction(window, 'ask-question', tutorTask.id, { kind: 'final' });
+    await waitForJS(window, 'document.querySelector("#tutoringDialog")?.open && !document.querySelector("#questionFollowUpForm").hidden && document.querySelector("#tutoringContent .tutor-question")', '错题追问显示当前题目和输入区');
+    const prompts = language === 'en'
+      ? ['Why should I check the input first?', 'Can you show a simpler example?']
+      : ['为什么需要先检查输入？', '可以换一个更简单的例子吗？'];
+    for (let index = 0; index < prompts.length; index += 1) {
+      await setValue(window, '#questionFollowUpInput', prompts[index]);
+      await click(window, '#sendQuestionFollowUp', '发送错题追问');
+      const messageCount = 2 * (index + 1);
+      await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(task => task.id === ${JSON.stringify(tutorTask.id)})?.tutorChats?.['final:q9']?.messages?.length === ${messageCount})`, `错题追问第 ${index + 1} 轮返回并保存`);
+      await waitForJS(window, '!document.querySelector("#sendQuestionFollowUp").disabled', '错题追问发送按钮恢复');
+    }
+    const questionLayout = await captureVisualScreenshot(window, `0.6.1-tutor-wrong-question-${language}-${width}x${width === 850 ? 650 : 800}.png`, '#tutoringDialog');
+    assert.equal(questionLayout.tutoringOverflow, false, '错题追问对话不得横向溢出');
+    const sendButtonVisible = await window.webContents.executeJavaScript(`(() => {
+      const button = document.querySelector("#sendQuestionFollowUp").getBoundingClientRect();
+      const dialog = document.querySelector("#tutoringDialog").getBoundingClientRect();
+      return button.top >= dialog.top && button.bottom <= Math.min(dialog.bottom, innerHeight);
+    })()`);
+    assert.equal(sendButtonVisible, true, '错题追问发送按钮应在当前弹窗视口内可见');
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const content = document.querySelector('#tutoringContent');
+      return content.scrollHeight - content.clientHeight - content.scrollTop <= 2;
+    })()`), true, '错题追问应显示最新回复并可滚动回顾历史');
+    const questionState = await inspectTutoringState(window);
+    assert.equal(questionState.contentOverflow, false, '错题追问内容容器不得横向溢出');
+    await click(window, '#tutoringDialog [data-close="tutoringDialog"]', '关闭错题追问视觉回归');
+    await click(window, '[data-nav="plans"]', '恢复计划详情截图上下文');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .plan-card"))', '计划列表恢复完成');
+    await clickAction(window, 'open-plan', visualTask.id);
+    await waitForJS(window, `document.querySelector('#appView h1')?.textContent === ${JSON.stringify(visualTask.title)}`, '计划详情截图上下文已恢复');
+  }
+
+  async function captureIntermediateViewport(language) {
+    await setVisualViewport(window, 1000, 750);
+    await click(window, '[data-nav="plans"]', '在 1000px 视口打开计划列表');
+    await waitForJS(window, 'Boolean(document.querySelector("#appView .plan-card"))', '1000px 计划列表已加载');
+    await clickAction(window, 'open-plan', visualTask.id);
+    await waitForJS(window, `document.querySelector('#appView h1')?.textContent === ${JSON.stringify(visualTask.title)}`, '1000px 计划详情已加载');
+    const planLayout = await window.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('.plan-day-row');
+      const info = row?.querySelector('.plan-day-info');
+      const actions = row?.querySelector('.plan-day-right');
+      return {
+        columns: row ? getComputedStyle(row).gridTemplateColumns.trim().split(/\\s+/).length : 0,
+        infoBottom: info?.getBoundingClientRect().bottom ?? null,
+        actionsTop: actions?.getBoundingClientRect().top ?? null
+      };
+    })()`);
+    assert.equal(planLayout.columns, 2, `1000px 计划日程应使用日期与内容两列：${JSON.stringify(planLayout)}`);
+    assert.ok(planLayout.actionsTop >= planLayout.infoBottom - 1,
+      `1000px 计划操作应排在正文下方：${JSON.stringify(planLayout)}`);
+    await captureVisualScreenshot(window, `0.6.1-ui-${language}-1000x750-detail.png`);
+
+    await clickAction(window, 'open-plan', visualTask.id);
+    await openAssessmentThroughUI(window, visualTask.id, 'daily', 1, false);
+    await waitForJS(window, 'Boolean(document.querySelector("#quizForm"))', '1000px 未提交测验已加载');
+    const quizLayout = await window.webContents.executeJavaScript(`(() => {
+      const grid = document.querySelector('.quiz-layout');
+      const main = grid?.querySelector('.quiz-main');
+      const side = grid?.querySelector('.quiz-side');
+      return {
+        columns: grid ? getComputedStyle(grid).gridTemplateColumns.trim().split(/\\s+/).length : 0,
+        mainBottom: main?.getBoundingClientRect().bottom ?? null,
+        sideTop: side?.getBoundingClientRect().top ?? null
+      };
+    })()`);
+    assert.equal(quizLayout.columns, 1, `1000px 测验主体与侧栏信息应单列排列：${JSON.stringify(quizLayout)}`);
+    assert.ok(quizLayout.sideTop >= quizLayout.mainBottom - 1,
+      `1000px 测验侧栏应排在题目下方：${JSON.stringify(quizLayout)}`);
+    await captureVisualScreenshot(window, `0.6.1-ui-${language}-1000x750-quiz.png`);
   }
 
   const visualAdjustmentRecords = [];
@@ -2380,6 +2674,7 @@ async function run() {
       await setVisualViewport(window, width, height);
       await captureMainViews(imageLanguage, width);
       await captureStandardDialogs(imageLanguage, width);
+      await captureTutoringStates(imageLanguage, width);
       if (width === 850) {
         await clickAction(window, 'open-plan', visualTask.id);
         await openAssessmentThroughUI(window, visualTask.id, 'daily', 0, false);
@@ -2396,6 +2691,8 @@ async function run() {
         await waitForJS(window, '!document.querySelector("#adjustmentDialog")?.open', '截图后续调整预览已取消');
       }
     }
+    currentStage = `验证 ${imageLanguage} 1000x750 侧栏断点布局并截图计划与测验`;
+    await captureIntermediateViewport(imageLanguage);
   }
   assert.equal(visualAdjustmentRecords.length, 2, '中文和英文讲解布局各使用一次真实后续调整预览');
   assert.deepEqual(visualAdjustmentRecords.map(record => record.payload.outputLanguage), ['zh-CN', 'en']);

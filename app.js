@@ -685,7 +685,7 @@
     const consentRequired = needsMaterialConsent(task) && !sessionConsent.has(task.id);
     if (!quiz?.questions?.length) {
       const description = isDaily ? t("根据当天任务生成 5 道选择或填空题。") : t("根据整份计划生成 10 道选择或填空题，最多包含 2 道简答。");
-      return `${head}<div class="quiz-layout"><div class="quiz-main"><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">${count} ${t("QUESTIONS / AI 测评")}</span><h2>${t("开始")}${label}</h2><p>${description}</p></div></section>${consentRequired ? `<div class="form-message warning-message">${t("本计划包含材料文字。请先在右侧勾选同意，之后才会向模型服务发送请求。")}</div>` : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">${t("题目会保存到本计划，之后可直接查看和作答。")}</span><button class="button button-primary" type="button" data-action="generate-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("生成")}${count}${t("题")}${label}</button></div></div><aside class="quiz-side"><section class="quiz-side-card"><h3>${t("这份测评")}</h3><p>${t("共")} ${count} ${t("道题。答案和反馈会在提交后显示。")}</p></section>${quizConsentCard(task)}</aside></div>`;
+      return `${head}<div class="quiz-layout"><div class="quiz-main"><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">${count} ${t("QUESTIONS / AI 测评")}</span><h2>${t("开始")}${label}</h2><p>${description}</p></div></section>${consentRequired ? `<div class="form-message warning-message">${t("本计划包含材料文字。请先勾选同意，之后才会向模型服务发送请求。")}</div>` : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">${t("题目会保存到本计划，之后可直接查看和作答。")}</span><button class="button button-primary" type="button" data-action="generate-assessment" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("生成")}${count}${t("题")}${label}</button></div></div><aside class="quiz-side"><section class="quiz-side-card"><h3>${t("这份测评")}</h3><p>${t("共")} ${count} ${t("道题。答案和反馈会在提交后显示。")}</p></section>${quizConsentCard(task)}</aside></div>`;
     }
     const submitted = Boolean(quiz.result);
     const isVersion2 = quiz.version === 2;
@@ -726,7 +726,7 @@
     const legacyAction = isLegacyAI && !submitted ? `<button class="button button-small button-outline" type="button" data-action="retake-assessment" data-task-id="${escapeHTML(task.id)}" ${selectorAttrs}>${t("升级为新题型")}</button>` : '';
     const submitAction = `<button class="button button-primary" type="submit" id="submitQuiz">${isLegacyAI ? t("提交旧版测试并评分") : `${t("提交并生成")}${reportLabel}`}</button>`;
     const action = submitted ? retake : isLegacyAI ? `${submitAction}${legacyAction}` : submitAction;
-    const materialNotice = !submitted && consentRequired ? `<div class="form-message warning-message">${t("请求会发送本计划相关学习内容与作答；旧版计划必要时可能包含材料文字。请先在右侧勾选同意。")}</div>` : '';
+    const materialNotice = !submitted && consentRequired ? `<div class="form-message warning-message">${t("请求会发送本计划相关学习内容与作答；旧版计划必要时可能包含材料文字。请先勾选同意。")}</div>` : '';
     return `${head}<div class="quiz-layout"><form id="quizForm" class="quiz-main" data-task-id="${escapeHTML(task.id)}" ${selectorAttrs}><section class="quiz-intro"><div class="quiz-intro-copy"><span class="panel-kicker">${isLegacy ? t("历史测验记录") : `${count} QUESTIONS / ${label}`}</span><h2>${escapeHTML(isDaily ? day.title : displayDifficulty(task.plan?.difficulty) || t("学习测验"))}</h2><p>${isLegacy ? t("显示此前保存的历史答案与结果。") : t("选项在答题时可见；参考答案和评分反馈会在提交后显示。")}</p></div>${quiz.generatedDate ? `<div class="quiz-intro-note">${t("题目生成于")} ${escapeHTML(formatDate(quiz.generatedDate, { year: 'numeric', month: 'long', day: 'numeric' }))}。</div>` : ''}</section>${materialNotice}${questionFields}${submitted && !isVersion2 ? renderResult(quiz) : ''}${submitted && isVersion2 ? renderAssessmentReport(task, selector, quiz) : ''}<div class="quiz-submit-row"><span class="quiz-submit-hint">${submitted ? t("题目与报告已保存在这份学习计划中。") : t("答题草稿只保存在当前应用会话中。")}</span>${action}</div></form><aside class="quiz-side"><section class="quiz-side-card"><h3>${t("本次练习")}</h3><p>${t("主题：")}${escapeHTML(task.title)}<br>${t("测评：")}${label}<br>${t("题目：")}${isLegacy ? t("旧版 5 题") : `${count} ${t("道")}`}</p></section>${quizConsentCard(task)}<section class="quiz-side-card"><h3>${t("回顾与反馈")}</h3><p>${submitted ? `${t("已生成")}${reportLabel}${t("，结果可导出为纯文本。")}` : t("结果保存后关闭页面也可继续查看。")}</p></section></aside></div>`;
   }
 
@@ -2166,8 +2166,10 @@
     return `${context.taskId}:${context.mode}:${context.mode === 'lesson' ? `${context.dayIndex}:${context.depth}` : tutorChatKey(context)}`;
   }
 
-  function tutorResponseHTML(response) {
-    return `<div class="tutor-text">${escapeHTML(response.text || '')}</div>${response.sources?.length ? `<p class="field-hint">${t("来源：")}${escapeHTML(response.sources.map(displaySource).join(state.preferences.language === 'en' ? '; ' : '；'))}</p>` : ''}${response.limitations?.length ? `<p class="field-hint">${t("说明：")}${escapeHTML(response.limitations.join(state.preferences.language === 'en' ? '; ' : '；'))}</p>` : ''}`;
+  function tutorResponseHTML(response, isLesson = false) {
+    const notes = `${response.sources?.length ? `<p class="field-hint">${t("来源：")}${escapeHTML(response.sources.map(displaySource).join(state.preferences.language === 'en' ? '; ' : '；'))}</p>` : ''}${response.limitations?.length ? `<p class="field-hint">${t("说明：")}${escapeHTML(response.limitations.join(state.preferences.language === 'en' ? '; ' : '；'))}</p>` : ''}`;
+    const text = `<div class="tutor-text">${escapeHTML(response.text || '')}</div>`;
+    return isLesson ? `<div class="tutor-response">${text}${notes ? `<div class="tutor-notes">${notes}</div>` : ''}</div>` : `${text}${notes}`;
   }
 
   function renderTutoring() {
@@ -2179,26 +2181,33 @@
     const isLesson = context.mode === 'lesson';
     const busy = tutoringRequests.has(tutoringRequestKey(context));
     $('#tutoringTitle').textContent = isLesson ? t`第 ${context.dayIndex + 1} 天 · 学习讲解` : t("错题与理解追问");
-    $('#tutoringIntro').textContent = isLesson ? t("围绕当天任务解释概念、例子和易错点。点击后才生成；已有讲解可直接查看。") : t("围绕这道题继续提问，帮助理解原因和方法。对话保留最近 20 轮。");
+    $('#tutoringIntro').textContent = isLesson ? t("解释当天任务中的概念、示例和易错点。") : t("围绕这道题继续提问，帮助理解原因和方法。对话保留最近 20 轮。");
     $('#lessonControls').hidden = !isLesson;
     $('#lessonActions').hidden = !isLesson;
     $('#questionFollowUpForm').hidden = isLesson;
+    $('#tutoringContent').classList.toggle('is-lesson', isLesson);
     const needsConsent = needsMaterialConsent(task) && !sessionConsent.has(task.id);
     $('#tutoringConsentWrap').hidden = !needsConsent;
     $('#tutoringConsent').checked = !needsConsent;
     if (isLesson) {
       const lesson = task.lessons?.[String(context.dayIndex)]?.[context.depth];
       const valid = lesson && sameValue({ dayTitle: lesson.dayTitle, dayTasks: lesson.dayTasks, daySource: lesson.daySource }, basis);
-      $('#tutoringContent').innerHTML = valid ? tutorResponseHTML(lesson) : `<p class="tutor-empty">${t("尚未生成这份讲解。")}</p>`;
-      $$('#lessonControls [data-depth]').forEach(button => { button.classList.toggle('is-selected', button.dataset.depth === context.depth); });
+      $('#tutoringContent').innerHTML = valid ? tutorResponseHTML(lesson, true) : busy ? `<div class="lesson-state is-loading" role="status" aria-live="polite"><span class="lesson-spinner" aria-hidden="true"></span><span>${t("正在生成讲解…")}</span></div>` : `<div class="lesson-state" role="status" aria-live="polite"><strong>${t("尚未生成这份讲解。")}</strong><span>${t("选择篇幅后，点击下方按钮生成讲解。")}</span></div>`;
+      $$('#lessonControls [data-depth]').forEach(button => {
+        const selected = button.dataset.depth === context.depth;
+        button.classList.toggle('is-selected', selected);
+        button.setAttribute('aria-pressed', String(selected));
+      });
       $('#generateLesson').hidden = Boolean(valid);
+      $('#lessonActions').hidden = Boolean(valid);
       $('#generateLesson').disabled = busy;
-      $('#generateLesson').textContent = busy ? t("正在生成讲解…") : `${t("生成")}${context.depth === 'brief' ? t("简要") : t("展开")}${t("讲解")}`;
+      $('#generateLesson').textContent = busy ? t("正在生成讲解…") : t(context.depth === 'brief' ? "生成简要讲解" : "生成展开讲解");
     } else {
       const chat = task.tutorChats?.[tutorChatKey(context)];
       const valid = chat && sameValue({ question: chat.question, answer: chat.answer, feedback: chat.feedback }, basis);
       const history = valid ? chat.messages : [];
       $('#tutoringContent').innerHTML = `<p class="tutor-question">${escapeHTML(basis.question)}</p>${history.map(message => `<article class="tutor-message is-${message.role}"><strong>${message.role === 'user' ? t("你") : t("学习助手")}</strong>${tutorResponseHTML(message)}</article>`).join('')}`;
+      $('#tutoringContent').scrollTop = $('#tutoringContent').scrollHeight;
       $('#sendQuestionFollowUp').disabled = busy;
       $('#questionFollowUpInput').disabled = busy;
       $('#sendQuestionFollowUp').textContent = busy ? t("正在回答…") : t("发送问题");
