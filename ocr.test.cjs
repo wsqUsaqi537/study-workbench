@@ -76,6 +76,25 @@ test('正常数学、Greek 和中文文本不触发 OCR', async () => {
   assert.deepEqual(result.readingWarnings, []);
 });
 
+test('文字稀疏异常控制字符触发本地 OCR 和阅读警告', async () => {
+  const calls = { screenshots: [], info: [], recognized: [], terminated: 0 };
+  const parser = parserFor([], calls);
+  const pages = [{ num: 9, text: '可正常阅读的长段文字。'.repeat(100) + '\u0001' }];
+  const result = await withWorkerFactory(async () => ({
+    async recognize(image) {
+      calls.recognized.push(Number(image.toString()));
+      return { data: { text: 'OCR 恢复后的第 9 页文字' } };
+    },
+    async terminate() {
+      calls.terminated += 1;
+    }
+  }), () => recoverPdfPages(parser, pages));
+
+  assert.deepEqual(calls.recognized, [9]);
+  assert.equal(result.pages[0].text, 'OCR 恢复后的第 9 页文字');
+  assert.ok(result.readingWarnings.some(warning => /本地 OCR/.test(warning)));
+});
+
 test('只渲染并识别异常页，保留物理页号并报告进度', async () => {
   const calls = { screenshots: [], info: [], recognized: [], terminated: 0 };
   const parser = parserFor([], calls);

@@ -18,6 +18,9 @@
   let createMaterials = [];
   let createExamDescription = '';
   let createExamMaterials = [];
+  let createDialogDraft = null;
+  let discardCreateDraftOnClose = false;
+  let createDialogSessionOpen = false;
   let examDraft = null;
   let examDialogSessionId = 0;
   let materialImportBusy = false;
@@ -27,6 +30,8 @@
   let assessmentSelector = { kind: 'final' };
   let proposedAdjustment = null;
   let stateLoaded = false;
+  let taskBackupImportBusy = false;
+  let lastLocalDate = localDateString();
   let configEpoch = 0;
   let settingsRequestId = 0;
   let createSessionId = 0;
@@ -293,6 +298,19 @@
   }
 
   function assessmentTaskContext(task) {
+    const plan = task.plan && typeof task.plan === 'object'
+      ? {
+          ...task.plan,
+          ...(Array.isArray(task.plan.days) ? {
+            days: task.plan.days.map(day => {
+              if (!day || typeof day !== 'object' || Array.isArray(day)) return day;
+              const content = { ...day };
+              delete content.completed;
+              return content;
+            })
+          } : {})
+        }
+      : task.plan;
     return {
       id: task.id,
       title: task.title,
@@ -302,7 +320,7 @@
       level: task.level,
       days: task.days,
       minutesPerDay: task.minutesPerDay,
-      plan: task.plan,
+      plan,
       materials: task.materials || []
     };
   }
@@ -316,7 +334,10 @@
       .filter(([dayIndex, quiz]) => quiz?.result && (selector.kind === 'final' || Number(dayIndex) < selector.dayIndex))
       .sort(([left], [right]) => Number(left) - Number(right))
       .map(([dayIndex, quiz]) => [dayIndex, quiz.result]);
-    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null, history });
+    const completedDays = countDays(task)
+      .filter(day => selector.kind === 'final' || Number(day.day) <= selector.dayIndex)
+      .map(day => [day.day, Boolean(day.completed)]);
+    return JSON.stringify({ context: assessmentTaskContext(task), quiz: assessmentFor(task, selector) || null, history, completedDays });
   }
 
   function adjustmentInputSnapshot(task, dayIndex) {
@@ -575,7 +596,8 @@
     const tasks = selected ? [selected] : onlySelected ? [] : state.tasks;
     const title = selected ? selected.title : t("全部计划");
     const description = selected ? (selected.goal || selected.plan?.summary || t("每天的安排可以按你的节奏调整。")) : t("查看每天的内容、来源和完成情况。");
-    const head = `<div class="page-head"><div class="page-head-copy"><span class="eyebrow">YOUR LEARNING MAP</span><h1>${escapeHTML(title)}</h1><p>${escapeHTML(description)}</p></div><div class="page-head-actions"><button class="button button-outline" type="button" data-nav="materials">${t("材料库")}</button><button class="button button-primary" type="button" data-action="new-task">${t("＋ 新建计划")}</button></div></div>`;
+    const restoreButton = !onlySelected ? `<button class="button button-outline" type="button" data-action="import-task-backup" ${taskBackupImportBusy ? 'disabled' : ''}>${t("恢复计划备份")}</button>` : '';
+    const head = `<div class="page-head"><div class="page-head-copy"><span class="eyebrow">YOUR LEARNING MAP</span><h1>${escapeHTML(title)}</h1><p>${escapeHTML(description)}</p></div><div class="page-head-actions">${restoreButton}<button class="button button-outline" type="button" data-nav="materials">${t("材料库")}</button><button class="button button-primary" type="button" data-action="new-task">${t("＋ 新建计划")}</button></div></div>`;
     if (!state.tasks.length) return `${head}${emptyState()}`;
     if (onlySelected && !selected) return renderPlans(false);
     return `${head}${summaryRow()}<div class="plan-list">${tasks.map(task => planCard(task, true)).join('')}</div>`;
@@ -628,9 +650,18 @@
     return entries.length ? `<div class="report-list"><strong>${escapeHTML(title)}</strong><ul>${entries.map(value => `<li>${escapeHTML(value)}</li>`).join('')}</ul></div>` : '';
   }
 
+  function hasInvalidReportQuestionReference(quiz) {
+    const reason = quiz?.result?.report?.reason;
+    if (typeof reason !== 'string' || !Array.isArray(quiz?.questions)) return false;
+    const citations = [...reason.matchAll(/\bq(\d+)\b|第\s*(\d+)\s*题/gi)].map(match => match[1] || match[2]);
+    return citations.some(number => !quiz.questions.some(question =>
+      typeof question?.id === 'string' && question.id.toLocaleLowerCase() === `q${number}`
+    ));
+  }
+
   function canAdjustAfter(task, dayIndex, quiz) {
     const today = localDateString();
-    return !quiz?.readinessStale && quiz?.result?.report?.readyForNext === false && countDays(task).some((day, index) => index > dayIndex && day.date >= today && !day.completed);
+    return !quiz?.readinessStale && !hasInvalidReportQuestionReference(quiz) && quiz?.result?.report?.readyForNext === false && countDays(task).some((day, index) => index > dayIndex && day.date >= today && !day.completed);
   }
 
   function renderAssessmentReport(task, selector, quiz, options = {}) {
@@ -638,21 +669,23 @@
     const report = result.report && typeof result.report === 'object' ? result.report : {};
     const isDaily = selector.kind === 'daily';
     const readinessStale = Boolean(quiz.readinessStale);
-    const readiness = readinessStale ? t("判断已过期") : report.readyForNext === true ? t("可以继续下一步") : report.readyForNext === false ? t("建议先补齐基础") : t("本次不判断准备程度");
+    const invalidQuestionReference = hasInvalidReportQuestionReference(quiz);
+    const readiness = invalidQuestionReference ? t("需要重新测评") : readinessStale ? t("判断已过期") : report.readyForNext === true ? t("可以继续下一步") : report.readyForNext === false ? t("建议先补齐基础") : t("本次不判断准备程度");
     const staleNotice = options.readOnly
       ? t("学习安排已变更，这份历史报告的准备程度已失效；成绩和作答仍保留。")
       : t("下一日任务已变更，这份报告的继续学习判断需重新评估。成绩和作答仍保留；重新生成并提交测评后会更新判断。");
-    const decisionText = options.readOnly || readinessStale ? '' : quiz.decision === 'adjusted'
+    const decisionText = options.readOnly || readinessStale || invalidQuestionReference ? '' : quiz.decision === 'adjusted'
       ? `<p class="result-feedback">${t("后续未完成日程已按你确认的调整方案更新。")}</p>`
       : quiz.decision === 'extra'
         ? `<p class="result-feedback">${t("本次选择了补学方案，")}${quiz.supplementCompleted ? t("已标记完成。") : t("尚未标记完成。")}</p>`
         : '';
-    const decisionActions = options.readOnly || readinessStale ? '' : quiz.decision === 'extra'
+    const decisionActions = options.readOnly || readinessStale || invalidQuestionReference ? '' : quiz.decision === 'extra'
       ? `<button class="button button-small button-outline" type="button" data-action="toggle-supplement" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${quiz.supplementCompleted ? t("撤销补学完成") : t("标记补学完成")}</button>`
       : quiz.decision === 'adjusted' ? '' : report.readyForNext === false ? `<button class="button button-small button-outline" type="button" data-action="choose-extra" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("按补学任务继续")}</button>${canAdjustAfter(task, selector.dayIndex, quiz) ? `<button class="button button-small button-primary" type="button" data-action="propose-adjustment" data-task-id="${escapeHTML(task.id)}" data-day-index="${selector.dayIndex}">${t("预览调整后续计划")}</button>` : ''}` : '';
     const feedbackMarkup = result.feedback && result.feedback !== report.summary ? `<p class="result-feedback">${escapeHTML(result.feedback)}</p>` : '';
     const actions = options.readOnly ? '' : `<div class="report-actions"><button class="button button-small button-outline" type="button" data-action="export-report" data-task-id="${escapeHTML(task.id)}" data-kind="${selector.kind}" ${isDaily ? `data-day-index="${selector.dayIndex}"` : ''}>${t("导出纯文本报告")}</button>${decisionActions}</div>`;
-    return `<section class="learning-report" aria-live="polite"><div class="result-panel-head"><div><span class="panel-kicker">${isDaily ? t("每日学习报告") : t(options.readOnly ? "历史周期报告" : "周期学习报告")}</span><h3>${isDaily ? t("本日掌握情况") : t("阶段学习回顾")}</h3></div><div class="result-score">${escapeHTML(result.score)}<small>${t("满分 100")}</small></div></div><p class="result-feedback">${escapeHTML(report.summary || result.feedback || t("本次反馈已保存。"))}</p>${feedbackMarkup}<div class="report-readiness ${readinessStale ? 'readiness-stale' : ''}"><strong>${t("准备程度：")}${readiness}</strong>${readinessStale ? `<p>${staleNotice}</p>` : report.reason ? `<p>${escapeHTML(report.reason)}</p>` : ''}</div>${reportList(t("薄弱点"), result.weakPoints)}${reportList(t("本次表现"), report.strengths)}${reportList(t("下一步建议"), report.nextSteps)}${report.extraMinutes ? `<div class="report-list"><strong>${t("建议补学 ·")} ${Number(report.extraMinutes) || 0} ${t("分钟")}</strong><ul>${(Array.isArray(report.extraTasks) ? report.extraTasks : []).map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : ''}${decisionText}${actions}</section>`;
+    const readinessNotice = invalidQuestionReference ? t("报告引用了不存在的题目；成绩与作答仍保留，请重新生成测评以更新判断。") : readinessStale ? staleNotice : report.reason;
+    return `<section class="learning-report" aria-live="polite"><div class="result-panel-head"><div><span class="panel-kicker">${isDaily ? t("每日学习报告") : t(options.readOnly ? "历史周期报告" : "周期学习报告")}</span><h3>${isDaily ? t("本日掌握情况") : t("阶段学习回顾")}</h3></div><div class="result-score">${escapeHTML(result.score)}<small>${t("满分 100")}</small></div></div><p class="result-feedback">${escapeHTML(report.summary || result.feedback || t("本次反馈已保存。"))}</p>${feedbackMarkup}<div class="report-readiness ${readinessStale || invalidQuestionReference ? 'readiness-stale' : ''}"${invalidQuestionReference ? `${options.readOnly ? '' : ' id="assessment-report-stale-question-reference"'} data-stale-question-reference="true"` : ''}><strong>${t("准备程度：")}${readiness}</strong>${readinessNotice ? `<p>${escapeHTML(readinessNotice)}</p>` : ''}</div>${reportList(t("薄弱点"), result.weakPoints)}${reportList(t("本次表现"), report.strengths)}${reportList(t("下一步建议"), report.nextSteps)}${report.extraMinutes ? `<div class="report-list"><strong>${t("建议补学 ·")} ${Number(report.extraMinutes) || 0} ${t("分钟")}</strong><ul>${(Array.isArray(report.extraTasks) ? report.extraTasks : []).map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></div>` : ''}${decisionText}${actions}</section>`;
   }
 
   function openFinalHistory(taskId) {
@@ -777,7 +810,7 @@
     return true;
   }
 
-  async function saveTask(task, nextView = currentView, expectedEpoch = configEpoch, baseTask = undefined, latestGuard = null, preserveNavigation = false) {
+  async function saveTask(task, nextView = currentView, expectedEpoch = configEpoch, baseTask = undefined, latestGuard = null, preserveNavigation = false, operationGuard = null) {
     if (expectedEpoch !== configEpoch || !apiEnabled()) throw new Error(t("模型服务配置已变化，请重新操作。"));
     if (!api?.saveTask) throw new Error(t("学习服务未连接，无法保存任务。"));
     const taskId = task.id;
@@ -793,6 +826,7 @@
       const latest = Array.isArray(beforeSave?.tasks) ? beforeSave.tasks.find(item => item.id === taskId) : null;
       if (baseSnapshot && !latest) throw new Error(t("这份计划已被删除，本次保存已取消。"));
       if (latestGuard && (!latest || !latestGuard(latest))) throw new Error(t("相关学习内容已变化，本次保存已取消，请重新操作。"));
+      if (operationGuard && !operationGuard()) return null;
       const saveValue = baseSnapshot && latest
         ? mergeTaskChanges(baseSnapshot, proposed, latest)
         : proposed;
@@ -831,6 +865,29 @@
     updateCreateControls();
   }
 
+  function restartGoalDiscussion() {
+    if (createActivity || materialImportBusy || !discussionMessages.length) return;
+    if (!window.confirm(t("重新开始讨论会清除本次对话和学习范围，但保留其他计划内容。继续吗？"))) return;
+    resetGoalDiscussion();
+  }
+
+  function clearCreateDraft() {
+    if (createActivity || materialImportBusy || !hasCreateDraftContent()) return;
+    if (!window.confirm(t("清空草稿只会清除当前未保存的计划内容，不会删除已保存的计划。确定清空吗？"))) return;
+    createDialogDraft = null;
+    if ($('#examDialog').open) $('#examDialog').close();
+    examDialogSessionId += 1;
+    cancelMaterialImport();
+    restoreCreateDialogDraft(null);
+    resetGoalDiscussion();
+    setMessage($('#createError'), '');
+    renderCreateMaterials();
+    renderCreateExamSummary();
+    updateCreateCadenceControls();
+    refreshCreateConsent();
+    updateCreateControls();
+  }
+
   function renderGoalDiscussion() {
     const host = $('#clarifyMessages');
     host.innerHTML = discussionMessages.map(message => `<div class="discussion-message is-${message.role}"><span>${message.role === 'user' ? t("你") : t("学习助手")}</span><p>${escapeHTML(message.content)}</p></div>`).join('');
@@ -849,6 +906,7 @@
       $('#confirmBrief').hidden = true;
     }
     $('#clarifySubmit').textContent = discussionMessages.length ? t("发送补充") : t("开始讨论目标");
+    updateCreateDraftControls();
     host.scrollTop = host.scrollHeight;
   }
 
@@ -865,12 +923,36 @@
     $('#saveExamDraft').disabled = busy || materialImportBusy;
     $('#clarifyInput').disabled = createActivity?.type === 'clarify';
     $$('#createForm input, #createForm select, #createForm textarea').forEach(field => { field.disabled = createActivity?.type === 'plan'; });
+    updateCreateDraftControls();
     if (createActivity?.type === 'clarify') $('#clarifySubmit').textContent = t("正在讨论…");
     else if ($('#createDialog').open) renderGoalDiscussion();
   }
 
+  function hasCreateDraftContent() {
+    const form = $('#createForm');
+    const fields = form.elements;
+    const changedSettings = fields.level.value !== 'beginner' || fields.learningMode.value !== 'balanced' ||
+      fields.startDate.value !== localDateString() || fields.days.value !== '14' ||
+      fields.minutesPerDay.value !== '60' || fields.cadenceMode.value !== 'daily' ||
+      $$('[name="cadenceWeekday"]', form).some(input => input.checked);
+    return Boolean(fields.title.value.trim() || fields.goal.value.trim() || changedSettings || createMaterials.length ||
+      createExamDescription.trim() || createExamMaterials.length || discussionMessages.length || discussionBrief ||
+      $('#clarifyInput').value.trim() || $('#createConsent').checked);
+  }
+
+  function updateCreateDraftControls() {
+    const busy = Boolean(createActivity) || materialImportBusy;
+    const restartDiscussion = $('#restartDiscussion');
+    restartDiscussion.hidden = !discussionMessages.length;
+    restartDiscussion.disabled = busy;
+    const clearDraft = $('[data-action="clear-create-draft"]');
+    clearDraft.hidden = !hasCreateDraftContent();
+    clearDraft.disabled = busy;
+  }
+
   function planProgressMessage(progress) {
     const hasCounts = Number.isFinite(Number(progress?.completed)) && Number.isFinite(Number(progress?.total));
+    if (progress?.stage === 'materials' && hasCounts) return t`正在阅读材料 ${Number(progress.completed)} / ${Number(progress.total)}`;
     if (progress?.stage === 'days' && hasCounts) {
       return t`正在安排学习日程 ${Number(progress.completed)} / ${Number(progress.total)}`;
     }
@@ -923,34 +1005,96 @@
   }
 
   function invalidateGoalDiscussion() {
-    resetGoalDiscussion();
+    const hadBrief = Boolean(discussionBrief || confirmedBrief);
+    discussionBrief = null;
+    confirmedBrief = null;
+    discussionReady = false;
+    const pendingClarification = createActivity?.type === 'clarify';
+    if (pendingClarification) createActivity = null;
+    if (hadBrief || pendingClarification) setMessage($('#clarifyError'), t("学习内容已变化，请继续讨论并重新确认学习范围。"), 'warning');
+    updateCreateControls();
+  }
+
+  function invalidatePendingClarification() {
+    if (createActivity?.type !== 'clarify') return;
+    createActivity = null;
+    setMessage($('#clarifyError'), t("学习设置已变化，刚才的讨论回复已忽略。请继续讨论。"), 'warning');
+    updateCreateControls();
+  }
+
+  function captureCreateDialogDraft() {
+    const form = $('#createForm');
+    return {
+      form: {
+        title: form.elements.title.value,
+        goal: form.elements.goal.value,
+        level: form.elements.level.value,
+        learningMode: form.elements.learningMode.value,
+        startDate: form.elements.startDate.value,
+        days: form.elements.days.value,
+        minutesPerDay: form.elements.minutesPerDay.value,
+        cadenceMode: form.elements.cadenceMode.value,
+        cadenceWeekdays: $$('[name="cadenceWeekday"]', form).filter(input => input.checked).map(input => input.value)
+      },
+      materials: clone(createMaterials),
+      examDescription: examDraft && $('#examDialog').open ? $('#examDescription').value : createExamDescription,
+      examMaterials: clone(examDraft && $('#examDialog').open ? examDraft.materials : createExamMaterials),
+      discussionMessages: clone(discussionMessages),
+      discussionBrief: discussionBrief ? clone(discussionBrief) : null,
+      confirmedBrief: confirmedBrief ? clone(confirmedBrief) : null,
+      discussionReady,
+      clarifyInput: $('#clarifyInput').value,
+      consent: $('#createConsent').checked,
+      configEpoch
+    };
+  }
+
+  function restoreCreateDialogDraft(draft) {
+    const form = $('#createForm');
+    form.reset();
+    const fields = draft?.form || {};
+    form.elements.title.value = fields.title || '';
+    form.elements.goal.value = fields.goal || '';
+    form.elements.level.value = fields.level || 'beginner';
+    form.elements.learningMode.value = fields.learningMode || 'balanced';
+    form.elements.startDate.value = fields.startDate || localDateString();
+    form.elements.days.value = fields.days || '14';
+    form.elements.minutesPerDay.value = fields.minutesPerDay || '60';
+    form.elements.cadenceMode.value = fields.cadenceMode || 'daily';
+    const weekdays = new Set((fields.cadenceWeekdays || []).map(String));
+    $$('[name="cadenceWeekday"]', form).forEach(input => { input.checked = weekdays.has(input.value); });
+    createMaterials = clone(draft?.materials || []);
+    createExamDescription = draft?.examDescription || '';
+    createExamMaterials = clone(draft?.examMaterials || []);
+    examDraft = null;
+    discussionMessages = clone(draft?.discussionMessages || []);
+    discussionBrief = draft?.discussionBrief ? clone(draft.discussionBrief) : null;
+    confirmedBrief = draft?.confirmedBrief ? clone(draft.confirmedBrief) : null;
+    discussionReady = Boolean(draft?.discussionReady && discussionBrief);
+    $('#clarifyInput').value = draft?.clarifyInput || '';
+    $('#createConsent').checked = Boolean(draft?.consent && draft.configEpoch === configEpoch);
   }
 
   function openCreateDialog() {
     if (!stateLoaded) return toast(t("正在读取本地学习数据，请稍候再创建计划。"));
     if (!apiEnabled()) return openSettings();
+    if ($('#createDialog').open) return;
+    finishCreateDialogClose();
     const form = $('#createForm');
-    form.reset();
-    form.elements.startDate.value = localDateString();
-    form.elements.days.value = '14';
-    form.elements.minutesPerDay.value = '60';
-    form.elements.cadenceMode.value = 'daily';
-    $$('[name="cadenceWeekday"]', form).forEach(input => { input.checked = false; });
-    createMaterials = [];
-    createExamDescription = '';
-    createExamMaterials = [];
-    examDraft = null;
+    discardCreateDraftOnClose = false;
+    restoreCreateDialogDraft(createDialogDraft);
     examDialogSessionId += 1;
     createSessionId += 1;
     createActivity = null;
-    resetGoalDiscussion();
-    $('#createConsent').checked = false;
     setMessage($('#createError'), '');
+    setMessage($('#clarifyError'), '');
     renderCreateMaterials();
     renderCreateExamSummary();
     updateCreateCadenceControls();
     refreshCreateConsent();
     $('#createDialog').showModal();
+    createDialogSessionOpen = true;
+    updateCreateControls();
     window.setTimeout(() => form.elements.title.focus(), 0);
   }
 
@@ -969,10 +1113,12 @@
     if (!createMaterials.length) {
       host.innerHTML = '';
       refreshCreateConsent();
+      updateCreateDraftControls();
       return;
     }
     host.innerHTML = createMaterials.map((material, index) => `<div class="attachment-item"><div class="attachment-name-wrap"><span class="attachment-name" title="${escapeHTML(material.name)}">${escapeHTML(material.name)} <span>· ${Number(material.chars) || 0} ${t("字")}</span></span>${materialReadingSummaryHTML(material)}</div><span class="attachment-item-actions"><button class="inline-link" type="button" data-action="preview-create-material" data-material-index="${index}">${t("预览")}</button><button class="inline-remove" type="button" data-action="remove-create-material" data-material-index="${index}" aria-label="${escapeHTML(t("移除"))} ${escapeHTML(material.name)}">${t("移除")}</button></span></div>`).join('');
     refreshCreateConsent();
+    updateCreateDraftControls();
   }
 
   function renderCreateExamSummary() {
@@ -983,12 +1129,14 @@
       host.innerHTML = '';
       host.hidden = true;
       $('#createExamButton').textContent = t("添加考试大纲");
+      updateCreateDraftControls();
       return;
     }
     const preview = description.length > 130 ? `${description.slice(0, 130).trimEnd()}…` : description;
     host.innerHTML = `<strong>${t("已添加考试范围")}</strong>${preview ? `<p>${escapeHTML(preview)}</p>` : ''}${fileCount ? `<small>${fileCount} ${t("份大纲文件")}</small>` : ''}`;
     host.hidden = false;
     $('#createExamButton').textContent = t("编辑考试大纲");
+    updateCreateDraftControls();
   }
 
   function openExamDialog() {
@@ -1217,6 +1365,9 @@
     if (requestMessages.length + 1 > 20) return setMessage($('#clarifyError'), t("讨论最多保留 20 条消息，请确认学习范围或开始新的讨论。"), 'warning');
     if (requestMessages.some(message => message.content.length > 4000)) return setMessage($('#clarifyError'), t("每条讨论消息最多 4000 个字符。"), 'warning');
 
+    discussionMessages = requestMessages.map(message => ({ ...message }));
+    $('#clarifyInput').value = '';
+    renderGoalDiscussion();
     createActivity = { id: requestId, type: 'clarify' };
     updateCreateControls();
     try {
@@ -1272,9 +1423,11 @@
       if (!plan || !Array.isArray(plan.days) || plan.days.length !== input.days) throw new Error(t("服务返回的计划天数与学习周期不一致，请重试。"));
       if (!Array.isArray(plan.knowledge) || plan.knowledge.length < 1 || plan.knowledge.length > 30) throw new Error(t("服务没有返回有效的知识清单，请检查模型配置后重试。"));
       const task = { id: makeId(), ...input, ...(briefSnapshot ? { brief: briefSnapshot } : {}), plan, createdAt: new Date().toISOString() };
-      if (hasMaterialText(task)) sessionConsent.add(task.id);
-      const saved = await saveTask(task, 'plan-detail', epoch);
+      const saved = await saveTask(task, 'plan-detail', epoch, undefined, null, false, () => sessionId === createSessionId && epoch === configEpoch && $('#createDialog').open && snapshot === createInputSnapshot() && createActivity?.id === requestId);
       if (!saved || sessionId !== createSessionId || epoch !== configEpoch || !apiEnabled()) return;
+      if (hasMaterialText(task)) sessionConsent.add(task.id);
+      createDialogDraft = null;
+      discardCreateDraftOnClose = true;
       $('#createDialog').close();
       toast(t("学习计划已生成并保存。"));
     } catch (errorValue) {
@@ -1588,6 +1741,21 @@
     }
   }
 
+  function refreshDateDependentView() {
+    const today = localDateString();
+    const changed = today !== lastLocalDate;
+    lastLocalDate = today;
+    if (!stateLoaded) return;
+    if (changed && currentView !== 'quiz') render();
+    else updateHeader();
+  }
+
+  window.setInterval(refreshDateDependentView, 60000);
+  window.addEventListener('focus', refreshDateDependentView);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshDateDependentView();
+  });
+
   function renderSettingsKeyState() {
     $('#apiKey').placeholder = state.settings?.hasKey ? t("留空以保留已保存的 Key") : t("填写 API Key");
     $('#keyState').textContent = state.settings?.hasKey ? t("已保存 API Key（内容不会读取或显示）") : t("尚未保存 API Key");
@@ -1806,10 +1974,36 @@
     toast(t("任务 JSON 已导出，不包含 API 配置。"));
   }
 
+  async function importTaskBackup() {
+    if (taskBackupImportBusy) return;
+    if (typeof api?.importTaskBackup !== 'function') return toast(t("当前版本暂不支持导入计划备份。"));
+    const epoch = configEpoch;
+    taskBackupImportBusy = true;
+    render();
+    try {
+      const result = await api.importTaskBackup();
+      if (!result || result.cancelled || epoch !== configEpoch) return;
+      const taskId = result.task?.id;
+      if (!taskId) throw new Error(t("无法读取导入的计划，请检查备份文件后重试。"));
+      if (!await reloadState(epoch) || epoch !== configEpoch) return;
+      if (!getTask(taskId)) throw new Error(t("导入的计划没有显示在列表中，请重试。"));
+      selectedTaskId = taskId;
+      currentView = 'plan-detail';
+      render();
+      toast(result.copied ? t("计划备份已作为新计划恢复。") : t("计划备份已恢复。"));
+    } catch (error) {
+      if (epoch === configEpoch && apiEnabled()) toast(error.message || t("导入计划备份失败，请检查文件后重试。"));
+    } finally {
+      taskBackupImportBusy = false;
+      render();
+    }
+  }
+
   async function openAssessment(taskId, selector, retake = false) {
     if (!apiEnabled()) return openSettings();
     const task = getTask(taskId);
     if (!task) return;
+    const previousNavigation = { currentView, selectedTaskId, assessmentSelector: clone(assessmentSelector) };
     assessmentSelector = selector.kind === 'daily'
       ? { kind: 'daily', dayIndex: Number(selector.dayIndex) }
       : { kind: 'final' };
@@ -1819,8 +2013,14 @@
     selectedTaskId = task.id;
     currentView = 'quiz';
     if (retake && quiz?.questions?.length) {
-      const confirmed = window.confirm(t("重新生成会替换这份测评中已保存的题目、答案和报告。确定继续吗？"));
-      if (!confirmed) { render(); return; }
+      const confirmed = window.confirm(t("重新生成会替换这份测评中已保存的题目、答案和报告；尚未提交的作答草稿也会丢失。确定继续吗？"));
+      if (!confirmed) {
+        currentView = previousNavigation.currentView;
+        selectedTaskId = previousNavigation.selectedTaskId;
+        assessmentSelector = previousNavigation.assessmentSelector;
+        render();
+        return;
+      }
     }
     const mustGenerate = retake || !quiz?.questions?.length;
     if (!mustGenerate) { render(); return; }
@@ -1871,7 +2071,7 @@
       } else next.quiz = savedQuiz;
       clearTutorChats(next, requestedSelector.kind, requestedSelector.dayIndex);
       quizDrafts.delete(assessmentDraftKey(latest, requestedSelector));
-      const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGenerationSnapshot(latestTask, requestedSelector) === inputSnapshot);
+      const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGenerationSnapshot(latestTask, requestedSelector) === inputSnapshot, true);
       if (!saved) return;
       quizDrafts.delete(assessmentDraftKey(next, requestedSelector));
     } catch (error) {
@@ -1941,7 +2141,7 @@
       target.result = result;
       target.resultDate = localDateString();
       delete target.readinessStale;
-      const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGradeSnapshot(latestTask, selector) === inputSnapshot);
+      const saved = await saveTask(next, 'quiz', epoch, latest, latestTask => assessmentGradeSnapshot(latestTask, selector) === inputSnapshot, true);
       if (!saved) return;
       quizDrafts.delete(assessmentDraftKey(next, selector));
       toast(t("测评结果和报告已保存。"));
@@ -1964,6 +2164,7 @@
     const task = getTask(taskId);
     const quiz = assessmentFor(task, selector);
     if (!task || !quiz?.result) return;
+    if (hasInvalidReportQuestionReference(quiz)) return toast(t("报告引用了不存在的题目；成绩与作答仍保留，请重新生成测评以更新判断。"));
     if (quiz.readinessStale) return toast(t("下一日安排已变更，请重新测评后再选择补学或调整。"));
     const epoch = configEpoch;
     const snapshot = assessmentGenerationSnapshot(task, selector);
@@ -1990,6 +2191,7 @@
     const quiz = assessmentFor(task, selector);
     if (!task || !quiz?.result) return;
     const report = quiz.result.report || {};
+    const invalidQuestionReference = hasInvalidReportQuestionReference(quiz);
     const lines = [
       selector.kind === 'daily' ? t("每日学习报告") : t("周期学习报告"),
       `${t("学习计划：")}${task.title}`,
@@ -1997,7 +2199,8 @@
       `${t("得分：")}${quiz.result.score} / 100`,
       `${t("反馈：")}${quiz.result.feedback || ''}`,
       `${t("报告摘要：")}${report.summary || ''}`,
-      `${t("准备程度：")}${quiz.readinessStale ? t("判断已过期（下一日任务已变更，需重新评估）") : report.readyForNext === true ? t("可以继续") : report.readyForNext === false ? t("建议先补学") : t("不判断")}`,
+      `${t("准备程度：")}${invalidQuestionReference ? t("需要重新测评") : quiz.readinessStale ? t("判断已过期（下一日任务已变更，需重新评估）") : report.readyForNext === true ? t("可以继续") : report.readyForNext === false ? t("建议先补学") : t("不判断")}`,
+      ...(invalidQuestionReference ? [t("报告引用了不存在的题目；成绩与作答仍保留，请重新生成测评以更新判断。")] : []),
       ...(quiz.readinessStale ? [t("继续学习判断：下一日任务已变更，这份报告需重新评估。")] : []),
       `${t("判断依据：")}${report.reason || ''}`,
       `${t("薄弱点：")}${weakPointsText(quiz.result.weakPoints)}`,
@@ -2364,6 +2567,8 @@
       await applyCadence();
       return;
     }
+    if (action === 'restart-discussion') { restartGoalDiscussion(); return; }
+    if (action === 'clear-create-draft') { clearCreateDraft(); return; }
     if (action === 'open-exam-dialog') { openExamDialog(); return; }
     if (action === 'save-exam-draft') { saveExamDraft(); return; }
     if (action === 'import-exam-material') { await importMaterials('exam'); return; }
@@ -2373,6 +2578,7 @@
     else if (action === 'lesson-depth' && tutoringContext) { tutoringContext.depth = button.dataset.depth; setMessage($('#tutoringError'), ''); renderTutoring(); }
     else if (action === 'generate-lesson') await requestTutoring();
     else if (action === 'new-task') openCreateDialog();
+    else if (action === 'import-task-backup') await importTaskBackup();
     else if (action === 'settings') openSettings();
     else if (action === 'profile') openProfile();
     else if (action === 'import-create') await importMaterials();
@@ -2412,20 +2618,18 @@
   });
 
   $('#createForm').addEventListener('submit', event => createPlan(event));
-  $('#createForm').addEventListener('input', event => {
-    if (['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay', 'cadenceMode', 'cadenceWeekday'].includes(event.target.name)) {
-      invalidateGoalDiscussion();
-      setMessage($('#createError'), '');
-      updateCreateCadenceControls();
-    }
-  });
-  $('#createForm').addEventListener('change', event => {
-    if (['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay', 'cadenceMode', 'cadenceWeekday'].includes(event.target.name)) {
-      invalidateGoalDiscussion();
-      setMessage($('#createError'), '');
-      updateCreateCadenceControls();
-    }
-  });
+  const handleCreateInputChange = event => {
+    const fieldName = event.target.name;
+    if (!['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay', 'cadenceMode', 'cadenceWeekday'].includes(fieldName)) return;
+    if (['title', 'goal', 'level', 'learningMode'].includes(fieldName)) invalidateGoalDiscussion();
+    else invalidatePendingClarification();
+    setMessage($('#createError'), '');
+    updateCreateCadenceControls();
+      updateCreateDraftControls();
+  };
+  $('#createForm').addEventListener('input', handleCreateInputChange);
+  $('#createForm').addEventListener('change', handleCreateInputChange);
+  $('#clarifyInput').addEventListener('input', updateCreateDraftControls);
   $('#cadenceForm').addEventListener('submit', event => { event.preventDefault(); previewCadence(); });
   const invalidateCadencePreview = event => {
     if (!['cadenceMode', 'cadenceWeekday'].includes(event.target.name)) return;
@@ -2467,8 +2671,23 @@
   $('#adjustmentDialog').addEventListener('close', () => {
     if (!$('#adjustmentDialog').open) proposedAdjustment = null;
   });
-  $('#createDialog').addEventListener('close', () => {
-    if ($('#createDialog').open) return;
+  function finishCreateDialogClose() {
+    if ($('#createDialog').open || !createDialogSessionOpen) return;
+    createDialogSessionOpen = false;
+    const discardDraft = discardCreateDraftOnClose;
+    if (discardDraft) {
+      createDialogDraft = null;
+      discardCreateDraftOnClose = false;
+    } else {
+      if ($('#examDialog').open && examDraft) {
+        const description = $('#examDescription').value;
+        const changed = description.trim() !== createExamDescription.trim() || !sameValue(examDraft.materials, createExamMaterials);
+        createExamDescription = description;
+        createExamMaterials = clone(examDraft.materials);
+        if (changed) invalidateGoalDiscussion();
+      }
+      createDialogDraft = captureCreateDialogDraft();
+    }
     if ($('#examDialog').open) $('#examDialog').close();
     const activity = createActivity;
     createSessionId += 1;
@@ -2480,17 +2699,26 @@
       try { Promise.resolve(api.cancelPlanGeneration(activity.id)).catch(() => {}); } catch { /* Closing the dialog still clears local loading state. */ }
     }
     createActivity = null;
-    resetGoalDiscussion();
     setBusy($('#createSubmit'), false);
     $('#createLoadingStatus').hidden = true;
     $('#createLoadingStatus').textContent = '';
     setMessage($('#createError'), '');
-    createMaterials = [];
-    createExamDescription = '';
-    createExamMaterials = [];
-    examDraft = null;
+    if (discardDraft) {
+      createMaterials = [];
+      createExamDescription = '';
+      createExamMaterials = [];
+      examDraft = null;
+      discussionMessages = [];
+      discussionBrief = null;
+      confirmedBrief = null;
+      discussionReady = false;
+      $('#clarifyInput').value = '';
+      $('#createConsent').checked = false;
+      resetGoalDiscussion();
+    }
     renderCreateExamSummary();
-  });
+  }
+  $('#createDialog').addEventListener('close', finishCreateDialogClose);
   $('#examDialog').addEventListener('close', () => {
     if ($('#examDialog').open) return;
     examDialogSessionId += 1;

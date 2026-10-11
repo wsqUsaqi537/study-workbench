@@ -3,7 +3,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
 const JSZip = require('jszip');
 const service = require('./services.cjs');
 
@@ -45,20 +44,38 @@ test('日期跨年正确，并拒绝不存在日期、不合法时间预算和�
   assert.equal(service.validateInput(input({ learningMode: 'exam', brief })), true);
 });
 
+let originalFetch;
+const activeMockApis = [];
+
 async function mockAPI(t, respond) {
   const received = [];
-  const server = http.createServer(async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    const data = JSON.parse(body);
-    received.push({ url: req.url, authorization: req.headers.authorization, body: data });
-    const value = await respond(data, received.length);
-    res.writeHead(value.status || 200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(value.raw || { choices: [{ message: { content: JSON.stringify(value.content) } }] }));
+  const mock = { respond, received };
+  if (!activeMockApis.length) {
+    originalFetch = global.fetch;
+    global.fetch = async (url, options) => {
+      const active = activeMockApis.at(-1);
+      const data = JSON.parse(options.body);
+      active.received.push({
+        url: new URL(url).pathname,
+        authorization: options.headers.Authorization,
+        body: data
+      });
+      const value = await active.respond(data, active.received.length);
+      return new Response(JSON.stringify(value.raw || {
+        choices: [{ message: { content: JSON.stringify(value.content) } }]
+      }), { status: value.status || 200, headers: { 'Content-Type': 'application/json' } });
+    };
+  }
+  activeMockApis.push(mock);
+  t.after(() => {
+    const index = activeMockApis.indexOf(mock);
+    if (index >= 0) activeMockApis.splice(index, 1);
+    if (!activeMockApis.length) {
+      global.fetch = originalFetch;
+      originalFetch = undefined;
+    }
   });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
-  return { settings: { endpoint: `http://127.0.0.1:${server.address().port}/v1`, model: 'mock-model', key: 'test-key' }, received };
+  return { settings: { endpoint: 'http://localhost/v1', model: 'mock-model', key: 'test-key' }, received };
 }
 
 function modelJSON(record) {

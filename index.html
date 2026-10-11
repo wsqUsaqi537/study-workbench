@@ -95,7 +95,7 @@
         <div id="confirmedBrief" class="confirmed-brief" hidden></div>
         <div id="clarifyError" class="form-message" role="status" aria-live="polite" hidden></div>
         <label class="field discussion-input"><span data-i18n="补充说明或回复">补充说明或回复</span><textarea id="clarifyInput" rows="2" maxlength="4000" data-i18n-placeholder="例如：我会参加期末考试，希望多安排真题练习。" placeholder="例如：我会参加期末考试，希望多安排真题练习。"></textarea></label>
-        <div class="discussion-actions"><span class="discussion-hint" data-i18n="讨论内容仅用于本次计划。">讨论内容仅用于本次计划。</span><button id="clarifySubmit" class="button button-small button-outline" type="button" data-i18n="开始讨论目标">开始讨论目标</button><button id="confirmBrief" class="button button-small button-primary" type="button" data-i18n="确认学习范围" hidden>确认学习范围</button></div>
+        <div class="discussion-actions"><span class="discussion-hint" data-i18n="讨论内容仅用于本次计划。">讨论内容仅用于本次计划。</span><button id="restartDiscussion" class="button button-small button-quiet" type="button" data-action="restart-discussion" data-i18n="重新开始讨论" hidden>重新开始讨论</button><button id="clarifySubmit" class="button button-small button-outline" type="button" data-i18n="开始讨论目标">开始讨论目标</button><button id="confirmBrief" class="button button-small button-primary" type="button" data-i18n="确认学习范围" hidden>确认学习范围</button></div>
       </section>
       <section class="exam-outline-entry" aria-labelledby="examOutlineTitle">
         <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选 · 备考">可选 · 备考</span><h3 id="examOutlineTitle" data-i18n="考试大纲">考试大纲</h3></div><button id="createExamButton" class="button button-small button-outline" type="button" data-action="open-exam-dialog" data-i18n="添加考试大纲">添加考试大纲</button></div>
@@ -110,7 +110,7 @@
       </section>
       <label id="createConsentWrap" class="consent-row" hidden><input id="createConsent" type="checkbox"><span><strong data-i18n="我同意发送本次添加的材料文字">我同意发送本次添加的材料文字</strong><small data-i18n="生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。">生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。</small></span></label>
       <p id="createLoadingStatus" class="delayed-loading-status" role="status" aria-live="polite" hidden></p>
-      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="createDialog" data-i18n="取消">取消</button><button id="createSubmit" class="button button-primary" type="submit"><span class="button-label" data-i18n="生成学习计划">生成学习计划</span><span class="button-spinner" aria-hidden="true"></span></button></div>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="createDialog" data-i18n="取消">取消</button><button class="button button-quiet" type="button" data-action="clear-create-draft" data-i18n="清空草稿" hidden>清空草稿</button><button id="createSubmit" class="button button-primary" type="submit"><span class="button-label" data-i18n="生成学习计划">生成学习计划</span><span class="button-spinner" aria-hidden="true"></span></button></div>
     </form>
   </dialog>
 

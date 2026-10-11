@@ -57,12 +57,12 @@ function validateLessonRecord(record, task, dayIndex, depth) {
   return record;
 }
 
-function ratedQuizFor(task, kind, dayIndex) {
+function ratedQuizFor(task, kind, dayIndex, validationOptions) {
   const quiz = kind === 'daily'
     ? task.dailyQuizzes && task.dailyQuizzes[String(dayIndex)]
     : task.quiz;
   if (!quiz) fail('任务中没有对应的测验。');
-  assessment.validateAssessment(quiz);
+  assessment.validateAssessment(quiz, validationOptions);
   if (quiz.version !== 2 || quiz.kind !== kind || quiz.dayIndex !== dayIndex || !quiz.result || !quiz.answers) {
     fail('追问仅支持已评分的 version 2 测验。');
   }
@@ -99,7 +99,7 @@ function validateChatRecord(record, task, key) {
     fail('期末追问记录的 dayIndex 必须为 null。');
   }
 
-  const quiz = ratedQuizFor(task, record.kind, record.dayIndex);
+  const quiz = ratedQuizFor(task, record.kind, record.dayIndex, { allowInvalidQuestionReferences: true });
   const question = quiz.questions.find(item => item.id === record.questionId);
   if (!question) fail('追问题目不在对应测验中。');
   const answer = quiz.answers[record.questionId].text;

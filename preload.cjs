@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('studyApp', Object.freeze({
   saveProfile: (profile) => ipcRenderer.invoke('profile:save', profile),
   saveTask: (task) => ipcRenderer.invoke('task:save', task),
   deleteTask: (id) => ipcRenderer.invoke('task:delete', id),
+  importTaskBackup: () => ipcRenderer.invoke('task:import-backup'),
   importMaterials: (requestId) => ipcRenderer.invoke('materials:import', requestId),
   importDroppedMaterials: (files, requestId) => {
     if (!Array.isArray(files) || files.length < 1 || files.length > 10) return Promise.reject(new Error(language === 'en' ? 'Drop between 1 and 10 materials at a time.' : '每次请拖入 1 至 10 份材料。'));

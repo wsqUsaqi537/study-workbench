@@ -232,6 +232,39 @@ function registerHandlers() {
     state = { tasks: next };
     return true;
   });
+  handle('task:import-backup', async () => {
+    activeCredentials();
+    const revision = configRevision;
+    const owner = window;
+    const { canceled, filePaths } = await dialog.showOpenDialog(owner, {
+      title: preferences.language === 'en' ? 'Restore a study plan backup' : '恢复学习计划备份',
+      properties: ['openFile'],
+      filters: [{ name: preferences.language === 'en' ? 'Study plan backup' : '学习计划备份', extensions: ['json'] }]
+    });
+    if (canceled) return { cancelled: true };
+    if (revision !== configRevision || owner !== window || !window || window.isDestroyed()) throw new Error('恢复已取消，请重新选择备份。');
+    activeCredentials();
+    if (!Array.isArray(filePaths) || filePaths.length !== 1) throw new Error('请选择一份学习计划 JSON 备份。');
+    const stats = fs.statSync(filePaths[0]);
+    if (!stats.isFile() || stats.size > 10 * 1024 * 1024) throw new Error('备份文件超过 10 MB 或不是普通文件。');
+    const content = fs.readFileSync(filePaths[0], 'utf8');
+    if (Buffer.byteLength(content) > 10 * 1024 * 1024) throw new Error('备份文件超过 10 MB 或不是普通文件。');
+    let backup;
+    try { backup = JSON.parse(content); } catch { throw new Error('备份不是有效的 JSON 文件。'); }
+    if (!services.isPlainObject(backup) || backup.format !== 'study-workbench-task' || !services.isPlainObject(backup.task)) throw new Error('这不是学习工作台导出的计划备份。');
+    const task = backup.task;
+    ['settings', 'api', 'apiKey', 'key', 'endpoint', 'model', 'encryptedKey', 'sessionKey'].forEach(field => delete task[field]);
+    validateTask(task);
+    if (task.plan.knowledge !== undefined) services.validateKnowledge(task.plan.knowledge, task);
+    task.plan.days.forEach(day => services.validateSource(day.source, task, '每日来源'));
+    if (state.tasks.length >= 100) throw new Error('最多保存 100 个任务，请先导出并删除旧任务。');
+    const copied = state.tasks.some(existing => existing.id === task.id);
+    if (copied) task.id = randomUUID();
+    const next = [task, ...state.tasks];
+    writeJSON('tasks.json', { tasks: next });
+    state = { tasks: next };
+    return { task, copied };
+  });
   handle('materials:import', async requestId => {
     activeCredentials();
     const { canceled, filePaths } = await dialog.showOpenDialog(window, {
@@ -256,7 +289,7 @@ function registerHandlers() {
     const generation = { controller, requestId };
     planGeneration = generation;
     const revision = configRevision;
-    const key = fingerprint({ version: 2, input, endpoint: config.endpoint, model: config.model, language: config.language });
+    const key = fingerprint({ version: 3, input, endpoint: config.endpoint, model: config.model, language: config.language });
     const saved = readJSON('plan-generation.json', null);
     try {
       const plan = await services.generatePlan(input, config, {

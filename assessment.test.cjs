@@ -2,7 +2,6 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const http = require('node:http');
 const service = require('./services.cjs');
 const assessment = require('./assessment.cjs');
 
@@ -82,32 +81,30 @@ function questionsFor(kind) {
 async function mockAPI(t, responses) {
   const received = [];
   const queue = [...responses];
-  const server = http.createServer(async (request, response) => {
-    let body = '';
-    for await (const chunk of request) body += chunk;
-    const requestBody = JSON.parse(body);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const request = new URL(url);
+    const requestBody = JSON.parse(options.body);
     const content = requestBody.messages?.[1]?.content || '';
     let payload;
     try { payload = JSON.parse(content); } catch { payload = null; }
-    received.push({ url: request.url, authorization: request.headers.authorization, requestBody, payload });
-    const next = queue.shift();
+    received.push({ url: request.pathname, authorization: options.headers.Authorization, requestBody, payload });
+    const queued = typeof queue[0] === 'function' ? queue[0] : queue.shift();
+    const next = typeof queued === 'function'
+      ? await queued({ request, requestBody, payload })
+      : queued;
     if (!next) {
-      response.writeHead(500, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({ error: { message: 'mock response queue exhausted' } }));
-      return;
+      return { ok: false, status: 500, text: async () => JSON.stringify({ error: { message: 'mock response queue exhausted' } }) };
     }
-    response.writeHead(next.status || 200, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify(next.raw || { choices: [{ message: { content: JSON.stringify(next.content) } }] }));
-  });
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  t.after(() => new Promise(resolve => {
-    server.close(resolve);
-    server.closeAllConnections();
-  }));
-  return { settings: settingsFor(server.address().port), received };
+    const status = next.status || 200;
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      text: async () => JSON.stringify(next.raw || { choices: [{ message: { content: JSON.stringify(next.content) } }] })
+    };
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  return { settings: settingsFor(1), received };
 }
 
 const filledScores = questions => questions.filter(question => question.type !== 'choice').map(question => ({
@@ -184,7 +181,7 @@ test('旧计划没有知识清单时只发送限长材料，并标注题目范�
 });
 
 test('缺少完整 API 配置时生成、评分和调整都拒绝，且不产生模型请求', async () => {
-  const task = makeTask();
+  const task = makeTask({ startDate: localDate() });
   const pendingQuestions = questionsFor('daily');
   const incompleteReport = report({ readyForNext: false, reason: '第 2 题回答没有说明循环如何重复处理多笔账目。', extraMinutes: 20, extraTasks: ['练习循环'] });
   task.dailyQuizzes = { '0': { version: 2, mode: 'ai', kind: 'daily', dayIndex: 0, questions: questionsFor('daily') } };
@@ -289,6 +286,96 @@ test('可给出可执行的补学报告；缺少证据或补学安排的报告�
     const invalid = await mockAPI(t, [{ content: modelGrade(questions, invalidReport) }]);
     await assert.rejects(assessment.gradeAssessment(task, { kind: 'daily', dayIndex: 0 }, answers, invalid.settings));
   }
+});
+
+test('报告题号引用必须属于当前测验，未准备好时必须提供有效证据', () => {
+  const questions = questionsFor('daily');
+  const quiz = {
+    version: 2, mode: 'ai', kind: 'daily', dayIndex: 0, questions,
+    answers: Object.fromEntries(questions.map(question => [question.id, { text: question.type === 'choice' ? question.answer : '回答' }]))
+  };
+  const items = questions.map(question => ({
+    id: question.id,
+    score: question.type === 'choice' ? 20 : 20,
+    feedback: '回答表达了核心概念。'
+  }));
+  const makeResult = reason => ({
+    mode: 'ai', score: 100, feedback: '继续练习。', items, weakPoints: ['循环'],
+    report: report({ readyForNext: false, reason, extraMinutes: 20, extraTasks: ['练习循环'] })
+  });
+
+  for (const reason of [
+    'q99 的回答没有解释循环如何重复处理多笔账目。',
+    '第 99 题回答没有解释循环如何重复处理多笔账目。',
+    'q1 回答正确，但 q99 的回答没有解释循环如何重复处理多笔账目。'
+  ]) assert.throws(() => assessment.validateAssessmentResult(makeResult(reason), quiz), /题目证据/);
+
+  for (const reason of [
+    'q1 的回答没有说明循环如何重复处理多笔账目。',
+    '第 1 题回答没有说明循环如何重复处理多笔账目。'
+  ]) assert.equal(assessment.validateAssessmentResult(makeResult(reason), quiz).report.reason, reason);
+
+  assert.doesNotThrow(() => assessment.validateAssessmentResult({
+    ...makeResult('总体掌握良好，继续按计划学习。'),
+    report: report({ readyForNext: true, reason: '总体掌握良好，继续按计划学习。' })
+  }, quiz));
+  assert.throws(() => assessment.validateAssessmentResult({
+    ...makeResult('总体掌握良好，q99 的回答仍需复核。'),
+    report: report({ readyForNext: true, reason: '总体掌握良好，q99 的回答仍需复核。' })
+  }, quiz), /不存在|题目证据/);
+
+  const finalQuestions = questionsFor('final');
+  const finalQuiz = {
+    version: 2, mode: 'ai', kind: 'final', dayIndex: null, questions: finalQuestions,
+    answers: Object.fromEntries(finalQuestions.map(question => [question.id, { text: question.type === 'choice' ? question.answer : '回答' }]))
+  };
+  const finalResult = reason => ({
+    mode: 'ai', score: 100, feedback: '本周期已完成。',
+    items: finalQuestions.map(question => ({ id: question.id, score: 10, feedback: '回答表达了核心概念。' })),
+    weakPoints: [], report: report({ readyForNext: null, reason })
+  });
+  assert.doesNotThrow(() => assessment.validateAssessmentResult(finalResult('本周期已完成，可按需回顾重点。'), finalQuiz));
+  assert.throws(() => assessment.validateAssessmentResult(finalResult('本周期已完成，但 q99 仍需复核。'), finalQuiz), /不存在|题目证据/);
+});
+
+test('旧日报的无效题号仅对历史记录校验宽容，不能用于计划调整', async t => {
+  const task = attachFailedDailyQuiz(makeTask({ days: 5, startDate: localDate() }));
+  task.dailyQuizzes['0'].result.report.reason = 'q99 的回答没有解释循环如何重复处理多笔账目。';
+  const before = structuredClone(task);
+  const quiz = task.dailyQuizzes['0'];
+
+  assert.equal(assessment.reportReferencesValid(quiz), false);
+  assert.equal(assessment.validateAssessmentRecords(task), true, '旧评分、作答和题目仍可作为历史记录保存或查看');
+  assert.doesNotThrow(() => assessment.validateAssessment(quiz, { allowInvalidQuestionReferences: true }));
+  assert.throws(() => assessment.validateAssessment(quiz), /题目证据/);
+  assert.throws(() => assessment.validateAssessmentResult(quiz.result, quiz), /题目证据/);
+
+  const invalidScore = structuredClone(task);
+  invalidScore.dailyQuizzes['0'].result.score += 1;
+  assert.throws(() => assessment.validateAssessmentRecords(invalidScore), /总分/);
+
+  const mock = await mockAPI(t, []);
+  await assert.rejects(assessment.proposeAdjustment(task, 0, mock.settings), /报告引用了不存在的题目，请重新测评/);
+  assert.equal(mock.received.length, 0, '旧的无效题号报告不得触发计划调整 API');
+  assert.deepEqual(task, before, '历史记录保留原有作答和成绩');
+});
+
+test('新评分拒绝模型报告引用不存在的题目', async t => {
+  const task = makeTask({ startDate: localDate() });
+  const questions = questionsFor('daily');
+  task.dailyQuizzes = { '0': { version: 2, mode: 'ai', kind: 'daily', dayIndex: 0, questions } };
+  const answers = Object.fromEntries(questions.map(question => [question.id, { text: question.type === 'choice' ? 'B' : '回答' }]));
+  const invalidReport = report({
+    readyForNext: false,
+    reason: 'q99 的回答没有解释循环如何重复处理多笔账目。',
+    extraMinutes: 20,
+    extraTasks: ['练习循环']
+  });
+  const mock = await mockAPI(t, [{ content: modelGrade(questions, invalidReport) }]);
+
+  await assert.rejects(assessment.gradeAssessment(task, { kind: 'daily', dayIndex: 0 }, answers, mock.settings), /题目证据/);
+  assert.equal(mock.received.length, 1);
+  assert.equal(task.dailyQuizzes['0'].result, undefined, '非法的新报告不能保存为成绩');
 });
 
 test('填空合理同义表达会进入评分上下文，选择题分数由本地正确答案决定', async t => {
@@ -424,4 +511,108 @@ test('调整只覆盖指定日期之后未完成的天，并验证日期、预�
     const invalid = await mockAPI(t, [{ content: { ...proposed, days: invalidDays } }]);
     await assert.rejects(assessment.proposeAdjustment(task, 1, invalid.settings));
   }
+});
+
+function attachFailedDailyQuiz(task, dayIndex = 0) {
+  const questions = questionsFor('daily');
+  task.dailyQuizzes = task.dailyQuizzes || {};
+  task.dailyQuizzes[String(dayIndex)] = {
+    version: 2, mode: 'ai', kind: 'daily', dayIndex, questions,
+    answers: Object.fromEntries(questions.map(question => [question.id, { text: question.type === 'choice' ? 'B' : '回答' }])),
+    result: {
+      mode: 'ai', score: 60, feedback: '仍需练习。',
+      items: questions.map(question => ({ id: question.id, score: question.type === 'choice' ? 0 : 20, feedback: '需要继续练习。' })),
+      weakPoints: ['循环'],
+      report: report({ readyForNext: false, reason: '第 2 题回答没有解释循环如何重复处理多笔账目。', extraMinutes: 20, extraTasks: ['练习循环'] })
+    }
+  };
+  return task;
+}
+
+function adjustmentFor(payload) {
+  return {
+    summary: '先巩固薄弱内容，再继续原学习目标。',
+    days: payload.upcoming.map(day => ({
+      day: day.day,
+      date: day.date,
+      title: `第 ${day.day} 天巩固练习`,
+      minutes: day.minutes,
+      tasks: [
+        '安排 5 题小测，用时 10 分钟；完成循环练习并复盘',
+        ...(day.day === payload.finalDay ? ['完成 10 题周期测验，用时 15 分钟；回顾本周期重点'] : [])
+      ],
+      source: payload.allowedSources[0]
+    }))
+  };
+}
+
+test('180 天调整按有界批次完成，不设输出 token 上限并保持原任务不变', async t => {
+  const task = attachFailedDailyQuiz(makeTask({ days: 180, startDate: localDate() }));
+  task.plan.days = task.plan.days.map(day => ({
+    ...day,
+    tasks: ['原有任务'.repeat(28), '原有练习'.repeat(28), '复习任务'.repeat(26)]
+  }));
+  const before = structuredClone(task);
+  let requestCount = 0;
+  const mock = await mockAPI(t, [({ requestBody, payload }) => {
+    requestCount += 1;
+    return { content: adjustmentFor(payload) };
+  }]);
+
+  const proposed = await assessment.proposeAdjustment(task, 0, mock.settings);
+
+  assert.equal(requestCount, mock.received.length);
+  assert.ok(requestCount > 1, '179 个未来日期应分成多个 API 请求');
+  for (const received of mock.received) {
+    assert.ok(received.payload.upcoming.length <= 12, '每次请求只包含有界日期批次');
+    assert.equal(received.payload.finalDay, 180);
+    assert.equal(Object.hasOwn(received.requestBody, 'max_tokens'), false, '规划请求不设 max_tokens');
+    assert.deepEqual(received.payload.allowedSources, ['主题与学习目标']);
+    assert.ok(JSON.stringify(received.payload).length < 60000);
+  }
+  assert.deepEqual(proposed.days.map(day => day.day), Array.from({ length: 179 }, (_, index) => index + 2));
+  assert.deepEqual(proposed.days.map(day => day.date), task.plan.days.slice(1).map(day => day.date));
+  assert.deepEqual(proposed.days.map(day => day.minutes), task.plan.days.slice(1).map(day => day.minutes));
+  assert.ok(proposed.days.every(day => day.tasks.some(item => /5 题小测/.test(item))));
+  assert.ok(proposed.days.at(-1).tasks.some(item => /10 题周期测验/.test(item)));
+  assert.ok(proposed.days.slice(0, -1).every(day => !day.tasks.some(item => /10 题周期测验/.test(item))));
+  assert.deepEqual(task, before, '预览完成后也不应修改原始任务');
+});
+
+test('调整输出长度受限时缩小批次重试，后续批次失败也不改变任务', async t => {
+  const task = attachFailedDailyQuiz(makeTask({ days: 8, startDate: localDate() }));
+  const before = structuredClone(task);
+  let call = 0;
+  const mock = await mockAPI(t, [({ payload }) => {
+    call += 1;
+    if (call === 1) return { raw: { choices: [{ finish_reason: 'length', message: { content: '{}' } }] } };
+    if (call === 3) return { status: 500, raw: { error: { message: 'failed' } } };
+    return { content: adjustmentFor(payload) };
+  }]);
+
+  await assert.rejects(assessment.proposeAdjustment(task, 0, mock.settings));
+  assert.equal(mock.received.length, 3, '超长批次应缩小后重试一次，随后失败即停止');
+  assert.deepEqual(task, before, '首批成功后续批次失败不得修改任务');
+  assert.ok(mock.received[0].payload.upcoming.length > mock.received[1].payload.upcoming.length);
+});
+
+test('模型每批只允许 3 天时，缩小后的成功批次尺寸会沿用到全部后续请求', async t => {
+  const task = attachFailedDailyQuiz(makeTask({ days: 10, startDate: localDate() }));
+  let oversizedRequests = 0;
+  const mock = await mockAPI(t, [({ payload }) => {
+    if (payload.upcoming.length > 3) {
+      oversizedRequests += 1;
+      return { raw: { choices: [{ finish_reason: 'length', message: { content: '{}' } }] } };
+    }
+    return { content: adjustmentFor(payload) };
+  }]);
+
+  const proposed = await assessment.proposeAdjustment(task, 0, mock.settings);
+
+  assert.equal(proposed.days.length, 9);
+  assert.equal(oversizedRequests, 2, '只在首次缩小批次时遇到 9 天和 4 天的输出上限');
+  assert.deepEqual(mock.received.map(item => item.payload.upcoming.length), [9, 4, 2, 2, 2, 2, 1]);
+  assert.ok(mock.received.every(item => item.payload.finalDay === 10));
+  assert.ok(mock.received.slice(2).every(item => item.payload.upcoming.length <= 3));
+  assert.ok(proposed.days.at(-1).tasks.some(item => /10 题周期测验/.test(item)));
 });

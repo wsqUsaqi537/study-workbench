@@ -245,6 +245,16 @@ function makeLongTutorResponse(payload) {
 }
 
 function responseFor(purpose, payload) {
+  if (purpose === '阅读材料片段') {
+    const material = payload.material || {};
+    const firstPage = material.sourcePages?.[0];
+    return {
+      summary: payload.outputLanguage === 'en'
+        ? 'The material introduces variables, loops, and a small practice exercise.'
+        : '材料介绍变量、循环以及一个小型练习。',
+      source: [material.name || '学习材料', firstPage ? `第 ${firstPage.number} ${firstPage.unit}` : ''].filter(Boolean).join(' ')
+    };
+  }
   if (payload.outputLanguage === 'en') {
     if (purpose === '生成学习计划') {
       const plan = makeModelPlan(payload);
@@ -343,11 +353,19 @@ const apiServer = http.createServer(async (request, response) => {
     let payload;
     try { payload = JSON.parse(content); } catch { payload = null; }
     const purpose = payload?.purpose || (content.includes('连接测试') ? '连接测试' : '');
-    const record = { path: request.url, authorization: request.headers.authorization, requestBody, purpose, payload, responseAborted: false };
+    const record = { path: request.url, authorization: request.headers.authorization, requestBody, purpose, payload, responseAborted: false, responseClosed: false, responseFinished: false };
     response.once('close', () => {
+      record.responseClosed = true;
       if (!response.writableFinished) record.responseAborted = true;
     });
+    response.once('finish', () => { record.responseFinished = true; });
     apiRecords.push(record);
+    if (nextApiGate && nextApiGate.purpose === purpose) {
+      const gate = nextApiGate;
+      nextApiGate = null;
+      gate.resolveObserved({ payload, record });
+      await gate.released;
+    }
     if (nextPlanGate && nextPlanGate.purpose === purpose) {
       const gate = nextPlanGate;
       nextPlanGate = null;
@@ -376,6 +394,7 @@ const apiStarted = new Promise((resolve, reject) => {
 });
 let nextPlanGate = null;
 let nextTutoringGate = null;
+let nextApiGate = null;
 
 function delayNextPlanResponse(purpose = '生成学习计划') {
   let resolveObserved;
@@ -392,6 +411,15 @@ function delayNextTutoringResponse(purpose = '讲解当前日学习内容') {
   const observed = new Promise(resolve => { resolveObserved = resolve; });
   const released = new Promise(resolve => { releaseResponse = resolve; });
   nextTutoringGate = { purpose, resolveObserved, released };
+  return { observed, release: () => releaseResponse() };
+}
+
+function delayNextApiResponse(purpose) {
+  let resolveObserved;
+  let releaseResponse;
+  const observed = new Promise(resolve => { resolveObserved = resolve; });
+  const released = new Promise(resolve => { releaseResponse = resolve; });
+  nextApiGate = { purpose, resolveObserved, released };
   return { observed, release: () => releaseResponse() };
 }
 
@@ -559,6 +587,81 @@ async function setChecked(window, selector, checked) {
     return true;
   })()`);
   assert.equal(changed, true, `找不到复选框 ${selector}`);
+}
+
+async function inspectCreateDialogState(window) {
+  return window.webContents.executeJavaScript(`(() => {
+    const form = document.querySelector('#createForm');
+    return {
+      title: form.elements.title.value,
+      goal: form.elements.goal.value,
+      level: form.elements.level.value,
+      learningMode: form.elements.learningMode.value,
+      startDate: form.elements.startDate.value,
+      days: form.elements.days.value,
+      minutesPerDay: form.elements.minutesPerDay.value,
+      cadenceMode: form.elements.cadenceMode.value,
+      consentChecked: document.querySelector('#createConsent').checked,
+      materials: [...document.querySelectorAll('#createMaterials .attachment-name')].map(element => element.textContent.trim()),
+      examSummary: document.querySelector('#createExamSummary').innerText,
+      messageCount: document.querySelectorAll('#clarifyMessages .discussion-message').length,
+      assistantMessageCount: document.querySelectorAll('#clarifyMessages .discussion-message.is-assistant').length,
+      discussionText: document.querySelector('#clarifyMessages').innerText,
+      confirmedBrief: !document.querySelector('#confirmedBrief').hidden && document.querySelector('#confirmedBrief').innerText,
+      confirmHidden: document.querySelector('#confirmBrief').hidden,
+      clarifyError: document.querySelector('#clarifyError').textContent
+    };
+  })()`);
+}
+
+async function clickCreateBackdrop(window) {
+  if (!window.isVisible()) window.show();
+  window.focus();
+  const probe = await window.webContents.executeJavaScript(`(() => {
+    const dialog = document.querySelector('#createDialog');
+    const rect = dialog.getBoundingClientRect();
+    const points = [
+      { x: Math.floor(rect.left / 2), y: Math.floor(innerHeight / 2) },
+      { x: Math.floor((rect.right + innerWidth) / 2), y: Math.floor(innerHeight / 2) },
+      { x: Math.floor(innerWidth / 2), y: Math.floor(rect.top / 2) },
+      { x: Math.floor(innerWidth / 2), y: Math.floor((rect.bottom + innerHeight) / 2) }
+    ];
+    const point = points.find(candidate => candidate.x >= 2 && candidate.y >= 2 &&
+      candidate.x < innerWidth - 2 && candidate.y < innerHeight - 2 &&
+      (candidate.x < rect.left || candidate.x > rect.right || candidate.y < rect.top || candidate.y > rect.bottom));
+    window.__desktopBackdropProbe = null;
+    dialog.addEventListener('click', event => {
+      window.__desktopBackdropProbe = {
+        target: event.target === dialog ? '#createDialog' : event.target.id || event.target.tagName,
+        x: event.clientX, y: event.clientY
+      };
+    }, { once: true, capture: true });
+    return {
+      point,
+      viewport: { width: innerWidth, height: innerHeight },
+      rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }
+    };
+  })()`);
+  assert.ok(probe.point, `新建对话框应有可点击遮罩区域：${JSON.stringify(probe)}`);
+  const { x, y } = probe.point;
+  window.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+  await delay(50);
+  window.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  window.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  await delay(100);
+  const result = await window.webContents.executeJavaScript(`({ ...${JSON.stringify(probe)}, open: document.querySelector('#createDialog').open, click: window.__desktopBackdropProbe })`);
+  assert.equal(result.open, false, `实际点击遮罩后应关闭新建对话框：${JSON.stringify(result)}`);
+}
+
+async function pressEscape(window) {
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ESC' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ESC' });
+}
+
+async function waitForApiRecordClosed(record, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!record.responseClosed && Date.now() < deadline) await delay(20);
+  assert.equal(record.responseClosed, true, `API 响应连接应关闭：${record.purpose}`);
 }
 
 async function beginCreateLoadingObservation(window) {
@@ -1183,6 +1286,20 @@ async function run() {
   await clickAction(window, 'open-plan', originalLegacyAITask.id);
   await clickAction(window, 'open-assessment', originalLegacyAITask.id, { kind: 'final' });
   await waitForJS(window, 'document.querySelectorAll(".quiz-question textarea[data-answer]").length === 5 && Boolean(document.querySelector("#submitQuiz"))', '旧版未评分 AI 测验可填写并提交');
+  const legacyQuizBeforeUpgradeCancel = await window.webContents.executeJavaScript(`({
+    title: document.querySelector('#appView h1')?.textContent,
+    questions: document.querySelectorAll('.quiz-question').length,
+    draft: document.querySelector('#quizForm [data-qid="q1"]')?.value || ''
+  })`);
+  let legacyUpgradePrompt = '';
+  await window.webContents.executeJavaScript(`window.confirm = message => { window.__legacyUpgradePrompt = message; return false; }; true`);
+  await clickAction(window, 'retake-assessment', originalLegacyAITask.id, { kind: 'final' });
+  legacyUpgradePrompt = await window.webContents.executeJavaScript('window.__legacyUpgradePrompt || ""');
+  assert.match(legacyUpgradePrompt, /尚未提交的作答草稿也会丢失/);
+  assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#appView h1')?.textContent`), legacyQuizBeforeUpgradeCancel.title, '取消旧版升级后应留在原测验页');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll(".quiz-question").length'), legacyQuizBeforeUpgradeCancel.questions);
+  assert.equal(await window.webContents.executeJavaScript('window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ' + JSON.stringify(originalLegacyAITask.id) + ')?.quiz?.version)'), undefined, '取消旧版升级不得改写旧测验');
+  await window.webContents.executeJavaScript('window.confirm = () => true; true');
   assert.equal(apiRecords.filter(record => record.purpose === '按材料和评分标准评阅学习测验').length, legacyGradeRequests, '仅打开旧版 AI 测验不应自动评分');
   for (let index = 0; index < 5; index += 1) {
     await setValue(window, `#quizForm [data-answer][data-qid="q${index + 1}"]`, `旧版 AI 第 ${index + 1} 题回答`);
@@ -1270,7 +1387,14 @@ async function run() {
   await setValue(window, '#createForm [name="learningMode"]', 'deep');
   await setValue(window, '#createForm [name="days"]', 3);
   await setValue(window, '#createForm [name="minutesPerDay"]', 60);
+  const originalCreateStartDate = await window.webContents.executeJavaScript('document.querySelector("#createForm [name=startDate]").value');
   await setChecked(window, '#createConsent', true);
+  const initialExamDescription = '考试范围：变量、条件、循环与基础应用。';
+  await click(window, '#createExamButton', '为新计划添加文字考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '新计划文字考纲对话框');
+  await setValue(window, '#examDescription', initialExamDescription);
+  await click(window, '#saveExamDraft', '保存新计划文字考纲');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#createExamSummary").innerText.includes("变量")', '文字考纲已加入新建草稿');
   await setValue(window, '#clarifyInput', '我希望重点练习变量、循环和函数。');
   await click(window, '#clarifySubmit', '发送第一轮学习目标讨论');
   await waitForJS(window, 'document.querySelectorAll("#clarifyMessages .discussion-message.is-assistant").length === 1', '模型返回第一轮追问');
@@ -1282,7 +1406,192 @@ async function run() {
   await click(window, '#confirmBrief', '确认学习范围');
   await waitForJS(window, 'document.querySelector("#confirmBrief").textContent === "已确认"', '学习范围确认状态');
   assert.equal(apiRecords.filter(record => record.purpose === '生成学习计划').length, 0, '确认范围之前不应生成计划');
-  await click(window, '#createSubmit', '使用确认简报生成计划');
+
+  currentStage = '日期时长频率保留讨论，关闭后恢复表单、范围、附件和考纲';
+  const initialDiscussion = await inspectCreateDialogState(window);
+  await setValue(window, '#createForm [name="startDate"]', testLocalDate(1));
+  await setValue(window, '#createForm [name="minutesPerDay"]', 75);
+  await setValue(window, '#createForm [name="days"]', 4);
+  await setValue(window, '#createForm [name="cadenceMode"]', 'alternate');
+  let scheduleEditedDraft = await inspectCreateDialogState(window);
+  assert.match(scheduleEditedDraft.confirmedBrief, /学习范围已确认/);
+  assert.equal(scheduleEditedDraft.messageCount, initialDiscussion.messageCount, '改日期、时长和频率不得清除讨论');
+  assert.equal(scheduleEditedDraft.confirmHidden, true, '已确认状态继续由已确认简报表示');
+  await setValue(window, '#createForm [name="startDate"]', originalCreateStartDate);
+  await setValue(window, '#createForm [name="minutesPerDay"]', 60);
+  await setValue(window, '#createForm [name="days"]', 3);
+  await setValue(window, '#createForm [name="cadenceMode"]', 'daily');
+
+  window.show();
+  async function assertRestoredCreateDraft(expected, confirmed = true) {
+    const actual = await inspectCreateDialogState(window);
+    assert.equal(actual.title, expected.title);
+    assert.equal(actual.goal, expected.goal);
+    assert.equal(actual.level, expected.level);
+    assert.equal(actual.learningMode, expected.learningMode);
+    assert.equal(actual.startDate, expected.startDate);
+    assert.equal(actual.days, expected.days);
+    assert.equal(actual.minutesPerDay, expected.minutesPerDay);
+    assert.equal(actual.cadenceMode, expected.cadenceMode);
+    assert.equal(actual.consentChecked, expected.consentChecked, '重开后应保留材料授权状态');
+    assert.equal(actual.materials.length, expected.materials.length);
+    for (const name of expected.materialNames) assert.ok(actual.materials.some(material => material.includes(name)), `重开后应保留附件 ${name}`);
+    assert.ok(actual.examSummary.includes(expected.examText), `重开后应保留考纲 ${expected.examText}`);
+    assert.equal(actual.messageCount, expected.messageCount, '重开后应保留对话消息');
+    assert.equal(actual.assistantMessageCount, expected.assistantMessageCount, '重开后应保留模型回复');
+    assert.equal(Boolean(actual.confirmedBrief), confirmed, '重开后应保留当前范围确认状态');
+    if (confirmed) assert.match(actual.confirmedBrief, /学习范围已确认/);
+    else assert.equal(actual.confirmHidden, true, '范围已失效时不得显示确认按钮');
+    return actual;
+  }
+
+  let expectedCreateDraft = await inspectCreateDialogState(window);
+  expectedCreateDraft.materialNames = ['dropped-study-material.pdf', 'study-notes.md', 'formula.tex', 'selected-notes.docx', 'selected-slides.pptx'];
+  expectedCreateDraft.examText = initialExamDescription;
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭已确认的新建计划草稿');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '关闭按钮收起新建草稿');
+  await click(window, '[data-action="new-task"]', '从关闭按钮恢复新建草稿');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '关闭按钮重开草稿');
+  await assertRestoredCreateDraft(expectedCreateDraft);
+
+  await pressEscape(window);
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', 'Escape 收起新建草稿');
+  await click(window, '[data-action="new-task"]', '从 Escape 恢复新建草稿');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', 'Escape 重开草稿');
+  await assertRestoredCreateDraft(expectedCreateDraft);
+
+  await clickCreateBackdrop(window);
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '遮罩点击收起新建草稿');
+  await click(window, '[data-action="new-task"]', '从遮罩关闭恢复新建草稿');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '遮罩关闭后重开草稿');
+  await assertRestoredCreateDraft(expectedCreateDraft);
+
+  async function reconfirmCurrentDiscussion(label) {
+    const before = await inspectCreateDialogState(window);
+    await setValue(window, '#clarifyInput', `请保留刚才的目标和范围。${label}`);
+    await click(window, '#clarifySubmit', `${label}后继续讨论并重确认范围`);
+    await waitForJS(window,
+      `!document.querySelector("#confirmBrief").hidden && !document.querySelector("#confirmBrief").disabled && document.querySelectorAll("#clarifyMessages .discussion-message.is-assistant").length === ${before.assistantMessageCount + 1}`,
+      `${label}后收到保留范围的讨论回复`);
+    await click(window, '#confirmBrief', `${label}后重新确认范围`);
+    await waitForJS(window, 'document.querySelector("#confirmBrief").textContent === "已确认"', `${label}后范围已重新确认`);
+  }
+
+  async function assertSemanticChangeClearsOnlyBrief(label, change) {
+    const before = await inspectCreateDialogState(window);
+    assert.ok(before.confirmedBrief, `${label}测试前应有已确认范围`);
+    await change();
+    const after = await inspectCreateDialogState(window);
+    assert.equal(after.confirmedBrief, false, `${label}变化必须清除已确认范围`);
+    assert.equal(after.confirmHidden, true, `${label}变化后不能继续确认旧范围`);
+    assert.equal(after.messageCount, before.messageCount, `${label}变化应保留对话消息`);
+    assert.equal(after.assistantMessageCount, before.assistantMessageCount, `${label}变化应保留模型回复`);
+    await reconfirmCurrentDiscussion(label);
+  }
+
+  currentStage = '学习内容变化仅取消旧范围确认并保留讨论';
+  await assertSemanticChangeClearsOnlyBrief('主题', async () => {
+    await setValue(window, '#createForm [name="title"]', '临时 Python 主题');
+    await setValue(window, '#createForm [name="title"]', 'Python 记账小程序');
+  });
+  await assertSemanticChangeClearsOnlyBrief('目标', async () => {
+    await setValue(window, '#createForm [name="goal"]', '临时目标：只练习条件判断。');
+    await setValue(window, '#createForm [name="goal"]', '我想学会 Python 基础并完成一个记账小程序。');
+  });
+  await assertSemanticChangeClearsOnlyBrief('基础水平', async () => {
+    await setValue(window, '#createForm [name="level"]', 'intermediate');
+    await setValue(window, '#createForm [name="level"]', 'beginner');
+  });
+  await assertSemanticChangeClearsOnlyBrief('学习方式', async () => {
+    await setValue(window, '#createForm [name="learningMode"]', 'exam');
+    await setValue(window, '#createForm [name="learningMode"]', 'deep');
+  });
+
+  const extraStudyPath = writeMarkdownFixture('draft-change-extra.md', '临时附件用于验证范围确认失效。');
+  await assertSemanticChangeClearsOnlyBrief('学习材料', async () => {
+    const before = await inspectCreateDialogState(window);
+    await dispatchActualFileDrop(window, extraStudyPath);
+    await waitForJS(window, 'document.querySelector("#createMaterials").innerText.includes("draft-change-extra.md")', '临时附件加入新建草稿');
+    const after = await inspectCreateDialogState(window);
+    assert.equal(after.confirmedBrief, false, '新增学习材料应清除确认范围');
+    assert.equal(after.messageCount, before.messageCount, '新增学习材料应保留对话');
+    await click(window, '[data-action="remove-create-material"][data-material-index="5"]', '移除临时学习附件');
+    await waitForJS(window, 'document.querySelectorAll("#createMaterials .attachment-item").length === 5', '移除临时附件后恢复原材料列表');
+    const restored = await inspectCreateDialogState(window);
+    assert.equal(restored.confirmedBrief, false, '材料移除后仍需重新确认范围');
+    assert.equal(restored.messageCount, before.messageCount, '材料移除不得清除讨论');
+  });
+
+  await assertSemanticChangeClearsOnlyBrief('考试范围', async () => {
+    await click(window, '#createExamButton', '编辑已确认计划的考试范围');
+    await waitForJS(window, 'document.querySelector("#examDialog")?.open', '打开已保存的考纲草稿');
+    await setValue(window, '#examDescription', '考试范围更新：增加边界条件与综合应用。');
+    await click(window, '#saveExamDraft', '保存更新后的考试范围');
+    await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#createExamSummary").innerText.includes("边界条件")', '考试范围更新已应用');
+  });
+
+  currentStage = '主弹窗关闭时保留未保存考纲子草稿';
+  const beforeUnsavedExamClose = await inspectCreateDialogState(window);
+  const unsavedExamDescription = '关闭新建主窗口时应保留的未保存考纲范围。';
+  await click(window, '#createExamButton', '打开考纲并输入未保存内容');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '未保存考纲子窗口已打开');
+  await setValue(window, '#examDescription', unsavedExamDescription);
+  await window.webContents.executeJavaScript('document.querySelector("#createDialog").close()');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open && !document.querySelector("#examDialog")?.open', '关闭主窗口并收起考纲子窗口');
+  await click(window, '[data-action="new-task"]', '重新打开保留未保存考纲的新建草稿');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '含未保存考纲的新建草稿已恢复');
+  const expectedAfterExamDraftClose = await inspectCreateDialogState(window);
+  expectedCreateDraft = {
+    ...expectedAfterExamDraftClose,
+    materialNames: expectedCreateDraft.materialNames,
+    examText: unsavedExamDescription
+  };
+  await assertRestoredCreateDraft(expectedCreateDraft, false);
+  assert.equal(expectedAfterExamDraftClose.messageCount, beforeUnsavedExamClose.messageCount, '关闭主窗口时应保留原讨论');
+  assert.equal(expectedAfterExamDraftClose.assistantMessageCount, beforeUnsavedExamClose.assistantMessageCount, '关闭主窗口时应保留原模型回复');
+  await reconfirmCurrentDiscussion('关闭主弹窗并保留未保存考纲');
+  currentStage = '重新开始讨论只清除对话与范围并支持取消';
+  const beforeRestartDiscussion = await inspectCreateDialogState(window);
+  await window.webContents.executeJavaScript(`window.__restartDiscussionPrompt = ""; window.confirm = message => { window.__restartDiscussionPrompt = message; return false; }; true`);
+  await click(window, '[data-action="restart-discussion"]', '取消重新开始讨论');
+  const restartDiscussionPrompt = await window.webContents.executeJavaScript('window.__restartDiscussionPrompt');
+  assert.match(restartDiscussionPrompt, /清除本次对话和学习范围/);
+  assert.deepEqual(await inspectCreateDialogState(window), beforeRestartDiscussion, '取消重启讨论不得改动草稿');
+  await window.webContents.executeJavaScript('window.confirm = message => { window.__restartDiscussionPrompt = message; return true; }; true');
+  await click(window, '[data-action="restart-discussion"]', '确认重新开始讨论');
+  await waitForJS(window, 'document.querySelectorAll("#clarifyMessages .discussion-message").length === 0 && document.querySelector("#confirmBrief").hidden', '重新开始讨论清除旧对话与范围');
+  const afterRestartDiscussion = await inspectCreateDialogState(window);
+  assert.equal(afterRestartDiscussion.title, beforeRestartDiscussion.title);
+  assert.equal(afterRestartDiscussion.goal, beforeRestartDiscussion.goal);
+  assert.equal(afterRestartDiscussion.learningMode, beforeRestartDiscussion.learningMode);
+  assert.equal(afterRestartDiscussion.consentChecked, beforeRestartDiscussion.consentChecked, '重新开始讨论应保留材料授权勾选');
+  assert.deepEqual(afterRestartDiscussion.materials, beforeRestartDiscussion.materials, '重新开始讨论应保留材料');
+  assert.equal(afterRestartDiscussion.examSummary, beforeRestartDiscussion.examSummary, '重新开始讨论应保留考纲');
+  await reconfirmCurrentDiscussion('显式重新开始讨论');
+  expectedCreateDraft = {
+    ...await inspectCreateDialogState(window),
+    materialNames: expectedCreateDraft.materialNames,
+    examText: unsavedExamDescription
+  };
+
+  currentStage = '取消中的旧计划响应不得写回重开草稿';
+  const cancelledPlanGate = delayNextApiResponse('生成学习计划');
+  await click(window, '#createSubmit', '启动随后取消的计划请求');
+  const cancelledPlanObserved = await cancelledPlanGate.observed;
+  assert.deepEqual(cancelledPlanObserved.payload.brief, expectedBrief, '取消中的旧请求应使用已确认范围快照');
+  await click(window, '#createDialog [data-close="createDialog"]', '取消并关闭进行中的计划请求');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '进行中的计划窗口已关闭');
+  await click(window, '[data-action="new-task"]', '重新打开取消请求的草稿');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '取消请求的草稿已恢复');
+  await assertRestoredCreateDraft(expectedCreateDraft, true);
+  cancelledPlanGate.release();
+  await waitForApiRecordClosed(cancelledPlanObserved.record);
+  await window.webContents.executeJavaScript('new Promise(resolve => setTimeout(resolve, 0))');
+  assert.equal(cancelledPlanObserved.record.responseAborted || cancelledPlanObserved.record.responseFinished, true, '被取消的模型请求应已经结束');
+  state = await readState(window);
+  assert.equal(state.tasks.some(task => task.title === 'Python 记账小程序'), false, '取消中的旧计划响应不得把任务写入本地数据');
+
+  await click(window, '#createSubmit', '使用恢复的草稿重新生成计划');
   await waitForJS(window, 'document.querySelector("#createDialog") && !document.querySelector("#createDialog").open', '新计划已保存');
   state = await readState(window);
   assert.equal(state.tasks.length, 3);
@@ -1305,7 +1614,54 @@ async function run() {
   assert.match(planPayload.materials.find(item => item.name === 'selected-notes.docx')?.text || '', /DOCX native selection/);
   assert.match(planPayload.materials.find(item => item.name === 'selected-slides.pptx')?.text || '', /PPTX native selection/);
   assert.deepEqual(planPayload.brief, expectedBrief);
-  assert.equal(apiRecords.filter(record => record.purpose === '澄清学习需求').length, 2);
+  assert.equal(apiRecords.filter(record => record.purpose === '澄清学习需求').length, 10);
+
+  currentStage = '成功创建后新建表单恢复为空白';
+  await click(window, '[data-action="new-task"]', '成功创建后打开下一份空白计划');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open', '成功创建后的新建表单已打开');
+  const blankCreateDraft = await inspectCreateDialogState(window);
+  assert.equal(blankCreateDraft.title, '');
+  assert.equal(blankCreateDraft.goal, '');
+  assert.equal(blankCreateDraft.materials.length, 0, '成功创建后不应复用上一份材料');
+  assert.equal(blankCreateDraft.examSummary, '', '成功创建后不应复用上一份考纲');
+  assert.equal(blankCreateDraft.messageCount, 0, '成功创建后不应复用上一轮讨论');
+  assert.equal(blankCreateDraft.confirmedBrief, false, '成功创建后不应复用已确认范围');
+  assert.equal(blankCreateDraft.consentChecked, false, '成功创建后不应复用材料授权');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("[data-action=clear-create-draft]")?.hidden ?? true'), true, '没有未保存内容时不应显示清空草稿按钮');
+  currentStage = '清空未保存的新建草稿需确认且不影响已保存计划';
+  const clearDraftTitle = '只用于测试清空的新草稿';
+  const clearDraftGoal = '验证新建草稿可以被显式清除。';
+  await setValue(window, '#createForm [name="title"]', clearDraftTitle);
+  await setValue(window, '#createForm [name="goal"]', clearDraftGoal);
+  const clearDraftMaterial = writeMarkdownFixture('clear-create-draft.md', '只用于验证清空草稿会移除材料。');
+  await dispatchActualFileDrop(window, clearDraftMaterial);
+  await waitForJS(window, 'document.querySelector("#createMaterials").innerText.includes("clear-create-draft.md")', '待清空草稿材料已加入');
+  await setChecked(window, '#createConsent', true);
+  await click(window, '#createExamButton', '为待清空草稿添加考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '待清空草稿考纲已打开');
+  await setValue(window, '#examDescription', '待清空的新建考纲。');
+  await click(window, '#saveExamDraft', '保存待清空草稿考纲');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#createExamSummary").innerText.includes("待清空")', '待清空考纲已保存到草稿');
+  await setValue(window, '#clarifyInput', '请帮我确认这份临时计划的学习范围。');
+  await click(window, '#clarifySubmit', '为待清空草稿开始讨论');
+  await waitForJS(window, 'document.querySelectorAll("#clarifyMessages .discussion-message.is-assistant").length === 1', '待清空草稿已包含讨论内容');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭以保存待清空草稿');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '待清空草稿已关闭');
+  await click(window, '[data-action="new-task"]', '重新打开待清空草稿');
+  await waitForJS(window, 'document.querySelector("#createDialog")?.open && Boolean(document.querySelector("[data-action=clear-create-draft]"))', '重新打开草稿并显示清空按钮');
+  const beforeClearDraft = await inspectCreateDialogState(window);
+  await window.webContents.executeJavaScript(`window.__clearDraftPrompt = ""; window.confirm = message => { window.__clearDraftPrompt = message; return false; }; true`);
+  await click(window, '[data-action="clear-create-draft"]', '取消清空新建草稿');
+  assert.match(await window.webContents.executeJavaScript('window.__clearDraftPrompt'), /不会删除已保存的计划/);
+  assert.deepEqual(await inspectCreateDialogState(window), beforeClearDraft, '取消清空草稿不得修改任一表单、材料或讨论内容');
+  await window.webContents.executeJavaScript('window.confirm = message => { window.__clearDraftPrompt = message; return true; }; true');
+  await click(window, '[data-action="clear-create-draft"]', '确认清空新建草稿');
+  await waitForJS(window, 'document.querySelector("#createForm [name=title]").value === "" && document.querySelector("#createForm [name=goal]").value === "" && document.querySelectorAll("#createMaterials .attachment-item").length === 0 && document.querySelector("#createExamSummary").innerText === "" && document.querySelectorAll("#clarifyMessages .discussion-message").length === 0 && !document.querySelector("#createConsent").checked', '清空草稿重置表单、材料、考纲、讨论与授权');
+  state = await readState(window);
+  assert.equal(state.tasks.length, 3, '清空草稿不得增删已保存计划');
+  assert.ok(state.tasks.some(task => task.id === newTask.id && task.title === 'Python 记账小程序'), '清空草稿后已保存计划仍存在');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭成功创建后的空白表单');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '空白新建表单已关闭');
 
   if (process.env.STUDY_TEST_REPRODUCE_TUTOR_GAP === '1') {
     currentStage = '复现修复前讲解授权卡与篇幅按钮 0px 间距';
@@ -1372,7 +1728,7 @@ async function run() {
   assert.ok(unconfirmedTask);
   assert.equal(unconfirmedTask.brief, undefined, '未确认简报不应写入任务');
   assert.equal(state.tasks.length, 4);
-  assert.equal(apiRecords.filter(record => record.purpose === '澄清学习需求').length, 4);
+  assert.equal(apiRecords.filter(record => record.purpose === '澄清学习需求').length, 13);
 
   currentStage = '日测题型、草稿隔离、日报补学与期末报告';
   await click(window, '[data-nav="plans"]', '打开全部计划');
@@ -1396,9 +1752,84 @@ async function run() {
 
   await clickAction(window, 'open-plan', newTask.id);
   const dailyDraft1 = '使用函数拆分记账和汇总步骤。';
-  await openAssessmentThroughUI(window, newTask.id, 'daily', 1, true);
+  const daily1GenerationGate = delayNextApiResponse('生成每日小测');
+  const requestsBeforeDaily1 = apiRecords.length;
+  await clickAction(window, 'open-assessment', newTask.id, { kind: 'daily', dayIndex: 1 });
+  await waitForJS(window, 'document.querySelector("#quizForm") || document.querySelector("[data-action=generate-assessment]") || /正在生成|generating/i.test(document.querySelector(".quiz-intro h2")?.textContent || "")', '第二天日测生成入口或忙碌状态');
+  const daily1EntryState = await window.webContents.executeJavaScript(`({
+    generateButton: Boolean(document.querySelector('[data-action="generate-assessment"]')),
+    busy: /正在生成|generating/i.test(document.querySelector('.quiz-intro h2')?.textContent || '')
+  })`);
+  if (daily1EntryState.generateButton) await clickAction(window, 'generate-assessment', newTask.id, { kind: 'daily', dayIndex: 1 });
+  else assert.equal(daily1EntryState.busy, true, '尚未生成的日测应开始生成');
+  const daily1Pending = await daily1GenerationGate.observed;
+  assert.equal(apiRecords.length, requestsBeforeDaily1 + 1, '第二天日测只发起一次生成请求');
+  await click(window, '[data-nav="plans"]', '第二天日测生成中切换到计划列表');
+  await clickAction(window, 'open-plan', newTask.id);
+  await clickAction(window, 'toggle-day', newTask.id, { dayIndex: 1 });
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.plan.days[1]?.completed === true)`, '第二天日测等待期间保存完成标志');
+  await click(window, '[data-nav="overview"]', '题目生成等待期间切换到概览');
+  daily1GenerationGate.release();
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.dailyQuizzes?.['1']?.questions?.length === 5)`, '第二天题目在完成状态变化后仍然保存');
+  state = await readState(window);
+  activeTask = state.tasks.find(candidate => candidate.id === newTask.id);
+  assert.equal(activeTask.plan.days[1].completed, true, '生成日测不得覆盖等待期间保存的完成标志');
+  assert.equal(activeTask.dailyQuizzes['1'].questions.length, 5);
+  assert.equal(await window.webContents.executeJavaScript('Boolean(document.querySelector("#quizForm"))'), false, '题目保存不得抢回等待期间离开的测验页');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("[data-nav=overview]")?.classList.contains("is-active")'), true, '题目保存应保留等待期间选择的概览页');
+  assert.equal(daily1Pending.record.responseFinished, true, '第二天测验请求已经正常结束');
+
+  await click(window, '[data-nav="plans"]', '重新打开已生成测验所属计划');
+  await clickAction(window, 'open-plan', newTask.id);
+  await openAssessmentThroughUI(window, newTask.id, 'daily', 1, false);
   assert.equal(await window.webContents.executeJavaScript('document.querySelector("#quizForm [data-qid=q2]").value'), '', '不同日期的测验草稿不能串用');
   await setValue(window, '#quizForm [data-answer][data-qid="q2"]', dailyDraft1);
+  await click(window, '[data-nav="plans"]', '切换计划以更改日测对应日期的完成状态');
+  await clickAction(window, 'open-plan', newTask.id);
+  await clickAction(window, 'toggle-day', newTask.id, { dayIndex: 1 });
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.plan.days[1]?.completed === false)`, '切换第二天完成状态以验证草稿键稳定');
+  await openAssessmentThroughUI(window, newTask.id, 'daily', 1, false);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#quizForm [data-qid=q2]").value'), dailyDraft1, '完成状态变化不得改变日测答题草稿键');
+  await click(window, '[data-nav="plans"]', '再次切换计划以恢复第二天完成状态');
+  await clickAction(window, 'open-plan', newTask.id);
+  await clickAction(window, 'toggle-day', newTask.id, { dayIndex: 1 });
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.plan.days[1]?.completed === true)`, '恢复第二天完成状态');
+  await openAssessmentThroughUI(window, newTask.id, 'daily', 1, false);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#quizForm [data-qid=q2]").value'), dailyDraft1, '恢复完成状态后仍应恢复日测草稿');
+  currentStage = '跨午夜焦点刷新页眉和今日任务且不清除答题草稿';
+  state = await readState(window);
+  const dateTask = state.tasks.find(candidate => candidate.id === newTask.id);
+  const day0Date = dateTask.plan.days[0].date;
+  const day1Date = dateTask.plan.days[1].date;
+  const countForDate = date => state.tasks.reduce((count, task) => count + (task.plan?.days || []).filter(day => day.date === date).length, 0);
+  const midnightHeaderCheck = await window.webContents.executeJavaScript(`(() => {
+    const NativeDate = window.Date;
+    const localTime = date => new NativeDate(date + 'T23:58:00').getTime();
+    window.__desktopDateProbe = { NativeDate, now: localTime(${JSON.stringify(day0Date)}) };
+    window.Date = class extends NativeDate {
+      constructor(...args) { super(...(args.length ? args : [window.__desktopDateProbe.now])); }
+      static now() { return window.__desktopDateProbe.now; }
+    };
+    window.dispatchEvent(new Event('focus'));
+    return { header: document.querySelector('#headerDate').textContent, badge: document.querySelector('#todayBadge').textContent };
+  })()`);
+  assert.equal(midnightHeaderCheck.badge, String(countForDate(day0Date)), '跨日测试午夜前的今日任务数应与当天安排一致');
+  const afterMidnightHeaderCheck = await window.webContents.executeJavaScript(`(() => {
+    window.__desktopDateProbe.now = new window.__desktopDateProbe.NativeDate(${JSON.stringify(`${day1Date}T00:02:00`)}).getTime();
+    window.dispatchEvent(new Event('focus'));
+    return { header: document.querySelector('#headerDate').textContent, badge: document.querySelector('#todayBadge').textContent };
+  })()`);
+  assert.notEqual(afterMidnightHeaderCheck.header, midnightHeaderCheck.header, '跨午夜后恢复焦点应刷新页眉日期');
+  assert.equal(afterMidnightHeaderCheck.badge, String(countForDate(day1Date)), '跨午夜后恢复焦点应更新今日任务数量');
+  assert.equal(await window.webContents.executeJavaScript('Boolean(document.querySelector("#quizForm"))'), true, '测验焦点刷新不得替换答题页面');
+  assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#quizForm [data-qid="q2"]').value`), dailyDraft1, '跨午夜后答题草稿仍应保留');
+  await click(window, '[data-nav="today"]', '查看跨日后的今日任务');
+  await waitForJS(window, `document.querySelector("#appView h1")?.textContent.includes("今日安排") && document.querySelector("#appView").innerText.includes(${JSON.stringify(day1Date)})`, '今日任务列表切换到次日安排');
+  await window.webContents.executeJavaScript(`window.Date = window.__desktopDateProbe.NativeDate; window.dispatchEvent(new Event('focus')); delete window.__desktopDateProbe; true`);
+  await click(window, '[data-nav="plans"]', '返回全部计划');
+  await clickAction(window, 'open-plan', newTask.id);
+  await openAssessmentThroughUI(window, newTask.id, 'daily', 1, false);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#quizForm [data-qid=q2]").value'), dailyDraft1, '重新打开测验后仍应恢复跨日时的答题草稿');
   const requestsAfterDaily1 = apiRecords.length;
   await click(window, '[data-nav="overview"]', '离开日测查看概览');
   await clickAction(window, 'open-plan', newTask.id);
@@ -1415,17 +1846,32 @@ async function run() {
   await setValue(window, '#quizForm [data-answer][data-qid="q4"]', '用循环访问每笔记录并累加金额。');
   await setValue(window, '#quizForm [data-answer][data-qid="q5"]', '函数可以把重复步骤整理成可复用操作。');
   const gradesBeforeDaily0 = apiRecords.filter(record => record.purpose === '评分并生成学习报告').length;
+  const daily0GradeGate = delayNextApiResponse('评分并生成学习报告');
   await click(window, '#submitQuiz', '提交日测并生成日报');
+  const daily0GradePending = await daily0GradeGate.observed;
+  await click(window, '[data-nav="plans"]', '日报评分等待期间切换到全部计划');
+  await clickAction(window, 'open-plan', newTask.id);
+  await clickAction(window, 'toggle-day', newTask.id, { dayIndex: 0 });
+  await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.plan.days[0]?.completed === true)`, '日报评分等待期间保存第一天完成状态');
+  await click(window, '[data-nav="overview"]', '日报评分等待期间切换到概览');
+  daily0GradeGate.release();
   await waitForJS(window, `window.studyApp.loadState().then(s => s.tasks.find(t => t.id === ${JSON.stringify(newTask.id)})?.dailyQuizzes?.['0']?.result?.report?.readyForNext === false)`, '日测报告已保存');
-  await waitForJS(window, 'Boolean(document.querySelector(".learning-report .report-readiness"))', '学习报告显示准备程度');
+  assert.equal(await window.webContents.executeJavaScript('Boolean(document.querySelector("#quizForm"))'), false, '评分完成不得抢回已离开的测验页');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("[data-nav=overview]")?.classList.contains("is-active")'), true, '评分完成应保留等待期间选择的概览页');
   state = await readState(window);
   activeTask = state.tasks.find(candidate => candidate.id === newTask.id);
+  assert.equal(activeTask.plan.days[0].completed, true, '日报评分不得覆盖等待期间保存的完成标志');
   assert.equal(activeTask.dailyQuizzes['0'].result.score, 100);
   assert.equal(activeTask.dailyQuizzes['0'].result.report.readyForNext, false, '准备程度应按先修证據判断，不能由高总分直接推断');
   assert.deepEqual(activeTask.dailyQuizzes['0'].answers.q1, { text: 'A' });
   assert.equal(apiRecords.filter(record => record.purpose === '评分并生成学习报告').length, gradesBeforeDaily0 + 1);
+  assert.equal(daily0GradePending.record.responseFinished, true, '日报评分请求已经正常结束');
   const dailyGradePayload = apiRecords.findLast(record => record.purpose === '评分并生成学习报告')?.payload;
   assert.equal(JSON.stringify(dailyGradePayload).includes('Native PDF worker smoke'), false, '评分已提供知识清单时不得重复发送原始附件文字');
+  await click(window, '[data-nav="plans"]', '打开已评分日测所属计划');
+  await clickAction(window, 'open-plan', newTask.id);
+  await openAssessmentThroughUI(window, newTask.id, 'daily', 0, false);
+  await waitForJS(window, 'Boolean(document.querySelector(".learning-report .report-readiness"))', '学习报告显示准备程度');
   await captureScreenshot(window, 'daily-report-0.3.png');
 
   const reportRequestCount = apiRecords.length;
@@ -1436,7 +1882,6 @@ async function run() {
   assert.equal(apiRecords.length, reportRequestCount, '选择或完成补学只应保存本地状态');
 
   await clickAction(window, 'open-plan', newTask.id);
-  await clickAction(window, 'toggle-day', newTask.id, { dayIndex: 0 });
   state = await readState(window);
   const pastDayBeforeAdjustment = structuredClone(state.tasks.find(candidate => candidate.id === newTask.id).plan.days[0]);
   assert.equal(pastDayBeforeAdjustment.completed, true);
@@ -1821,7 +2266,7 @@ async function run() {
   assert.deepEqual(weeklyTask.cadence.weekdays, [1, 3, 5]);
   assert.ok(weeklyTask.plan.days.every(day => [1, 3, 5].includes(new Date(`${day.date}T00:00:00.000Z`).getUTCDay())), '每周计划只应安排周一、周三和周五');
 
-  currentStage = '100000字符材料一次提交并自动生成60日批次计划';
+  currentStage = '100000字符材料分片阅读并生成60日批次计划';
   await click(window, '[data-action="new-task"]', '打开60日计划新建对话框');
   await waitForJS(window, 'document.querySelector("#createDialog")?.open', '60日计划新建对话框');
   await setValue(window, '#createForm [name="title"]', '60日 Python 练习计划');
@@ -1857,12 +2302,22 @@ async function run() {
   assert.equal(longTask.plan.days.length, 60);
   assert.deepEqual(longTask.plan.days.map(day => day.date), schedule.learningDates({ startDate: longTask.startDate, calendarDays: 60, cadence: { mode: 'daily' } }));
   const longPlannerRecords = apiRecords.slice(longPlanRequestStart).filter(record => ['生成学习计划概要与知识清单', '生成学习计划每日安排'].includes(record.purpose));
+  const longReaderRecords = apiRecords.slice(longPlanRequestStart).filter(record => record.purpose === '阅读材料片段');
   const outlineRecords = longPlannerRecords.filter(record => record.purpose === '生成学习计划概要与知识清单');
   const dayBatchRecords = longPlannerRecords.filter(record => record.purpose === '生成学习计划每日安排');
+  assert.ok(longReaderRecords.length >= 2, '100000 字材料应经多个片段请求完整阅读');
+  assert.deepEqual(longReaderRecords.map(record => record.payload.material.segment), longReaderRecords.map((_record, index) => index + 1), '材料片段应按序串行读取');
+  assert.ok(longReaderRecords.every(record => record.payload.material.name === '100000-character-study-metadata.md'));
+  assert.ok(longReaderRecords.every(record => record.payload.material.segmentCount === longReaderRecords.length));
+  assert.ok(longReaderRecords.every(record => record.payload.material.text.length > 0 && record.payload.material.text.length <= 40000));
+  assert.equal(longReaderRecords.reduce((total, record) => total + record.payload.material.text.length, 0), longMetadata.length, '分片请求应覆盖完整本地材料');
+  assert.equal(longReaderRecords.map(record => record.payload.material.text).join(''), longMetadata, '模型阅读请求应按顺序完整覆盖 100000 字原文');
+  assert.ok(longReaderRecords.every(record => record.payload.material.sourcePages.every(page => Number.isInteger(page.number) && typeof page.unit === 'string')));
+  assert.ok(apiRecords.slice(longPlanRequestStart).findIndex(record => record.purpose === '生成学习计划概要与知识清单') > apiRecords.slice(longPlanRequestStart).findLastIndex(record => record.purpose === '阅读材料片段'), '完整读取材料后才应生成计划概要');
   assert.equal(outlineRecords.length, 1, '大材料应只发起一次计划概要请求');
   assert.equal(dayBatchRecords.length, Math.ceil(60 / 7), '60 个学习日应按每批最多 7 日生成');
   const outlineRequest = outlineRecords[0].requestBody.messages[1].content;
-  assert.ok(outlineRequest.length < 100000 && !outlineRequest.includes(longMetadata), '100000 字符原文只应经上下文预算截取后发送一次');
+  assert.ok(outlineRequest.length < 100000 && !outlineRequest.includes(longMetadata), '100000 字符原文应由分片提要取代后再生成计划概要');
   const requestedSessions = dayBatchRecords.flatMap(record => record.payload.sessions);
   assert.equal(requestedSessions.length, 60);
   assert.ok(dayBatchRecords.every(record => record.payload.sessions.length <= 7));
@@ -1875,6 +2330,8 @@ async function run() {
   })()`);
   assert.ok(progressEvents.some(event => event.stage === 'outline' && event.completed === 0 && event.total === 1), '界面进度应收到概要阶段开始');
   assert.ok(progressEvents.some(event => event.stage === 'outline' && event.completed === 1 && event.total === 1), '界面进度应收到概要阶段完成');
+  assert.ok(progressEvents.some(event => event.stage === 'materials' && event.completed === 0 && event.total === longReaderRecords.length), '界面进度应收到材料阅读阶段开始');
+  assert.equal(progressEvents.filter(event => event.stage === 'materials').at(-1)?.completed, longReaderRecords.length, '界面进度应在完整材料提要后结束阅读阶段');
   assert.equal(progressEvents.filter(event => event.stage === 'days').at(-1)?.completed, 60, '界面进度应在全部60日安排后完成');
   const checkpointPath = path.join(dataDir, 'plan-generation.json');
   assert.equal(fs.existsSync(checkpointPath), true, '60 日计划完成后应持久化计划生成检查点');
@@ -2098,6 +2555,12 @@ async function run() {
   async function openCreateFixture(title, goal = '理解变量与循环并完成 Python 练习。') {
     await clickAction(window, 'new-task');
     await waitForJS(window, 'document.querySelector("#createDialog")?.open', `${title}新建计划对话框`);
+    const hasPreviousDraft = await window.webContents.executeJavaScript('Boolean(document.querySelector("[data-action=clear-create-draft]") && !document.querySelector("[data-action=clear-create-draft]").hidden)');
+    if (hasPreviousDraft) {
+      await window.webContents.executeJavaScript('window.confirm = () => true; true');
+      await click(window, '[data-action="clear-create-draft"]', `${title}隔离并清除上一测试草稿`);
+      await waitForJS(window, 'document.querySelector("[data-action=clear-create-draft]")?.hidden && document.querySelectorAll("#createMaterials .attachment-item").length === 0 && document.querySelector("#createExamSummary").innerText === ""', `${title}测试草稿已重置`);
+    }
     await setValue(window, '#createForm [name="title"]', title);
     await setValue(window, '#createForm [name="goal"]', goal);
     await setValue(window, '#createForm [name="days"]', 2);
@@ -2697,6 +3160,88 @@ async function captureDialog(name, selector, language, width) {
   assert.equal(visualAdjustmentRecords.length, 2, '中文和英文讲解布局各使用一次真实后续调整预览');
   assert.deepEqual(visualAdjustmentRecords.map(record => record.payload.outputLanguage), ['zh-CN', 'en']);
 
+  currentStage = '计划备份导入取消、双语提示与同编号副本';
+  await setUiLanguage(window, 'zh-CN');
+  await click(window, '[data-nav="plans"]', '打开带恢复备份按钮的计划列表');
+  await waitForJS(window, 'document.querySelector("#appView h1")?.textContent === "全部计划"', '计划列表用于备份恢复');
+  const tasksBeforeBackupImport = await readState(window);
+  const tasksBeforeBackupJson = JSON.stringify(tasksBeforeBackupImport.tasks);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("[data-action=import-task-backup]")?.textContent.trim()'), '恢复计划备份');
+  await captureScreenshot(window, 'backup-import-button-zh.png');
+  const originalBackupOpenDialog = dialog.showOpenDialog;
+  let backupDialogOptions;
+  let finishBackupDialog;
+  let backupDialogMode = 'pending';
+  let backupDialogPath;
+  try {
+    dialog.showOpenDialog = async (_owner, options) => {
+      backupDialogOptions = options;
+      if (backupDialogMode === 'pending') return new Promise(resolve => { finishBackupDialog = resolve; });
+      if (backupDialogMode === 'cancel') return { canceled: true, filePaths: [] };
+      return { canceled: false, filePaths: [backupDialogPath] };
+    };
+    await click(window, '[data-action="import-task-backup"]', '打开系统备份选择器');
+    await waitForJS(window, 'document.querySelector("[data-action=import-task-backup]")?.disabled', '备份选择期间按钮进入禁用状态');
+    assert.equal(backupDialogOptions.title, '恢复学习计划备份');
+    assert.deepEqual(backupDialogOptions.properties, ['openFile']);
+    assert.deepEqual(backupDialogOptions.filters, [{ name: '学习计划备份', extensions: ['json'] }]);
+    await captureScreenshot(window, 'backup-import-loading-zh.png');
+    backupDialogMode = 'cancel';
+    finishBackupDialog({ canceled: true, filePaths: [] });
+    await waitForJS(window, '!document.querySelector("[data-action=import-task-backup]")?.disabled', '取消备份选择后按钮恢复');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#appView h1")?.textContent'), '全部计划', '取消文件选择不得导航到计划详情');
+    assert.equal(JSON.stringify((await readState(window)).tasks), tasksBeforeBackupJson, '取消恢复不得修改计划状态');
+
+    await setUiLanguage(window, 'en');
+    await click(window, '[data-nav="plans"]', '英文界面打开计划列表');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("[data-action=import-task-backup]")?.textContent.trim()'), 'Restore backup');
+    await captureScreenshot(window, 'backup-import-button-en.png');
+    backupDialogMode = 'pending';
+    finishBackupDialog = null;
+    await click(window, '[data-action="import-task-backup"]', '英文界面打开备份选择器');
+    await waitForJS(window, 'document.querySelector("[data-action=import-task-backup]")?.disabled', '英文备份选择期间按钮进入禁用状态');
+    assert.equal(backupDialogOptions.title, 'Restore a study plan backup');
+    assert.deepEqual(backupDialogOptions.filters, [{ name: 'Study plan backup', extensions: ['json'] }]);
+    finishBackupDialog({ canceled: true, filePaths: [] });
+    await waitForJS(window, '!document.querySelector("[data-action=import-task-backup]")?.disabled', '英文取消选择后按钮恢复');
+    await setUiLanguage(window, 'zh-CN');
+
+    const uniqueBackupTask = structuredClone(newTask);
+    uniqueBackupTask.id = 'desktop-import-backup-unique';
+    uniqueBackupTask.title = 'UI 导入的独立计划';
+    backupDialogPath = path.join(dataDir, 'ui-import-unique.json');
+    fs.writeFileSync(backupDialogPath, JSON.stringify({ format: 'study-workbench-task', exportedAt: new Date().toISOString(), task: uniqueBackupTask }), 'utf8');
+    backupDialogMode = 'import';
+    await click(window, '[data-nav="plans"]', '中文界面返回计划列表');
+    await click(window, '[data-action="import-task-backup"]', '恢复独立编号的计划备份');
+    await waitForJS(window, `document.querySelector("#appView h1")?.textContent === ${JSON.stringify(uniqueBackupTask.title)}`, '成功恢复的计划打开详情');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#toast").textContent'), '计划备份已恢复。');
+    let stateAfterUniqueBackup = await readState(window);
+    const uniqueImportedTask = stateAfterUniqueBackup.tasks.find(task => task.id === uniqueBackupTask.id);
+    assert.equal(uniqueImportedTask.title, uniqueBackupTask.title);
+
+    const duplicateBackupTask = structuredClone(newTask);
+    duplicateBackupTask.title = '同编号备份副本';
+    backupDialogPath = path.join(dataDir, 'ui-import-duplicate.json');
+    fs.writeFileSync(backupDialogPath, JSON.stringify({ format: 'study-workbench-task', exportedAt: new Date().toISOString(), task: duplicateBackupTask }), 'utf8');
+    await click(window, '[data-nav="plans"]', '为同编号副本返回计划列表');
+    await click(window, '[data-action="import-task-backup"]', '恢复与现有计划同编号的备份');
+    await waitForJS(window, `document.querySelector("#appView h1")?.textContent === ${JSON.stringify(duplicateBackupTask.title)}`, '同编号备份以副本身份打开详情');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#toast").textContent'), '计划备份已作为新计划恢复。');
+    const stateAfterDuplicateBackup = await readState(window);
+    const importedCopies = stateAfterDuplicateBackup.tasks.filter(task => task.title === duplicateBackupTask.title);
+    assert.equal(importedCopies.length, 1);
+    assert.notEqual(importedCopies[0].id, newTask.id, '同编号备份应创建新编号');
+    assert.equal(stateAfterDuplicateBackup.tasks.find(task => task.id === newTask.id)?.title, newTask.title, '导入同编号备份不得覆盖原计划');
+    assert.ok(stateAfterDuplicateBackup.tasks.some(task => task.id === uniqueBackupTask.id), '导入独立编号的计划应保留');
+    await window.webContents.executeJavaScript(`(async () => { await window.studyApp.deleteTask(${JSON.stringify(uniqueBackupTask.id)}); await window.studyApp.deleteTask(${JSON.stringify(importedCopies[0].id)}); })()`);
+    await window.webContents.executeJavaScript('window.studyApp.loadState()');
+    assert.equal(JSON.stringify((await readState(window)).tasks), tasksBeforeBackupJson, '清理导入 fixture 后原计划集合应完全恢复');
+    window = await reloadWindow(window, true, tasksBeforeBackupImport.tasks.length);
+  } finally {
+    dialog.showOpenDialog = originalBackupOpenDialog;
+  }
+
   currentStage = '清除 Key、重新锁定并确认任务磁盘内容不变';
   const taskFilePath = path.join(dataDir, 'tasks.json');
   const taskFileBeforeRelock = fs.readFileSync(taskFilePath, 'utf8');
@@ -2718,12 +3263,12 @@ async function captureDialog(name, selector, language, width) {
   const regressionAdjustmentRequests = apiRecords.filter(record => record.purpose === '调整后续学习规划' && record.payload?.title === regressionTitle);
   assert.equal(regressionAdjustmentRequests.length, 1, '跳过已完成日回归测试应单独发起一次模拟调整请求');
   const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record));
-  assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈'].includes(purpose)), [
+  assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈', '阅读材料片段'].includes(purpose)), [
     '连接测试',
     '生成周期测验',
     '按材料和评分标准评阅学习测验',
-    '澄清学习需求', '澄清学习需求', '生成学习计划',
-    '澄清学习需求', '澄清学习需求', '生成学习计划',
+    ...Array.from({ length: 10 }, () => '澄清学习需求'), '生成学习计划', '生成学习计划',
+    '澄清学习需求', '澄清学习需求', '澄清学习需求', '生成学习计划',
     '生成每日小测', '生成每日小测', '评分并生成学习报告',
     '生成每日小测', '生成周期测验', '评分并生成学习报告',
     '生成每日小测', '评分并生成学习报告',

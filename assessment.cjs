@@ -7,6 +7,7 @@ const { languageInstruction, normalizeLanguage } = require('./i18n.js');
 
 const DAILY_QUESTION_COUNT = 5;
 const FINAL_QUESTION_COUNT = 10;
+const ADJUSTMENT_BATCH_DAYS = 12;
 const QUIZ_METADATA_KEYS = [
   'generatedDate', 'answers', 'result', 'resultDate', 'decision', 'supplementCompleted', 'readinessStale'
 ];
@@ -117,13 +118,35 @@ function validateDateValue(value, label) {
   if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value.slice(0, 10)) fail(label + '格式无效。');
 }
 
-function validateReport(report, quiz) {
+function citedQuestionNumbers(reason) {
+  return [...reason.matchAll(/\bq(\d+)\b|第\s*(\d+)\s*题/gi)].map(match => match[1] || match[2]);
+}
+
+function questionReferencesValid(questions, citedQuestions) {
+  return citedQuestions.every(number =>
+    questions.some(question => question && typeof question.id === 'string' && question.id.toLocaleLowerCase() === 'q' + number)
+  );
+}
+
+function reportReferencesValid(quiz) {
+  const report = quiz && quiz.result && quiz.result.report;
+  if (!plain(report) || typeof report.reason !== 'string' || !Array.isArray(quiz.questions)) return false;
+  const citedQuestions = citedQuestionNumbers(report.reason);
+  const allReferencesExist = questionReferencesValid(quiz.questions, citedQuestions);
+  return allReferencesExist && !(quiz.kind === 'daily' && report.readyForNext === false && !citedQuestions.length);
+}
+
+function validateReport(report, quiz, options = {}) {
   services.exactKeys(report, ['summary', 'strengths', 'nextSteps', 'readyForNext', 'reason', 'extraMinutes', 'extraTasks'], '学习报告');
   services.requireString(report.summary, '报告摘要', 1, 2000);
   requireArrayStrings(report.strengths, '优势列表', 10, 500);
   requireArrayStrings(report.nextSteps, '下一步建议', 10, 500);
   if (report.readyForNext !== null && typeof report.readyForNext !== 'boolean') fail('下一日准备程度必须为布尔值或 null。');
   services.requireString(report.reason, '准备程度依据', 1, 1200);
+  const citedQuestions = citedQuestionNumbers(report.reason);
+  if (!options.allowInvalidQuestionReferences && !questionReferencesValid(quiz.questions, citedQuestions)) {
+    fail('报告引用了当前测验不存在的题目证据。');
+  }
   if (!Number.isInteger(report.extraMinutes) || report.extraMinutes < 0 || report.extraMinutes > 240) fail('补学时间必须为 0 至 240 分钟的整数。');
   requireArrayStrings(report.extraTasks, '补学任务', 10, 500);
   if (quiz.kind === 'final' && report.readyForNext !== null) fail('期末报告的 readyForNext 必须为 null。');
@@ -131,14 +154,14 @@ function validateReport(report, quiz) {
     if (report.extraMinutes < 15 || report.extraMinutes > 120 || report.extraTasks.length < 1 || report.extraTasks.length > 3) {
       fail('未准备好下一日学习时，必须提供 15 至 120 分钟和 1 至 3 项补学任务。');
     }
-    if (!report.nextSteps.length || report.reason.length < 20 || !/(q\d+|第\s*\d+\s*题)/i.test(report.reason)) {
+    if (!report.nextSteps.length || report.reason.length < 20 || !citedQuestions.length) {
       fail('未准备好下一日学习时，报告必须引用具体题目证据并给出可执行建议。');
     }
   }
   return report;
 }
 
-function validateAssessmentResult(result, quiz) {
+function validateAssessmentResult(result, quiz, options = {}) {
   validateAssessmentStructure({
     version: quiz.version,
     mode: quiz.mode,
@@ -162,7 +185,7 @@ function validateAssessmentResult(result, quiz) {
     fail('总分必须严格等于逐题分数之和且不超过 100。');
   }
   requireArrayStrings(result.weakPoints, '薄弱点列表', 20, 500);
-  validateReport(result.report, quiz);
+  validateReport(result.report, quiz, options);
   if (quiz.answers) {
     const choicePoints = quiz.kind === 'daily' ? 20 : 10;
     quiz.questions.forEach((question, index) => {
@@ -185,7 +208,7 @@ function validateReadinessForTask(quiz, result, days) {
   if (!hasNextDay && result.report.readyForNext !== null) fail('最后一日没有后续任务，readyForNext 必须为 null。');
 }
 
-function validateAssessment(quiz) {
+function validateAssessment(quiz, options = {}) {
   if (!plain(quiz)) fail('学习测验格式无效。');
   const presentMetadata = QUIZ_METADATA_KEYS.filter(key => Object.prototype.hasOwnProperty.call(quiz, key));
   services.exactKeys(quiz, ['version', 'mode', 'kind', 'dayIndex', 'questions', ...presentMetadata], '学习测验');
@@ -201,7 +224,7 @@ function validateAssessment(quiz) {
   if (Object.prototype.hasOwnProperty.call(quiz, 'answers')) validateAnswers(quiz.answers, quiz.questions);
   if (Object.prototype.hasOwnProperty.call(quiz, 'result')) {
     if (!quiz.answers) fail('已评分测验必须保存作答。');
-    validateAssessmentResult(quiz.result, quiz);
+    validateAssessmentResult(quiz.result, quiz, options);
   }
   if (Object.prototype.hasOwnProperty.call(quiz, 'decision') && !['adjusted', 'extra'].includes(quiz.decision)) fail('学习决定无效。');
   if (quiz.decision !== undefined && (quiz.kind !== 'daily' || !quiz.result || quiz.result.report.readyForNext !== false)) {
@@ -247,13 +270,13 @@ function validateAssessmentRecords(task) {
     if (!plain(task.dailyQuizzes)) fail('每日测验记录格式无效。');
     for (const [key, quiz] of Object.entries(task.dailyQuizzes)) {
       if (!/^(0|[1-9]\d*)$/.test(key) || !Number.isInteger(task.days) || Number(key) >= task.days) fail('每日测验记录日期无效。');
-      validateAssessment(quiz);
+      validateAssessment(quiz, { allowInvalidQuestionReferences: true });
       if (quiz.kind !== 'daily' || quiz.dayIndex !== Number(key)) fail('每日测验与保存日期不一致。');
       if (quiz.result) validateReadinessForTask(quiz, quiz.result, task.days);
     }
   }
   if (task.quiz && Object.prototype.hasOwnProperty.call(task.quiz, 'version')) {
-    validateAssessment(task.quiz);
+    validateAssessment(task.quiz, { allowInvalidQuestionReferences: true });
     if (task.quiz.kind !== 'final' || task.quiz.dayIndex !== null) fail('期末测验记录格式无效。');
   }
   if (task.finalQuizHistory !== undefined) {
@@ -266,7 +289,7 @@ function validateAssessmentRecords(task) {
 function validateFinalHistoryQuiz(quiz) {
   if (!plain(quiz) || !quiz.result) fail('历史周期测验必须包含已评分结果。');
   if (Object.prototype.hasOwnProperty.call(quiz, 'version')) {
-    validateAssessment(quiz);
+    validateAssessment(quiz, { allowInvalidQuestionReferences: true });
     if (quiz.kind !== 'final' || quiz.dayIndex !== null) fail('历史周期测验记录格式无效。');
     return quiz;
   }
@@ -621,6 +644,8 @@ function validateAdjustment(modelResult, candidates, task, sources) {
 async function proposeAdjustment(task, dayIndex, settings = {}) {
   validateTask(task);
   if (!Number.isInteger(dayIndex) || dayIndex < 0 || dayIndex >= task.days) fail('测验日期编号无效。');
+  const storedQuiz = task.dailyQuizzes && task.dailyQuizzes[String(dayIndex)];
+  if (storedQuiz && !reportReferencesValid(storedQuiz)) fail('报告引用了不存在的题目，请重新测评。');
   const quiz = getAssessment(task, { kind: 'daily', dayIndex });
   if (!quiz.result) fail('请先完成每日小测并生成学习报告。');
   if (quiz.readinessStale) fail('该日报所依据的下一日计划已调整，请重新完成每日小测后再调整计划。');
@@ -637,11 +662,12 @@ async function proposeAdjustment(task, dayIndex, settings = {}) {
     EXAMPASS_RULES,
     '不要接收或要求原始材料全文，也不要泄露 API 配置或隐藏信息。',
     '只返回合法 JSON：{"summary":string,"days":[{"day":number,"date":"YYYY-MM-DD","title":string,"minutes":number,"tasks":string[],"source":string}]}。',
-    'days 必须按输入顺序逐日完整返回。day、date、minutes 必须与每个当前计划日期完全相同；不得出现过去日期或已完成日期。只使用 allowedSources 中的来源字符串。',
-    '每天任务都要保留 5 题小测并写明用时，测验时间计入当日 minutes。最后一天另外保留 10 题周期测验并写明用时，也计入当日 minutes。',
+    'days 必须按输入顺序逐日完整返回。day、date、minutes 必须与当前批次中每个计划日期完全相同；不得出现过去日期或已完成日期。只使用 allowedSources 中的来源字符串。',
+    'previousDay 是前一批最后一个已确认日期的少量衔接信息；有该字段时据此安排自然过渡。summary 用简短文字概括整体调整思路。',
+    '每天任务都要保留 5 题小测并写明用时，测验时间计入当日 minutes。finalDay 是完整周期最后一天编号；只有 day 等于 finalDay 时才安排 10 题周期测验并写明用时，其他日期（包括批次末日）都不要安排周期测验。',
     languageInstruction(settings.language)
   ].join('\n');
-  const payload = {
+  const basePayload = {
     purpose: '调整后续学习规划',
     outputLanguage: normalizeLanguage(settings.language),
     title: task.title,
@@ -650,6 +676,7 @@ async function proposeAdjustment(task, dayIndex, settings = {}) {
     examContext: services.examContext(task),
     learningMode: task.learningMode || 'balanced',
     level: task.level,
+    finalDay: task.days,
     failedDay: {
       day: dayIndex + 1,
       title: task.plan.days[dayIndex].title,
@@ -662,7 +689,6 @@ async function proposeAdjustment(task, dayIndex, settings = {}) {
         extraTasks: quiz.result.report.extraTasks
       }
     },
-    upcoming: upcoming.map(day => ({ day: day.day, date: day.date, title: day.title, minutes: day.minutes, tasks: day.tasks })),
     knowledge: (task.plan.knowledge || []).map(item => ({
       title: item.title,
       priority: item.priority,
@@ -671,10 +697,53 @@ async function proposeAdjustment(task, dayIndex, settings = {}) {
     })),
     allowedSources: sources
   };
-  const context = services.boundedContext(payload, [], services.contextBudget(systemMessage, settings));
-  const content = await services.requestChat(settings, systemMessage, context.text, 5000, false, true);
-  const modelResult = services.parseModelJson(content, '计划调整');
-  return validateAdjustment(modelResult, upcoming, task, sources);
+  const adjustedDays = [];
+  let summary;
+  let offset = 0;
+  let preferredBatchSize = ADJUSTMENT_BATCH_DAYS;
+  while (offset < upcoming.length) {
+    let batchSize = Math.min(preferredBatchSize, upcoming.length - offset);
+    while (true) {
+      const candidates = upcoming.slice(offset, offset + batchSize);
+      const previous = adjustedDays[adjustedDays.length - 1];
+      const payload = {
+        ...basePayload,
+        ...(previous ? { previousDay: {
+          day: previous.day,
+          date: previous.date,
+          title: previous.title,
+          transitionTask: previous.tasks[previous.tasks.length - 1].slice(0, 300),
+          source: previous.source
+        } } : {}),
+        upcoming: candidates.map(day => ({ day: day.day, date: day.date, title: day.title, minutes: day.minutes, tasks: day.tasks }))
+      };
+      let context;
+      try {
+        context = services.boundedContext(payload, [], services.contextBudget(systemMessage, settings));
+      } catch (error) {
+        if (batchSize === 1) throw error;
+        batchSize = Math.max(1, Math.floor(batchSize / 2));
+        continue;
+      }
+
+      let content;
+      try {
+        content = await services.requestChat(settings, systemMessage, context.text, undefined, false, true, { omitTokenBudget: true });
+      } catch (error) {
+        if (!['MODEL_OUTPUT_LENGTH', 'MODEL_OUTPUT_SIZE'].includes(error.code) || batchSize === 1) throw error;
+        batchSize = Math.max(1, Math.floor(batchSize / 2));
+        continue;
+      }
+      const modelResult = services.parseModelJson(content, '计划调整');
+      const validated = validateAdjustment(modelResult, candidates, task, sources);
+      if (summary === undefined) summary = validated.summary;
+      adjustedDays.push(...validated.days);
+      preferredBatchSize = Math.min(preferredBatchSize, batchSize);
+      offset += batchSize;
+      break;
+    }
+  }
+  return validateAdjustment({ summary, days: adjustedDays }, upcoming, task, sources);
 }
 
 module.exports = {
@@ -683,5 +752,6 @@ module.exports = {
   proposeAdjustment,
   validateAssessment,
   validateAssessmentResult,
-  validateAssessmentRecords
+  validateAssessmentRecords,
+  reportReferencesValid
 };

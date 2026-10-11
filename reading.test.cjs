@@ -6,7 +6,6 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const http = require('node:http');
 const JSZip = require('jszip');
 const service = require('./services.cjs');
 const { documentReadingRules } = require('./document-reading.cjs');
@@ -42,19 +41,18 @@ function modelPlan(data, studyNotes) {
 
 async function mockAPI(t, respond) {
   const received = [];
-  const server = http.createServer(async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    const parsed = JSON.parse(body);
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, options) => {
+    const parsed = JSON.parse(options.body);
     received.push(parsed);
     const content = await respond(parsed, received.length);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) } }] }));
-  });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) } }] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  };
+  t.after(() => { global.fetch = originalFetch; });
   return {
-    settings: { endpoint: `http://127.0.0.1:${server.address().port}/v1`, model: 'mock', key: 'test-key' },
+    settings: { endpoint: 'http://localhost/v1', model: 'mock', key: 'test-key' },
     received
   };
 }
@@ -195,4 +193,131 @@ test('PPTX 按关系顺序提取讲者备注并保留公式结构，复杂公式
   assert.equal(service.validateInput(withMaterial), true);
   const sent = JSON.parse(service.boundedContext({ purpose: '测试' }, withMaterial.materials, 60000).text);
   assert.deepEqual(sent.materials[0].readingWarnings, result.readingWarnings);
+});
+
+test('PPTX 提取关系中的图表标题与数值，并提示混合图文幻灯片的图片文字未识别', async t => {
+  const zip = new JSZip();
+  zip.file('ppt/presentation.xml', '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>');
+  zip.file('ppt/_rels/presentation.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>');
+  zip.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>季度访问量</a:t></a:r></a:p></p:txBody></p:sp><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame><p:pic><p:blipFill><a:blip r:embed="rId3"/></p:blipFill></p:pic></p:spTree></p:cSld></p:sld>');
+  zip.file('ppt/slides/_rels/slide1.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>');
+  zip.file('ppt/charts/chart1.xml', '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>季度销售额</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>净销售额</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>第一季度</c:v></c:pt><c:pt idx="1"><c:v>第二季度</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>98765</c:v></c:pt><c:pt idx="1"><c:v>12345</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>稀疏系列</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="2"><c:v>B</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache><c:pt idx="1"><c:v>100</c:v></c:pt><c:pt idx="2"><c:v>200</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>');
+  zip.file('ppt/media/image1.png', Buffer.from('fixture image bytes'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'study-reading-chart-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'charts.pptx');
+  await fsp.writeFile(filePath, await zip.generateAsync({ type: 'nodebuffer' }));
+
+  const result = await service.parseMaterial(filePath);
+  assert.match(result.text, /季度销售额/);
+  assert.match(result.text, /净销售额/);
+  assert.match(result.text, /第一季度[^\n]*98765/);
+  assert.match(result.text, /第二季度[^\n]*12345/);
+  assert.match(result.text, /稀疏系列：A：无缓存值；项目 2：100；B：200/);
+  assert.ok(result.readingWarnings.some(warning => /图片.*文字.*未.*识别/.test(warning)));
+});
+
+test('英文计划保存已翻译的固定材料阅读提示', async t => {
+  const warning = 'PPTX 包含图片，图片内文字未进行 OCR 识别，请对照原幻灯片核对。';
+  const lesson = material('slides', 'slides.pptx');
+  lesson.readingWarnings = [warning, '部分 PDF 页面已通过本地 OCR 恢复文字；公式和特殊符号可能不完整，请复核。'];
+  const data = input({ materials: [lesson] });
+  const { settings } = await mockAPI(t, () => modelPlan(data));
+
+  const plan = await service.generatePlan(data, { ...settings, language: 'en' });
+
+  assert.ok(plan.warnings.includes('PPTX contains images. Text inside images was not recognized with OCR; check the original slides.'));
+  assert.ok(plan.warnings.includes('Text was recovered from some PDF pages with local OCR; formulas and special symbols may be incomplete. Review them against the source.'));
+  assert.ok(!plan.warnings.includes(warning));
+});
+
+test('超长材料分片覆盖全文、断点只续读剩余部分，尾部知识和来源进入计划', async t => {
+  const firstBody = '前段概念'.repeat(12000);
+  const middleBody = '中段练习'.repeat(12000);
+  const tail = '尾部唯一章节：极限与导数';
+  const sourceText = `【第 1 页】${firstBody}\n【第 2 页】${middleBody}\n【第 3 页】${tail}${'尾部补充'.repeat(2500)}`;
+  const lesson = material('large', '微积分.pdf', sourceText);
+  lesson.units = 3;
+  lesson.readingWarnings = ['OCR 提示：公式和特殊符号可能不完整。'];
+  const data = input({ materials: [lesson] });
+  const { settings, received } = await mockAPI(t, request => {
+    const payload = userPayload(request);
+    if (payload.purpose === '阅读材料片段') {
+      const pages = payload.material.sourcePages;
+      const referencedPages = payload.material.text.includes(tail)
+        ? pages.filter(page => page.number === 3)
+        : pages.slice(0, 1);
+      return {
+        summary: payload.material.text.includes(tail) ? '尾部唯一章节讲解极限与导数。' : '本片段介绍微积分概念与练习。',
+        source: referencedPages.length
+          ? `${payload.material.name} ${referencedPages.map(page => `第 ${page.number} ${page.unit}`).join('；' + payload.material.name + ' ')}`
+          : payload.material.name
+      };
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') {
+      const summary = payload.materials[0].text;
+      const source = summary.includes('尾部唯一章节') ? '微积分.pdf 第 3 页' : '微积分.pdf 第 1 页';
+      return {
+        summary: '完整阅读材料后安排学习。', difficulty: '入门', warnings: [],
+        knowledge: [{ title: summary.includes('尾部唯一章节') ? '极限与导数' : '微积分基础', priority: '重点', explanation: '掌握材料中的核心概念。', source }]
+      };
+    }
+    if (payload.purpose === '生成学习计划每日安排') {
+      return { days: payload.sessions.map(session => ({
+        ...session, title: session.day === data.days ? '综合测试与复盘' : `第 ${session.day} 天学习`,
+        minutes: 45, tasks: session.day === data.days
+          ? ['完成 5 题小测，用时 10 分钟', '完成 10 题周期测验，用时 20 分钟']
+          : ['完成 5 题小测，用时 10 分钟'],
+        source: '微积分.pdf 第 3 页'
+      })) };
+    }
+    throw new Error('unexpected request purpose: ' + payload.purpose);
+  });
+
+  const controller = new AbortController();
+  let checkpoint;
+  await assert.rejects(service.generatePlan(data, settings, {
+    signal: controller.signal,
+    onCheckpoint: value => {
+      checkpoint = value;
+      if (value.stage === 'materials' && value.nextChunk === 1) controller.abort();
+    }
+  }), /取消/);
+  assert.equal(checkpoint.stage, 'materials');
+  assert.equal(checkpoint.nextChunk, 1);
+  assert.equal(received.filter(request => userPayload(request).purpose === '阅读材料片段').length, 1);
+  await assert.rejects(service.generatePlan(data, settings, {
+    checkpoint: { ...checkpoint, fingerprint: 'damaged' }
+  }), /无法安全恢复/);
+  assert.equal(received.filter(request => userPayload(request).purpose === '阅读材料片段').length, 1);
+
+  const plan = await service.generatePlan(data, settings, { checkpoint });
+  const chunks = received
+    .map(request => userPayload(request))
+    .filter(payload => payload.purpose === '阅读材料片段')
+    .map(payload => payload.material.text);
+  assert.equal(chunks.join(''), sourceText);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.some(chunk => chunk.includes(tail)));
+  assert.match(plan.knowledge[0].title, /极限与导数/);
+  assert.equal(plan.knowledge[0].source, '微积分.pdf 第 3 页');
+  assert.ok(plan.warnings.includes('OCR 提示：公式和特殊符号可能不完整。'));
+  assert.equal(received.filter(request => userPayload(request).purpose === '阅读材料片段').length, chunks.length);
+});
+
+test('材料片段提要不能引用本次请求中不可见的页码', async t => {
+  const sourceText = `【第 1 页】${'第一页内容'.repeat(10000)}\n【第 2 页】${'第二页内容'.repeat(10000)}`;
+  const lesson = material('visible', '可见页.pdf', sourceText);
+  lesson.units = 2;
+  const data = input({ materials: [lesson] });
+  const { settings, received } = await mockAPI(t, request => {
+    const payload = userPayload(request);
+    if (payload.purpose === '阅读材料片段') {
+      const unseen = payload.material.sourcePages.some(page => page.number === 1) ? 2 : 1;
+      return { summary: '片段提要。', source: `${payload.material.name} 第 ${unseen} 页` };
+    }
+    throw new Error('不可见页码应在概要调用前被拒绝。');
+  });
+  await assert.rejects(service.generatePlan(data, settings), /不存在的页码|真实的页码/);
+  assert.equal(received.length, 1);
 });

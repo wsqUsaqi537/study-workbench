@@ -58,10 +58,9 @@ function isOcrCandidate(text) {
     return true;
   }
 
-  const characters = Array.from(value).filter(character => !/[\n\r\t\f]/.test(character));
+  const characters = Array.from(value).filter(character => !/[\n\r\t\f\v\u0085]/.test(character));
   if (characters.length === 0) return false;
-  const controls = characters.filter(character => /[\u0000-\u0008\u000B\u000E-\u001F\u007F-\u009F]/.test(character));
-  return controls.length >= 3 && controls.length / characters.length >= 0.01;
+  return characters.some(character => /[\u0000-\u0008\u000E-\u001F\u007F-\u0084\u0086-\u009F]/.test(character));
 }
 
 function unpackedPath(filePath) {

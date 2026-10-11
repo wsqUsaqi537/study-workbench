@@ -133,22 +133,31 @@ test('短计划沿用旧 purpose，携带日历频率，并省略 token 输出�
   assert.equal(Object.hasOwn(requests[0].body, 'max_completion_tokens'), false);
 });
 
-test('英文短计划将附件截断警告本地化为英语', async t => {
+test('英文短计划分段完整阅读超长附件，不再把已覆盖全文报告为截断', async t => {
   const marker = '【第 1 页】';
   const text = marker + 'x'.repeat(100000 - marker.length);
   const data = input({
     materials: [{ id: 'm1', name: 'lesson.pdf', units: 1, chars: text.length, text }]
   });
-  const requests = installFetch(t, () => response(legacyPlan(data)));
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      return response({ summary: 'Full material segment summary.', source: 'lesson.pdf 第 1 页' });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data, 'en'));
+    return response({ days: generatedDays(payload, 'en') });
+  });
 
   const plan = await service.generatePlan(data, { ...settings, language: 'en' });
 
-  assert.ok(plan.warnings.some(warning => warning.includes('Material text was shortened')));
-  assert.equal(requests[0].payload.purpose, '生成学习计划');
-  assert.equal(Object.hasOwn(requests[0].body, 'max_tokens'), false);
+  assert.equal(plan.warnings.some(warning => warning.includes('Material text was shortened')), false);
+  const materialRequests = requests.filter(request => request.payload.purpose === '阅读材料片段');
+  assert.equal(materialRequests.length, 3);
+  assert.equal(materialRequests.map(request => request.payload.material.text).join(''), text);
+  assert.equal(requests.filter(request => request.payload.purpose === '生成学习计划概要与知识清单').length, 1);
+  assert.ok(requests.every(request => !Object.hasOwn(request.body, 'max_tokens')));
 });
 
-test('60 次学习与 100,000 字材料通过单次概要和七日分批生成', async t => {
+test('60 次学习与 100,000 字材料先完整分段阅读，再按七日分批生成', async t => {
   const startDate = '2026-10-01';
   const marker = '【第 1 页】';
   const sensitive = 'SensitiveMaterialToken';
@@ -161,6 +170,9 @@ test('60 次学习与 100,000 字材料通过单次概要和七日分批生成',
   });
   const events = [];
   const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      return response({ summary: '材料片段覆盖课程正文内容。', source: '课程.pdf 第 1 页' });
+    }
     if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
     assert.equal(payload.purpose, '生成学习计划每日安排');
     return response({ days: generatedDays(payload) });
@@ -169,13 +181,16 @@ test('60 次学习与 100,000 字材料通过单次概要和七日分批生成',
   const plan = await service.generatePlan(data, settings, { onProgress: event => events.push(event) });
 
   assert.equal(plan.days.length, 60);
+  const materialRequests = requests.filter(request => request.payload.purpose === '阅读材料片段');
+  assert.equal(materialRequests.length, 3);
+  assert.equal(materialRequests.map(request => request.payload.material.text).join(''), text);
   assert.equal(requests.filter(request => request.payload.purpose === '生成学习计划概要与知识清单').length, 1);
   const batches = requests.filter(request => request.payload.purpose === '生成学习计划每日安排');
   assert.equal(batches.length, 9);
   assert.ok(batches.every(request => request.payload.sessions.length <= 7));
   assert.equal(batches.at(-1).payload.sessions.at(-1).day, 60);
   assert.match(plan.days.at(-1).tasks.join(' '), /10 题周期测验/);
-  assert.match(JSON.stringify(requests[0].payload.materials), /SensitiveMaterialToken/);
+  assert.match(JSON.stringify(materialRequests.map(request => request.payload.material.text)), /SensitiveMaterialToken/);
   for (const request of requests) {
     assert.equal(Object.hasOwn(request.body, 'max_tokens'), false);
     assert.equal(Object.hasOwn(request.body, 'max_completion_tokens'), false);
