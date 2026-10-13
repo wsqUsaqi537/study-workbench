@@ -93,6 +93,73 @@ test('每日讲解只发送当天引用的材料片段，并命中缓存时不�
   assert.equal(received.length, 1);
 });
 
+test('英文来源页码按物理页选择正确讲解片段，文件名数字不当作页码', async t => {
+  const task = makeTask({ withMaterial: true });
+  const englishSource = 'course2.pdf, pp.1';
+  const text = '【第 1 页】ENGLISH_PAGE_ONE_TOKEN\n\n【第 2 页】ENGLISH_PAGE_TWO_TOKEN';
+  task.materials[0] = { ...task.materials[0], name: 'course2.pdf', text, units: 2, chars: text.length };
+  task.plan.days[0].source = englishSource;
+  task.plan.knowledge[0].source = englishSource;
+  const model = {
+    text: 'Concept: variables store data. Example: total stores a value. Common mistake: a name is not a type. Practice: declare one variable.',
+    sources: [englishSource], limitations: ['Only the cited physical page was sent.']
+  };
+  const received = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, options) => {
+    received.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(model) } }] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  };
+  t.after(() => { global.fetch = originalFetch; });
+  const settings = { endpoint: 'http://localhost/v1', model: 'mock-model', key: 'test-key' };
+
+  const lesson = await tutoring.generateLesson(task, 0, 'brief', settings);
+  const payload = JSON.parse(received[0].messages[1].content);
+  assert.match(payload.materials[0].text, /ENGLISH_PAGE_ONE_TOKEN/);
+  assert.doesNotMatch(payload.materials[0].text, /ENGLISH_PAGE_TWO_TOKEN/);
+  assert.equal(lesson.sources[0], englishSource);
+});
+
+test('逗号连接的多文件来源按最长文件名分段，各自只发送引用页', async t => {
+  const task = makeTask({ withMaterial: true });
+  const materials = [
+    ['a.pdf', 'A'],
+    ['page2.pdf', 'B'],
+    ['a.pdf.backup.pdf', 'C']
+  ].map(([name, marker]) => {
+    const text = `【第 1 页】${marker}_ONLY_PAGE_ONE\n【第 2 页】${marker}_ONLY_PAGE_TWO`;
+    return { id: marker, name, text, units: 2, chars: text.length };
+  });
+  const combinedSource = 'a.pdf page 1, page2.pdf page 1, a.pdf.backup.pdf page 1';
+  task.materials = materials;
+  task.plan.days = task.plan.days.map(day => ({ ...day, source: combinedSource }));
+  task.plan.knowledge = task.plan.knowledge.map(item => ({ ...item, source: combinedSource }));
+  const model = {
+    text: 'Concept: review the cited pages. Example: compare the definitions. Common mistake: use only cited material. Practice: restate the key idea.',
+    sources: [combinedSource], limitations: ['Only the cited physical pages were sent.']
+  };
+  const received = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, options) => {
+    received.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(model) } }] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  };
+  t.after(() => { global.fetch = originalFetch; });
+
+  await tutoring.generateLesson(task, 0, 'brief', { endpoint: 'http://localhost/v1', model: 'mock', key: 'test-key' });
+  const payload = JSON.parse(received[0].messages[1].content);
+  assert.equal(payload.materials.length, 3);
+  for (const [name, marker] of [['a.pdf', 'A'], ['page2.pdf', 'B'], ['a.pdf.backup.pdf', 'C']]) {
+    const excerpt = payload.materials.find(material => material.name === name).text;
+    assert.match(excerpt, new RegExp(`${marker}_ONLY_PAGE_ONE`));
+    assert.doesNotMatch(excerpt, new RegExp(`${marker}_ONLY_PAGE_TWO`));
+  }
+});
+
 test('讲解校验日期、深度及过期缓存；无附件时标记通识补充', async t => {
   const task = makeTask();
   await assert.rejects(tutoring.generateLesson(task, 2, 'brief', {}), /日期/);

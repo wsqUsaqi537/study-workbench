@@ -182,12 +182,24 @@ function relatedKnowledge(knowledge, target, maxItems = 8) {
   return (relevant.length ? relevant : ranked.slice(0, Math.min(3, maxItems))).map(entry => entry.item);
 }
 
-function sourceReferences(source, materialName, materialNames) {
+function sourceReferences(source, materialName, materialText, materialNames) {
   const refs = new Set();
-  for (const citation of source.split(/[;；\n]+/).map(part => part.trim())) {
-    if (!citation.startsWith(materialName)) continue;
-    const fragment = citation.slice(materialName.length);
-    for (const reference of fragment.matchAll(/第\s*(\d+)\s*(页|张幻灯片)/g)) refs.add(reference[1] + '|' + reference[2]);
+  const available = [...materialText.matchAll(/【第\s*(\d+)\s*(页|张幻灯片)】/g)]
+    .map(match => ({ number: Number(match[1]), unit: match[2] }));
+  const names = [...new Set(materialNames)].sort((left, right) => right.length - left.length);
+  const pattern = new RegExp(names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
+  const matches = [...source.matchAll(pattern)];
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+    if (match[0] !== materialName) continue;
+    const fragment = source.slice(match.index + match[0].length, matches[index + 1]?.index ?? source.length);
+    const references = services.extractSourceReferences(fragment);
+    for (const page of available) {
+      if (references.some(reference => reference.valid && reference.unit === page.unit &&
+          page.number >= reference.start && page.number <= reference.end)) {
+        refs.add(page.number + '|' + page.unit);
+      }
+    }
   }
   return refs;
 }
@@ -215,9 +227,10 @@ function excerptMaterialText(material, references, target, remaining) {
 function relevantMaterials(task, sources, target) {
   const citations = [...new Set(sources)];
   const excerpted = [];
+  const materialNames = task.materials.map(material => material.name);
   let remaining = MAX_ATTACHMENT_CONTEXT;
   for (const material of task.materials) {
-    const refs = new Set(citations.flatMap(source => [...sourceReferences(source, material.name)]));
+    const refs = new Set(citations.flatMap(source => [...sourceReferences(source, material.name, material.text, materialNames)]));
     if (!refs.size && !citations.some(source => source.split(/[;；\n]+/).some(part => part.trim() === material.name))) continue;
     const text = excerptMaterialText(material, refs, target, remaining);
     if (!text) continue;

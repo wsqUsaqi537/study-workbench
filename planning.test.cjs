@@ -207,6 +207,223 @@ test('60 次学习与 100,000 字材料先完整分段阅读，再按七日分�
   assert.equal(events.filter(event => event.stage === 'days').at(-1).completed, 60);
 });
 
+test('合计超过 200,000 字的多份材料仍按 40,000 字片段完整阅读', async t => {
+  const firstText = '【第 1 页】' + 'A'.repeat(120000);
+  const secondText = '【第 1 页】' + 'B'.repeat(120000);
+  const data = input({ materials: [
+    { id: 'first', name: 'first.md', units: 1, chars: firstText.length, text: firstText },
+    { id: 'second', name: 'second.md', units: 1, chars: secondText.length, text: secondText }
+  ] });
+  assert.ok(data.materials.reduce((sum, material) => sum + material.chars, 0) > 200000);
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      return response({ summary: `覆盖 ${payload.material.name} 的当前片段。`, source: `${payload.material.name} 第 1 页` });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    return response({ days: generatedDays(payload) });
+  });
+
+  const plan = await service.generatePlan(data, settings);
+
+  assert.equal(plan.days.length, data.days);
+  const materialRequests = requests.filter(request => request.payload.purpose === '阅读材料片段');
+  const reconstructed = new Map(data.materials.map(material => [material.id, '']));
+  for (const request of materialRequests) {
+    const chunk = request.payload.material.text;
+    assert.ok(chunk.length <= 40000);
+    assert.ok(request.body.messages[0].content.length + request.body.messages[1].content.length <= 60000);
+    reconstructed.set(request.payload.material.id, reconstructed.get(request.payload.material.id) + chunk);
+  }
+  assert.equal(reconstructed.get('first'), firstText);
+  assert.equal(reconstructed.get('second'), secondText);
+});
+
+test('超过 2.5M 字材料先完整阅读，再分层归纳且取消可续接组缓存', async t => {
+  const body = 'x'.repeat(2_550_000);
+  const largeText = `【第 1 页】${body.slice(0, 1_300_000)}【第 2 页】${body.slice(1_300_000)}`;
+  const otherText = '【第 7 页】另一个材料的合成内容。';
+  const data = input({
+    days: 8,
+    calendarDays: 8,
+    materials: [
+      { id: 'large', name: 'large.md', units: 1, chars: largeText.length, text: largeText },
+      { id: 'other', name: 'other.md', units: 1, chars: otherText.length, text: otherText }
+    ]
+  });
+  assert.ok(data.materials.reduce((sum, material) => sum + material.chars, 0) > 2_500_000);
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const allRequests = [];
+  let checkpoint;
+  let controller = new AbortController();
+  const createResponder = (invalidSource, requests) => createMockFetch(({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      const refs = payload.material.sourcePages.map(page => `第 ${page.number} ${page.unit}`).join(' ');
+      return response({ summary: 'R'.repeat(1200), source: [payload.material.name, refs].filter(Boolean).join(' ') });
+    }
+    if (payload.purpose === '归纳材料提要') {
+      if (invalidSource && invalidSource(payload)) {
+        return response({ summary: 'C'.repeat(1200), source: invalidSource(payload) });
+      }
+      const page = payload.material.sourcePages.at(-1);
+      const refs = page ? `第 ${page.number} ${page.unit}` : '';
+      return response({ summary: 'C'.repeat(1200), source: [payload.material.name, refs].filter(Boolean).join(' ') });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') {
+      const result = guide(data);
+      result.knowledge[0].source = 'large.md 第 2 页';
+      return response(result);
+    }
+    return response({ days: generatedDays(payload) });
+  }, requests);
+
+  const firstRequests = [];
+  allRequests.push(firstRequests);
+  global.fetch = createResponder(null, firstRequests);
+  await assert.rejects(service.generatePlan(data, settings, {
+    signal: controller.signal,
+    onCheckpoint: value => {
+      if (value.stage === 'materials') {
+        checkpoint = value;
+        if (value.compressions?.length === 1) controller.abort();
+      }
+    }
+  }), error => error.name === 'AbortError');
+  assert.equal(checkpoint.notes.length, checkpoint.nextChunk);
+  assert.equal(checkpoint.compressions.length, 1);
+
+  const rawSegments = firstRequests.filter(request => request.payload.purpose === '阅读材料片段')
+    .map(request => request.payload.material.text);
+  assert.equal(rawSegments.join(''), largeText + otherText);
+  const firstCompression = firstRequests.find(request => request.payload.purpose === '归纳材料提要');
+  assert.equal(firstCompression.payload.range.start, 0);
+  assert.ok(firstCompression.body.messages.every(message => message.content.length <= 60000));
+
+  const tampered = JSON.parse(JSON.stringify(checkpoint));
+  tampered.notes[0].summary = '不同的已读提要';
+  const requestsBeforeTamper = firstRequests.length;
+  await assert.rejects(service.generatePlan(data, settings, { checkpoint: tampered }), /归纳输入与已读材料不匹配/);
+  assert.equal(firstRequests.length, requestsBeforeTamper);
+
+  const failCrossGroup = payload => payload.purpose === '归纳材料提要' && payload.range.start !== 0
+    ? 'large.md 第 2 页'
+    : null;
+  const crossGroupRequests = [];
+  allRequests.push(crossGroupRequests);
+  global.fetch = createResponder(failCrossGroup, crossGroupRequests);
+  await assert.rejects(service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  }), /不存在的页码或幻灯片/);
+  assert.equal(crossGroupRequests.filter(request => request.payload.purpose === '归纳材料提要').length, 1);
+  assert.ok(crossGroupRequests.every(request => request.payload.purpose !== '阅读材料片段'));
+
+  const failUnread = payload => payload.purpose === '归纳材料提要' && payload.range.start !== 0
+    ? 'large.md 第 999 页'
+    : null;
+  const unreadRequests = [];
+  allRequests.push(unreadRequests);
+  global.fetch = createResponder(failUnread, unreadRequests);
+  await assert.rejects(service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  }), /不存在的页码或幻灯片/);
+  assert.equal(unreadRequests.filter(request => request.payload.purpose === '归纳材料提要').length, 1);
+  assert.ok(unreadRequests.every(request => request.payload.purpose !== '阅读材料片段'));
+
+  const resumedRequests = [];
+  allRequests.push(resumedRequests);
+  global.fetch = createResponder(null, resumedRequests);
+  const plan = await service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  });
+
+  assert.equal(plan.days.length, data.days);
+  assert.equal(plan.knowledge[0].source, 'large.md 第 2 页');
+  assert.equal(checkpoint.compressions.length, 8);
+  assert.ok(checkpoint.compressions.some(record => record.source.includes('第 2 页')));
+  assert.ok(resumedRequests.every(request => request.payload.purpose !== '阅读材料片段'));
+  assert.ok(allRequests.flat().every(request => request.body.messages.every(message => message.content.length <= 60000)));
+  assert.ok(allRequests.flat().every(request => !Object.hasOwn(request.body, 'max_tokens')));
+  const finalOutline = resumedRequests.find(request => request.payload.purpose === '生成学习计划概要与知识清单');
+  assert.match(finalOutline.payload.materials[0].text, /第 2 页/);
+  const compressionStartZeroRequests = allRequests.flat()
+    .filter(request => request.payload.purpose === '归纳材料提要' && request.payload.range.start === 0);
+  assert.equal(compressionStartZeroRequests.length, 1);
+  const retriedGroup = allRequests.flat().filter(request => request.payload.purpose === '归纳材料提要' && request.payload.range.start !== 0);
+  assert.equal(retriedGroup.length, 9);
+});
+
+test('第二轮材料提要归纳可取消续接，缺少前轮缓存时拒绝恢复', async t => {
+  const marker = '【第 1 页】';
+  const text = marker + 'x'.repeat(8_000_000 - marker.length);
+  const data = input({
+    days: 8,
+    calendarDays: 8,
+    materials: [{ id: 'large', name: 'large.md', units: 1, chars: text.length, text }]
+  });
+  const longSource = name => {
+    const suffix = ' 第 1 页';
+    return name + ' ' + 'x'.repeat(2000 - name.length - 1 - suffix.length) + suffix;
+  };
+  const responder = requests => createMockFetch(({ payload }) => {
+    if (payload.purpose === '阅读材料片段' || payload.purpose === '归纳材料提要') {
+      return response({
+        summary: (payload.purpose === '阅读材料片段' ? 'R' : 'C').repeat(1200),
+        source: longSource(payload.material.name)
+      });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    return response({ days: generatedDays(payload) });
+  }, requests);
+
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const firstRequests = [];
+  global.fetch = responder(firstRequests);
+  const controller = new AbortController();
+  let checkpoint;
+  await assert.rejects(service.generatePlan(data, settings, {
+    signal: controller.signal,
+    onCheckpoint: value => {
+      if (value.stage === 'materials') {
+        checkpoint = value;
+        if (value.compressions?.some(record => record.round === 2)) controller.abort();
+      }
+    }
+  }), error => error.name === 'AbortError');
+
+  assert.equal(checkpoint.compressions.filter(record => record.round === 1).length, 25);
+  assert.equal(checkpoint.compressions.filter(record => record.round === 2).length, 1);
+  assert.equal(firstRequests.filter(request => request.payload.purpose === '归纳材料提要' && request.payload.round === 2).length, 1);
+
+  const missingPriorRound = JSON.parse(JSON.stringify(checkpoint));
+  const firstRoundCacheIndex = missingPriorRound.compressions.findIndex(record => record.round === 1);
+  missingPriorRound.compressions.splice(firstRoundCacheIndex, 1);
+  const invalidResumeRequests = [];
+  global.fetch = responder(invalidResumeRequests);
+  await assert.rejects(service.generatePlan(data, settings, { checkpoint: missingPriorRound }), /不完整的归纳轮次/);
+  assert.equal(invalidResumeRequests.length, 0);
+
+  const resumedRequests = [];
+  global.fetch = responder(resumedRequests);
+  const plan = await service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  });
+
+  assert.equal(plan.days.length, data.days);
+  assert.equal(checkpoint.compressions.filter(record => record.round === 1).length, 25);
+  assert.equal(checkpoint.compressions.filter(record => record.round === 2).length, 3);
+  assert.ok(resumedRequests.every(request => request.payload.purpose !== '阅读材料片段'));
+  assert.ok(resumedRequests.every(request => request.payload.purpose !== '归纳材料提要' || request.payload.round === 2));
+  assert.equal(resumedRequests.filter(request => request.payload.purpose === '归纳材料提要').length, 2);
+  assert.ok(firstRequests.concat(resumedRequests).every(request =>
+    request.body.messages.every(message => message.content.length <= 60000)));
+  assert.ok(firstRequests.concat(resumedRequests).every(request => !Object.hasOwn(request.body, 'max_tokens')));
+});
+
 test('短计划整体输出 length 后转概要分批', async t => {
   const data = input({ days: 4, calendarDays: 4 });
   const requests = installFetch(t, ({ payload }) => {

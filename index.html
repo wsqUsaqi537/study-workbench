@@ -64,7 +64,6 @@
       <div class="dialog-topline"><span class="eyebrow" data-i18n="从目标开始">从目标开始</span><button class="dialog-close" type="button" data-close="createDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
       <h2 id="createTitle" data-i18n="新建学习计划">新建学习计划</h2>
       <p class="dialog-intro" data-i18n="告诉工作台你想学什么，我们会把它拆成每天可完成的练习。">告诉工作台你想学什么，我们会把它拆成每天可完成的练习。</p>
-      <div id="createError" class="form-message error-message" role="alert" hidden></div>
       <div class="field-grid">
         <label class="field field-wide"><span><span data-i18n="学习主题">学习主题</span> <i>*</i></span><input name="title" type="text" maxlength="120" data-i18n-placeholder="例如：用 Python 完成数据分析入门" placeholder="例如：用 Python 完成数据分析入门" required autocomplete="off"></label>
         <label class="field field-wide"><span><span data-i18n="你的目标">你的目标</span> <i>*</i></span><textarea name="goal" rows="3" maxlength="2000" data-i18n-placeholder="完成这段学习后，你希望能做到什么？" placeholder="完成这段学习后，你希望能做到什么？" required></textarea></label>
@@ -101,15 +100,18 @@
         <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选 · 备考">可选 · 备考</span><h3 id="examOutlineTitle" data-i18n="考试大纲">考试大纲</h3></div><button id="createExamButton" class="button button-small button-outline" type="button" data-action="open-exam-dialog" data-i18n="添加考试大纲">添加考试大纲</button></div>
         <p data-i18n="可填写考试范围或上传大纲文件；自学计划可以跳过。">可填写考试范围或上传大纲文件；自学计划可以跳过。</p>
         <div id="createExamSummary" class="exam-outline-summary" hidden></div>
+        <div id="createExamError" class="form-message error-message" role="alert" hidden></div>
       </section>
       <section id="materialDropZone" class="attachment-box" aria-labelledby="attachmentTitle">
         <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选">可选</span><h3 id="attachmentTitle" data-i18n="学习材料">学习材料</h3></div><button class="button button-small button-outline" type="button" data-action="import-create"><span data-i18n="＋ 添加材料">＋ 添加材料</span></button></div>
         <p data-i18n="点击添加，或将 PDF、DOCX、PPTX、MD、TEX 拖入此处。旧版 DOC/PPT 请先转换；扫描 PDF 将尝试在本机识别。">点击添加，或将 PDF、DOCX、PPTX、MD、TEX 拖入此处。旧版 DOC/PPT 请先转换；扫描 PDF 将尝试在本机识别。</p>
         <div id="createMaterials" class="attachment-list"></div>
         <div id="createMaterialImportStatus" class="material-import-status" hidden><p id="createMaterialImportMessage" role="status" aria-live="polite"></p><button class="inline-remove" type="button" data-action="cancel-material-import" data-import-target="study" data-i18n="取消导入">取消导入</button></div>
+        <div id="createMaterialError" class="form-message error-message" role="alert" hidden></div>
       </section>
       <label id="createConsentWrap" class="consent-row" hidden><input id="createConsent" type="checkbox"><span><strong data-i18n="我同意发送本次添加的材料文字">我同意发送本次添加的材料文字</strong><small data-i18n="生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。">生成计划时，材料文字会发送给已配置的模型服务；未同意时不会发送材料内容。</small></span></label>
       <p id="createLoadingStatus" class="delayed-loading-status" role="status" aria-live="polite" hidden></p>
+      <div id="createError" class="form-message error-message" role="alert" hidden></div>
       <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="createDialog" data-i18n="取消">取消</button><button class="button button-quiet" type="button" data-action="clear-create-draft" data-i18n="清空草稿" hidden>清空草稿</button><button id="createSubmit" class="button button-primary" type="submit"><span class="button-label" data-i18n="生成学习计划">生成学习计划</span><span class="button-spinner" aria-hidden="true"></span></button></div>
     </form>
   </dialog>
@@ -119,14 +121,15 @@
       <div class="dialog-topline"><span class="eyebrow" data-i18n="考试范围">考试范围</span><button class="dialog-close" type="button" data-close="examDialog" data-i18n-aria-label="关闭" aria-label="关闭">×</button></div>
       <h2 id="examDialogTitle" data-i18n="添加考试大纲">添加考试大纲</h2>
       <p class="dialog-intro" data-i18n="写下考试范围、章节或题型，也可以添加 PDF、DOCX、PPTX、MD、TEX 文件。自学可跳过。">写下考试范围、章节或题型，也可以添加 PDF、DOCX、PPTX、MD、TEX 文件。自学可跳过。</p>
-      <div id="examError" class="form-message error-message" role="alert" hidden></div>
       <label class="field"><span data-i18n="考试范围补充">考试范围补充</span><textarea id="examDescription" name="description" rows="5" maxlength="8000" data-i18n-placeholder="例如：重点考查第 2 至 5 章，包含基础概念、公式应用和实验分析。" placeholder="例如：重点考查第 2 至 5 章，包含基础概念、公式应用和实验分析。"></textarea><small class="field-hint" data-i18n="最多 8,000 个字符。">最多 8,000 个字符。</small></label>
       <section id="examMaterialDropZone" class="attachment-box exam-material-zone" aria-labelledby="examMaterialTitle">
         <div class="attachment-heading"><div><span class="section-kicker" data-i18n="可选">可选</span><h3 id="examMaterialTitle" data-i18n="大纲文件">大纲文件</h3></div><button class="button button-small button-outline" type="button" data-action="import-exam-material"><span data-i18n="＋ 添加材料">＋ 添加材料</span></button></div>
         <p data-i18n="点击添加，或将支持的文件拖入此处。">点击添加，或将支持的文件拖入此处。</p>
         <div id="examMaterials" class="attachment-list"></div>
         <div id="examMaterialImportStatus" class="material-import-status" hidden><p id="examMaterialImportMessage" role="status" aria-live="polite"></p><button class="inline-remove" type="button" data-action="cancel-material-import" data-import-target="exam" data-i18n="取消导入">取消导入</button></div>
+        <div id="examMaterialError" class="form-message error-message" role="alert" hidden></div>
       </section>
+      <div id="examError" class="form-message error-message" role="alert" hidden></div>
       <div class="dialog-actions"><button class="button button-quiet" type="button" data-close="examDialog" data-i18n="取消">取消</button><button id="saveExamDraft" class="button button-primary" type="button" data-action="save-exam-draft" data-i18n="保存到计划">保存到计划</button></div>
     </form>
   </dialog>

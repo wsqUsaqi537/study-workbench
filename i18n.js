@@ -30,7 +30,6 @@
     '每日学习任务格式无效。': 'Invalid daily learning tasks.',
     '每日计划内容或时间无效。': 'Invalid daily plan content or time budget.',
     '完成状态无效。': 'Invalid completion status.',
-    '单个任务数据过大，请减少材料。': 'This task is too large. Reduce the attached materials.',
     '请求来源无效。': 'Invalid request origin.',
     '每次最多添加 10 份有效的本机材料。': 'Add up to 10 valid local materials at a time.',
     '最多保存 100 个任务，请先导出并删除旧任务。': 'You can save up to 100 tasks. Export and remove old tasks first.'

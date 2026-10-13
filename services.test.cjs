@@ -212,6 +212,53 @@ test('混合 PDF 与 PPTX 来源逐文件验证页码，交换引用后拒绝计
   assert.throws(() => service.validatePlan(swapped, data, 'ai'), /引用|来源/);
 });
 
+test('来源解析兼容限定的中英文页码格式并逐项验证范围', () => {
+  const pdfText = ['【第 1 页】一', '【第 2 页】二', '【第 3 页】三'].join('\n');
+  const pptText = ['【第 1 张幻灯片】一', '【第 2 张幻灯片】二', '【第 3 张幻灯片】三'].join('\n');
+  const data = input({ materials: [
+    { id: 'pdf', name: 'course2.pdf', text: pdfText, units: 3, chars: pdfText.length },
+    { id: 'pptx', name: 'slides3.pptx', text: pptText, units: 3, chars: pptText.length }
+  ] });
+  const pdfSources = [
+    'course2.pdf 第1页', 'course2.pdf 第1-3页', 'course2.pdf 第1—3页',
+    'course2.pdf 第1、3页', 'course2.pdf, page 1', 'course2.pdf, pages 1-3',
+    'course2.pdf, p.1', 'course2.pdf, p.1.', 'course2.pdf, pp. 1', 'course2.pdf, pages 1/1-3'
+  ];
+  const pptSources = [
+    'slides3.pptx 第 2 张幻灯片', 'slides3.pptx slide 1',
+    'slides3.pptx slides 1-3', 'slides3.pptx, slides 1/1-3'
+  ];
+  for (const source of pdfSources) assert.doesNotThrow(() => service.validateSource(source, data, '来源'), source);
+  for (const source of pptSources) assert.doesNotThrow(() => service.validateSource(source, data, '来源'), source);
+
+  assert.deepEqual(service.extractSourceReferences('page 1/3, pp. 2-3 第4、6页 slides 1–2').map(ref => [ref.start, ref.end, ref.unit]), [
+    [1, 1, '页'], [3, 3, '页'], [2, 3, '页'], [4, 4, '页'], [6, 6, '页'], [1, 2, '张幻灯片']
+  ]);
+  for (const source of [
+    'page 1 course2.pdf',
+    'course2.pdf page 1-3, page 10',
+    'course2.pdf p 1',
+    'course2.pdf slide 1',
+    'slides3.pptx page 1',
+    'course2.pdf page 0',
+    'course2.pdf page -99',
+    'course2.pdf page −99',
+    'course2.pdf page +1',
+    'course2.pdf page 1.5',
+    'course2.pdf page 1.5-3',
+    'course2.pdf page -1-3',
+    'course2.pdf page 0-1',
+    'course2.pdf page 1e6',
+    'course2.pdf page 1E+6',
+    'course2.pdf 第 1 页；page -99',
+    'course2.pdf pages 1-9999999999999',
+    'course2.pdf printed page 99'
+  ]) assert.throws(() => service.validateSource(source, data, '来源'), /来源|页码|幻灯片/ , source);
+  const gapOnly = { materials: [{ ...data.materials[0], text: '【第 1 页】一\n【第 3 页】三' }] };
+  assert.throws(() => service.validateSource('course2.pdf page 1-3', gapOnly, '来源'), /不存在/);
+  assert.throws(() => service.validateSource('course2.pdf', data, '来源'), /真实的页码/);
+});
+
 test('AI 测验沿用五题格式，评分只发送文字答案且验证逐题总和', async t => {
   const data = task();
   const questions = quizQuestions();
@@ -363,11 +410,11 @@ test('真实 DOCX、PPTX 附件可提取，PPTX 页码自然排序', async t => 
   assert.ok(presentation.text.indexOf('Slide 2 内容') < presentation.text.indexOf('Slide 10 内容'));
 });
 
-function samplePDF(content = 'Learning variables and functions') {
+function samplePDF(content = 'Learning variables and functions', width = 612) {
   const stream = content ? `BT /F1 18 Tf 50 720 Td (${content}) Tj ET` : 'q Q';
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`
   ];
   let pdf = '%PDF-1.4\n';
@@ -385,6 +432,11 @@ test('真实 PDF 提取文字，旧格式与空幻灯片有可读错误', async 
   await fs.writeFile(pdfPath, samplePDF());
   const pdf = await service.parseMaterial(pdfPath);
   assert.match(pdf.text, /Learning variables and functions/);
+  const largePdfPath = path.join(dir, 'large.pdf');
+  await fs.writeFile(largePdfPath, samplePDF('Synthetic PDF text. '.repeat(12000), 2000000));
+  const largePdf = await service.parseMaterial(largePdfPath);
+  assert.ok(largePdf.chars > 200000);
+  assert.equal(service.validateInput(input({ materials: [{ id: 'large-pdf', ...largePdf }] })), true);
   const blankPath = path.join(dir, 'blank.pdf');
   await fs.writeFile(blankPath, samplePDF(''));
   await assert.rejects(service.parseMaterial(blankPath), /OCR|文字/);
@@ -441,21 +493,26 @@ test('Markdown 与 TeX 保留原文结构、公式和文件名来源', async t =
   service.validateSource(tex.name, input({ materials: [{ id: 'tex', ...tex }] }), '知识点来源');
 });
 
-test('Markdown 与 TeX 拒绝空文本、过大文件、无效 UTF-8 和二进制内容', async t => {
+test('Markdown 与 TeX 保留长文本并拒绝空文本、过大文件、无效 UTF-8 和二进制内容', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'study-invalid-text-test-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const cases = [
     ['empty.md', Buffer.alloc(0), /文字|文本|空/],
     ['blank.tex', Buffer.from(' \r\n\t', 'utf8'), /文字|文本|空/],
     ['bad-encoding.md', Buffer.from([0x23, 0x20, 0xc3, 0x28]), /UTF-8|编码/],
-    ['binary.tex', Buffer.from('x = 1;\0\n', 'utf8'), /二进制|控制字符/],
-    ['too-many-chars.md', Buffer.from('a'.repeat(200001), 'utf8'), /200,000/]
+    ['binary.tex', Buffer.from('x = 1;\0\n', 'utf8'), /二进制|控制字符/]
   ];
   for (const [name, contents, error] of cases) {
     const filePath = path.join(dir, name);
     await fs.writeFile(filePath, contents);
     await assert.rejects(service.parseMaterial(filePath), error, name);
   }
+
+  const largePath = path.join(dir, 'large.md');
+  await fs.writeFile(largePath, 'Synthetic Markdown lesson. '.repeat(9000), 'utf8');
+  const large = await service.parseMaterial(largePath);
+  assert.ok(large.chars > 200000);
+  assert.equal(service.validateInput(input({ materials: [{ id: 'large-md', ...large }] })), true);
 
   const oversizedPath = path.join(dir, 'oversized.tex');
   const oversized = await fs.open(oversizedPath, 'w');

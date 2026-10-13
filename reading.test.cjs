@@ -168,6 +168,21 @@ function notesXml(text) {
   return `<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder 1"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>${text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>`;
 }
 
+test('PPTX 正文超过 200,000 字仍可完整解析', async t => {
+  const zip = new JSZip();
+  const body = 'Synthetic PPTX lesson. '.repeat(10000);
+  zip.file('ppt/slides/slide1.xml', `<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><a:p><a:r><a:t>${body}</a:t></a:r></a:p></p:cSld></p:sld>`);
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'study-reading-large-pptx-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'large.pptx');
+  await fsp.writeFile(filePath, await zip.generateAsync({ type: 'nodebuffer' }));
+
+  const result = await service.parseMaterial(filePath);
+  assert.ok(result.chars > 200000);
+  assert.equal((result.text.match(/Synthetic PPTX lesson\./g) || []).length, 10000);
+  assert.equal(service.validateInput(input({ materials: [{ id: 'large-slides', ...result }] })), true);
+});
+
 test('PPTX 按关系顺序提取讲者备注并保留公式结构，复杂公式附阅读警告', async t => {
   const zip = new JSZip();
   zip.file('ppt/presentation.xml', '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId r:id="rId2" id="256"/><p:sldId id="257" r:id="rId1"/></p:sldIdLst></p:presentation>');
@@ -320,4 +335,87 @@ test('材料片段提要不能引用本次请求中不可见的页码', async t 
   });
   await assert.rejects(service.generatePlan(data, settings), /不存在的页码|真实的页码/);
   assert.equal(received.length, 1);
+});
+
+test('长合成 PDF 与 PPTX 支持英文物理页码格式并完整保存阅读来源', async t => {
+  const makeLongMaterial = (id, name, unit) => {
+    const text = [1, 2, 3].map(number =>
+      `【第 ${number} ${unit}】${number === 1 ? '印刷页码 99；' : ''}${name}合成内容` +
+      '合成材料段落。'.repeat(12000)).join('\n');
+    return material(id, name, text);
+  };
+  const pdf = makeLongMaterial('pdf', 'chapter page 2.pdf', '页');
+  const pptx = makeLongMaterial('pptx', 'slides3.pptx', '张幻灯片');
+  pdf.units = 3;
+  pptx.units = 3;
+  const data = input({ days: 8, materials: [pdf, pptx] });
+  const pdfSource = 'chapter page 2.pdf pages 1/2/3';
+  const pptxSource = 'slides3.pptx slides 1-3';
+  const { settings: baseSettings, received } = await mockAPI(t, request => {
+    const payload = userPayload(request);
+    if (payload.purpose === '阅读材料片段') {
+      const pages = payload.material.sourcePages.map(page => page.number);
+      const pageList = payload.material.name === pdf.name && pages.includes(1) && pages.includes(2)
+        ? '1'
+        : pages.join('/');
+      const location = payload.material.name.endsWith('.pptx') ? 'slides ' + pageList : 'pages ' + pageList;
+      return { summary: `Read ${payload.material.name} segment.`, source: `${payload.material.name} ${location}` };
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') {
+      return {
+        summary: 'Read all supplied PDF pages and slides.', difficulty: '入门', warnings: [], studyNotes: [],
+        knowledge: [
+          { title: 'PDF 内容', priority: '重点', explanation: '根据 PDF 合成内容整理。', source: pdfSource },
+          { title: 'PPT 内容', priority: '了解', explanation: '根据幻灯片合成内容整理。', source: pptxSource }
+        ]
+      };
+    }
+    if (payload.purpose === '生成学习计划每日安排') {
+      return { days: payload.sessions.map(session => ({
+        day: session.day,
+        date: session.date,
+        title: `第 ${session.day} 天学习`,
+        minutes: 45,
+        tasks: session.day === payload.days
+          ? ['完成 5 题小测，用时 10 分钟', '完成 10 题周期测验，用时 20 分钟']
+          : ['完成 5 题小测，用时 10 分钟'],
+        source: pdfSource
+      })) };
+    }
+    throw new Error('unexpected request purpose: ' + payload.purpose);
+  });
+  const settings = { ...baseSettings, language: 'en' };
+  let checkpoint;
+  const controller = new AbortController();
+  await assert.rejects(service.generatePlan(data, settings, {
+    signal: controller.signal,
+    onCheckpoint: value => {
+      if (value.stage === 'materials') checkpoint = value;
+      if (value.stage === 'materials' && value.nextChunk === 1) controller.abort();
+    }
+  }), /取消/);
+  assert.equal(checkpoint.nextChunk, 1);
+  assert.deepEqual(checkpoint.notes[0].sourcePages, [{ number: 1, unit: '页' }]);
+  const plan = await service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  });
+
+  const readingRequests = received.map(userPayload).filter(payload => payload.purpose === '阅读材料片段');
+  assert.ok(readingRequests.length > 6);
+  for (const sourceMaterial of [pdf, pptx]) {
+    const chunks = readingRequests.filter(payload => payload.material.name === sourceMaterial.name).map(payload => payload.material.text);
+    assert.equal(chunks.join(''), sourceMaterial.text);
+    const savedPages = new Set(checkpoint.notes.filter(note => note.materialId === sourceMaterial.id)
+      .flatMap(note => note.sourcePages.map(page => page.number)));
+    assert.deepEqual([...savedPages].sort((left, right) => left - right), [1, 2, 3]);
+  }
+  assert.ok(checkpoint.notes.some(note => note.materialId === pdf.id && note.source === 'chapter page 2.pdf pages 1' &&
+    note.sourcePages.length === 1 && note.sourcePages[0].number === 1),
+  '页码出现在文件名中时，检查点只保存来源中真正引用的位置');
+  assert.equal(new Set(readingRequests.map(payload => `${payload.material.name}:${payload.material.segment}`)).size,
+    readingRequests.length, '从检查点续接后没有重读已完成片段');
+  assert.match(received.find(request => userPayload(request).purpose === '阅读材料片段').messages[0].content, /不得使用页面上印刷的页码/);
+  assert.deepEqual(plan.knowledge.map(item => item.source), [pdfSource, pptxSource]);
+  assert.ok(plan.days.every(day => day.source === pdfSource));
 });

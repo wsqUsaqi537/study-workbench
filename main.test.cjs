@@ -105,9 +105,51 @@ test('取消或非法备份不改变已保存计划，正确备份可以恢复�
 
 test('过大备份被拒绝且不保存', async t => {
   const h = await harness(t);
-  h.select(' '.repeat(10 * 1024 * 1024 + 1));
-  await assert.rejects(h.invoke('task:import-backup'), /10 MB/);
+  h.select(' '.repeat(40 * 1024 * 1024 + 1));
+  await assert.rejects(h.invoke('task:import-backup'), /40 MB/);
   assert.deepEqual(h.stored(), { tasks: [] });
+});
+
+test('超过 2.5M 字符且大于 10 MiB 的计划仍可恢复并保存', async t => {
+  const h = await harness(t);
+  const text = '【第 1 页】' + 'large-material '.repeat(800000);
+  const base = taskFixture();
+  base.plan.knowledge[0].source = 'large.md 第 1 页';
+  base.plan.days = base.plan.days.map(day => ({ ...day, source: 'large.md 第 1 页' }));
+  const task = {
+    ...base,
+    materials: [{ id: 'large-material', name: 'large.md', text, units: 1, chars: text.length }]
+  };
+  h.select({ format: 'study-workbench-task', task });
+  assert.ok(fs.statSync(path.join(h.dir, 'backup.json')).size > 10 * 1024 * 1024);
+
+  const restored = await h.invoke('task:import-backup');
+
+  assert.equal(restored.task.materials[0].text.length, text.length);
+  await h.invoke('task:save', restored.task);
+  assert.equal(h.stored().tasks[0].materials[0].text.length, text.length);
+  assert.ok(fs.statSync(path.join(h.dir, 'tasks.json')).size > 2.5 * 1024 * 1024);
+});
+
+test('计划启动前按当前任务与新输入的 JSON 字节拒绝超限且不调用 API', async t => {
+  const text = 'x'.repeat(20 * 1024 * 1024);
+  const existing = {
+    ...taskFixture(),
+    materials: [{ id: 'existing-material', name: 'existing.md', text, units: 1, chars: text.length }]
+  };
+  const h = await harness(t, [existing]);
+  const input = {
+    title: '大材料计划', goal: '学习材料', level: 'beginner', startDate: '2026-10-11',
+    days: 2, minutesPerDay: 60,
+    materials: [{ id: 'new-material', name: 'new.md', text, units: 1, chars: text.length }]
+  };
+  const originalFetch = global.fetch;
+  let fetchCount = 0;
+  global.fetch = async () => { fetchCount += 1; throw new Error('unexpected API call'); };
+  t.after(() => { global.fetch = originalFetch; });
+
+  await assert.rejects(h.invoke('plan:generate', input), /40 MB/);
+  assert.equal(fetchCount, 0);
 });
 
 test('旧报告错误题号不会阻止备份恢复与进度保存，历史追问记录保持可读', async t => {

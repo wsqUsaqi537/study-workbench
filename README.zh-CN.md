@@ -6,10 +6,10 @@
 
 ## 下载与安装
 
-下载 1.0.0 版本：
+下载 1.0.1 版本：
 
-- **macOS — Apple 芯片：**[下载 ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.0/study-workbench-1.0.0-mac-arm64.zip)。解压后将“学习工作台”移入“应用程序”。
-- **Windows — x64：**[下载 EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.0/study-workbench-1.0.0-windows-x64.exe)。运行安装程序并按提示操作。
+- **macOS — Apple 芯片：**[下载 ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.1/study-workbench-1.0.1-mac-arm64.zip)。解压后将“学习工作台”移入“应用程序”。
+- **Windows — x64：**[下载 EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.1/study-workbench-1.0.1-windows-x64.exe)。运行安装程序并按提示操作。
 
 安装包未经代码签名，macOS 版本未经公证；Windows 版本尚未在 Windows 电脑上实机测试。
 
@@ -26,7 +26,7 @@
 
 计划和设置保存在本机。可导出计划备份，再从计划页使用 **恢复备份**恢复或迁移到另一台电脑；恢复重复计划时，已有计划会保留。生成内容时，相关信息会发送至所配置的模型服务；发送材料文本前会征求同意。已保存的讲解和测验可再次打开，无需重新请求模型。
 
-仅支持 PDF、DOCX、PPTX、MD、TEX；旧版 DOC/PPT 请先转换，MD/TEX 需为 UTF-8，TEX 按源码读取且不会编译。PDF 提取文本不可读的页面可使用内置中英文 OCR，公式需对照原文核验；PPTX 图片中的文字不会被识别。大型材料会分段读取，可能需要一些时间。
+仅支持 PDF、DOCX、PPTX、MD、TEX；旧版 DOC/PPT 请先转换，MD/TEX 需为 UTF-8，TEX 按源码读取且不会编译。PDF 提取文本不可读的页面可使用内置中英文 OCR，公式需对照原文核验；PPTX 图片中的文字不会被识别。每份材料最多 30 MB。大型材料会分段读取，可能需要一些时间。
 
 ## 致谢与许可
 

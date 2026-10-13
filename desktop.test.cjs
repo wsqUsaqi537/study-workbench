@@ -378,6 +378,14 @@ const apiServer = http.createServer(async (request, response) => {
       gate.resolveObserved(payload);
       await gate.released;
     }
+    if (nextApiFailure?.purpose === purpose) {
+      const failure = nextApiFailure;
+      nextApiFailure = null;
+      record.mockFailure = true;
+      response.writeHead(500, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: failure.message } }));
+      return;
+    }
     const result = responseFor(purpose, payload || {});
     if (response.destroyed) return;
     response.writeHead(200, { 'Content-Type': 'application/json' });
@@ -395,6 +403,11 @@ const apiStarted = new Promise((resolve, reject) => {
 let nextPlanGate = null;
 let nextTutoringGate = null;
 let nextApiGate = null;
+let nextApiFailure = null;
+
+function failNextApiResponse(purpose, message = 'mock API failure') {
+  nextApiFailure = { purpose, message };
+}
 
 function delayNextPlanResponse(purpose = '生成学习计划') {
   let resolveObserved;
@@ -705,6 +718,40 @@ async function setUiLanguage(window, language) {
   await setValue(window, '#profileLanguage', language);
   await waitForJS(window, `document.documentElement.lang === ${JSON.stringify(language)}`, `${language} 界面已应用`);
   await click(window, '[data-close="profileDialog"]', '关闭个人资料语言对话框');
+}
+
+async function inspectInlineAlert(window, selector, contextSelector, anchorSelector = '') {
+  const script = [
+    '(() => {',
+    '  const element = document.querySelector(' + JSON.stringify(selector) + ');',
+    '  const context = document.querySelector(' + JSON.stringify(contextSelector) + ');',
+    '  const anchor = ' + (anchorSelector ? 'document.querySelector(' + JSON.stringify(anchorSelector) + ')' : 'null') + ';',
+    '  if (!element || !context) return null;',
+    '  const box = element.getBoundingClientRect();',
+    '  const dialog = element.closest("dialog");',
+    '  const dialogBox = dialog && dialog.getBoundingClientRect();',
+    '  return {',
+    '    hidden: element.hidden, text: element.textContent.trim(), role: element.getAttribute("role"),',
+    '    inContext: context.contains(element), lastInContext: context.lastElementChild === element, hasBox: element.getClientRects().length > 0 && box.width > 0 && box.height > 0,',
+    '    visibleInViewport: box.top >= 0 && box.bottom <= innerHeight && box.left >= 0 && box.right <= innerWidth,',
+    '    visibleInDialog: Boolean(dialogBox && box.top >= dialogBox.top && box.bottom <= dialogBox.bottom),',
+    '    dialogOpen: Boolean(dialog && dialog.open),',
+    '    beforeAnchor: Boolean(anchor && (element.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_FOLLOWING)),',
+    '    anchorGap: anchor ? anchor.getBoundingClientRect().top - box.bottom : null',
+    '  };',
+    '})()'
+  ].join('\n');
+  return window.webContents.executeJavaScript(script);
+}
+
+function createSparseFixture(filePath, size) {
+  const descriptor = fs.openSync(filePath, 'wx');
+  try {
+    fs.ftruncateSync(descriptor, size);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return filePath;
 }
 
 async function setVisualViewport(window, width, height) {
@@ -2636,14 +2683,214 @@ async function run() {
     await click(window, '#createMaterialImportStatus [data-action="cancel-material-import"]', '取消 mock OCR 导入');
     assert.equal(await Promise.race([mockParseAborted, delay(5000).then(() => null)]), mockOcrPath, '取消按钮应通过 materials:cancel 中断当前解析');
     await waitForJS(window, 'document.querySelector("#createMaterialImportStatus").hidden', '取消后 OCR 状态隐藏');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createMaterialError").hidden'), true, '取消导入不得在学习材料区留下迟到错误');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createError").hidden'), true, '取消导入不得在生成按钮旁留下迟到错误');
     assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#createMaterials .attachment-item").length'), 0, '取消解析不得添加半成品材料');
     assert.equal(apiRecords.length, apiRequestsBeforeOcr, '取消 OCR 后仍不得请求模型服务');
     await click(window, '#createDialog [data-close="createDialog"]', '关闭 OCR mock 新建对话框');
     await waitForJS(window, '!document.querySelector("#createDialog")?.open', 'OCR mock 对话框已清理');
+
+    let resolveLateExamParseStarted;
+    let rejectLateExamParse;
+    const lateExamParseStarted = new Promise(resolve => { resolveLateExamParseStarted = resolve; });
+    const lateExamPath = writeMarkdownFixture('late-exam-import-error.md', '迟到失败 mock');
+    services.parseMaterial = filePath => {
+      resolveLateExamParseStarted(filePath);
+      return new Promise((resolve, reject) => { rejectLateExamParse = reject; });
+    };
+    await openCreateFixture('关闭考纲时迟到错误保护');
+    await click(window, '#createExamButton', '打开迟到错误保护考纲');
+    await waitForJS(window, 'document.querySelector("#examDialog")?.open', '迟到错误保护考纲已打开');
+    const lateExamDrop = await dispatchActualFileDrop(window, lateExamPath, '#examMaterialDropZone');
+    assert.equal(lateExamDrop.prepared, true);
+    assert.equal(await lateExamParseStarted, lateExamPath, '考纲文件应进入延迟 mock parser');
+    await click(window, '#examDialog [data-close="examDialog"]', '导入期间关闭考纲子弹窗');
+    await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#examMaterialImportStatus").hidden', '关闭考纲后导入状态结束');
+    assert.equal(typeof rejectLateExamParse, 'function');
+    rejectLateExamParse(new Error('late mock exam import failure'));
+    await delay(300);
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examMaterialError").hidden'), true, '关闭考纲后迟到失败不得显示在子弹窗文件区');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createExamError").hidden'), true, '关闭考纲后迟到失败不得显示在父弹窗考纲区');
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examError").hidden'), true, '关闭考纲后迟到失败不得显示在保存区');
+    await click(window, '#createDialog [data-close="createDialog"]', '关闭迟到错误保护计划');
+    await waitForJS(window, '!document.querySelector("#createDialog")?.open', '迟到错误保护计划已清理');
   } finally {
     services.parseMaterial = originalParseMaterial;
     dialog.showOpenDialog = originalShowOpenDialog;
   }
+
+  currentStage = '双语验证30 MiB文件大小错误的局部提示、可见滚动和成功重试';
+  const oversizedImportPath = path.join(os.tmpdir(), 'study-workbench-over-30mb-' + process.pid + '-' + Date.now() + '.md');
+  createSparseFixture(oversizedImportPath, 30 * 1024 * 1024 + 1);
+  const apiRequestsBeforeSizeFailures = apiRecords.length;
+  try {
+    for (const language of ['zh-CN', 'en']) {
+      await setUiLanguage(window, language);
+      await openCreateFixture('30 MiB学习材料导入局部错误 ' + language);
+      const oversizedStudyDrop = await dispatchActualFileDrop(window, oversizedImportPath, '#materialDropZone');
+      assert.equal(oversizedStudyDrop.prepared, true, '超大稀疏学习材料应经真实本机文件拖放到达 UI');
+      await waitForJS(window,
+        '!document.querySelector("#createMaterialError").hidden && document.querySelector("#createMaterialImportStatus").hidden',
+        language + '学习材料大小错误应在导入状态结束后显示');
+      const studyImportAlert = await inspectInlineAlert(window, '#createMaterialError', '#materialDropZone');
+      assert.equal(studyImportAlert.role, 'alert');
+      assert.equal(studyImportAlert.hidden, false);
+      assert.equal(studyImportAlert.inContext, true, '学习材料错误必须位于学习材料区');
+      assert.equal(studyImportAlert.lastInContext, true, '学习材料错误必须放在材料区底部');
+      assert.equal(studyImportAlert.hasBox, true);
+      assert.equal(studyImportAlert.visibleInViewport, true, '学习材料错误应滚动到当前可见区域');
+      assert.equal(studyImportAlert.visibleInDialog, true, '学习材料错误应处于新建弹窗可视范围');
+      assert.match(studyImportAlert.text, language === 'en' ? /Each material.*30 MB/ : /每份材料不得超过 30 MB/);
+      assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createError").hidden'), true, '导入失败不得把错误放到标题下方或生成按钮提示区');
+      assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#createMaterials .attachment-item").length'), 0, '超大普通材料不得加入草稿');
+      await captureScreenshot(window, 'import-study-error-' + (language === 'en' ? 'en' : 'zh') + '.png');
+
+      const smallStudyName = 'size-retry-study-' + language + '.md';
+      await dropMaterial(writeMarkdownFixture(smallStudyName, '成功重试后的普通学习材料。'), '#materialDropZone', '#createMaterials', smallStudyName);
+      const clearedStudyAlert = await inspectInlineAlert(window, '#createMaterialError', '#materialDropZone');
+      assert.equal(clearedStudyAlert.hidden, true, '普通材料重试成功后应清除原错误');
+      assert.equal(clearedStudyAlert.text, '');
+      assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createError").hidden'), true);
+
+      await click(window, '#createExamButton', '打开考纲文件大小重试测试');
+      await waitForJS(window, 'document.querySelector("#examDialog")?.open', '考纲文件大小测试子弹窗');
+      const oversizedExamDrop = await dispatchActualFileDrop(window, oversizedImportPath, '#examMaterialDropZone');
+      assert.equal(oversizedExamDrop.prepared, true, '超大稀疏考纲文件应经真实本机文件拖放到达 UI');
+      await waitForJS(window,
+        '!document.querySelector("#examMaterialError").hidden && document.querySelector("#examMaterialImportStatus").hidden',
+        language + '考纲文件大小错误应在导入状态结束后显示');
+      const examImportAlert = await inspectInlineAlert(window, '#examMaterialError', '#examMaterialDropZone');
+      assert.equal(examImportAlert.role, 'alert');
+      assert.equal(examImportAlert.hidden, false);
+      assert.equal(examImportAlert.inContext, true, '考纲材料导入错误必须位于子弹窗文件区');
+      assert.equal(examImportAlert.lastInContext, true, '考纲文件错误必须放在文件区底部');
+      assert.equal(examImportAlert.hasBox, true);
+      assert.equal(examImportAlert.visibleInViewport, true, '考纲文件错误应滚动到当前可见区域');
+      assert.equal(examImportAlert.visibleInDialog, true, '考纲文件错误应处于子弹窗可视范围');
+      assert.match(examImportAlert.text, language === 'en' ? /Each material.*30 MB/ : /每份材料不得超过 30 MB/);
+      assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examError").hidden'), true, '考纲文件导入失败不得出现在保存区');
+      assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createError").hidden'), true, '考纲文件导入失败不得出现在生成按钮错误区');
+      await captureScreenshot(window, 'import-exam-file-error-' + (language === 'en' ? 'en' : 'zh') + '.png');
+
+      await click(window, '#examDialog [data-close="examDialog"]', '关闭有导入错误的考纲子弹窗');
+      await waitForJS(window, '!document.querySelector("#examDialog")?.open', '考纲错误子弹窗关闭');
+      const parentExamAlert = await inspectInlineAlert(window, '#createExamError', '.exam-outline-entry', '#materialDropZone');
+      assert.equal(parentExamAlert.hidden, false, '父弹窗应保留考纲附件导入错误');
+      assert.equal(parentExamAlert.role, 'alert');
+      assert.equal(parentExamAlert.inContext, true, '父弹窗考纲错误必须位于考试大纲区');
+      assert.equal(parentExamAlert.lastInContext, true, '父弹窗考纲错误必须位于考试大纲区底部');
+      assert.equal(parentExamAlert.beforeAnchor, true);
+      assert.ok(parentExamAlert.anchorGap >= 0 && parentExamAlert.anchorGap < 120);
+      assert.equal(parentExamAlert.hasBox, true);
+      assert.equal(parentExamAlert.visibleInViewport, true, '关闭子弹窗后父弹窗考纲错误应可见');
+      assert.equal(parentExamAlert.visibleInDialog, true);
+      assert.match(parentExamAlert.text, language === 'en' ? /Each material.*30 MB/ : /每份材料不得超过 30 MB/);
+      await captureScreenshot(window, 'import-exam-parent-error-' + (language === 'en' ? 'en' : 'zh') + '.png');
+
+      await click(window, '#createExamButton', '重新打开考纲并清除旧错误');
+      await waitForJS(window, 'document.querySelector("#examDialog")?.open', '重试考纲导入时子弹窗重新打开');
+      const smallExamName = 'size-retry-exam-' + language + '.md';
+      await dropMaterial(writeMarkdownFixture(smallExamName, '成功重试后的大纲材料。'), '#examMaterialDropZone', '#examMaterials', smallExamName);
+      for (const selector of ['#examMaterialError', '#createExamError', '#examError']) {
+        const clearedAlert = await window.webContents.executeJavaScript('({ hidden: document.querySelector(' + JSON.stringify(selector) + ').hidden, text: document.querySelector(' + JSON.stringify(selector) + ').textContent.trim() })');
+        assert.deepEqual(clearedAlert, { hidden: true, text: '' }, '考纲材料重试成功后应清除 ' + selector);
+      }
+      await click(window, '#saveExamDraft', '保存成功重试的大纲草稿');
+      await waitForJS(window,
+        '!document.querySelector("#examDialog")?.open && !document.querySelector("#createExamSummary").hidden && document.querySelector("#createExamSummary").innerText.trim().length > 0',
+        '成功重试的大纲已保存到计划草稿');
+      assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createError").hidden'), true, '保存成功的大纲不得留下生成错误');
+      await click(window, '#createExamButton', '确认成功重试的大纲附件已保存在父草稿');
+      await waitForJS(window,
+        'document.querySelector("#examDialog")?.open && document.querySelector("#examMaterials").innerText.includes(' + JSON.stringify(smallExamName) + ')',
+        '重新打开后仍能看到成功重试的大纲附件');
+      await click(window, '#examDialog [data-close="examDialog"]', '关闭已确认附件已保存的考纲草稿');
+      await click(window, '#createDialog [data-close="createDialog"]', '关闭双语导入测试计划');
+      await waitForJS(window, '!document.querySelector("#createDialog")?.open', '双语导入测试草稿已清理');
+    }
+  } finally {
+    fs.rmSync(oversizedImportPath, { force: true });
+  }
+  assert.equal(apiRecords.length, apiRequestsBeforeSizeFailures, '材料大小失败和本地重试均不得调用模型服务');
+  await setUiLanguage(window, 'zh-CN');
+
+  currentStage = '验证考纲校验分别显示在子弹窗保存区和父弹窗考纲区';
+  await openCreateFixture('考纲校验提示局部位置');
+  await click(window, '#createExamButton', '打开考纲校验提示子弹窗');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '考纲校验提示子弹窗已打开');
+  await setValue(window, '#examDescription', '超长考纲'.repeat(2001));
+  await click(window, '#saveExamDraft', '保存超过字符限制的考纲描述');
+  await waitForJS(window, '!document.querySelector("#examError").hidden && !document.querySelector("#createExamError").hidden', '考纲校验错误同时进入子弹窗和父弹窗的专属区域');
+  const saveExamAlert = await inspectInlineAlert(window, '#examError', '#examForm', '#saveExamDraft');
+  assert.equal(saveExamAlert.role, 'alert');
+  assert.equal(saveExamAlert.hidden, false);
+  assert.equal(saveExamAlert.inContext, true);
+  assert.equal(saveExamAlert.hasBox, true);
+  assert.equal(saveExamAlert.visibleInViewport, true, '考纲保存错误应滚动到可见区域');
+  assert.equal(saveExamAlert.visibleInDialog, true);
+  assert.equal(saveExamAlert.beforeAnchor, true, '考纲保存错误应紧邻保存按钮之前');
+  assert.ok(saveExamAlert.anchorGap >= 0 && saveExamAlert.anchorGap < 120, '考纲保存错误应靠近保存按钮');
+  assert.match(saveExamAlert.text, /8,000/);
+  await captureScreenshot(window, 'exam-validation-child-error-zh.png');
+  const parentExamValidation = await inspectInlineAlert(window, '#createExamError', '.exam-outline-entry', '#materialDropZone');
+  assert.equal(parentExamValidation.hidden, false);
+  assert.equal(parentExamValidation.inContext, true, '父弹窗考纲错误应位于考试大纲区底部');
+  assert.equal(parentExamValidation.lastInContext, true);
+  assert.equal(parentExamValidation.beforeAnchor, true);
+  assert.ok(parentExamValidation.anchorGap >= 0 && parentExamValidation.anchorGap < 120);
+  assert.equal(parentExamValidation.role, 'alert');
+  await click(window, '#examDialog [data-close="examDialog"]', '关闭考纲校验错误子弹窗');
+  await waitForJS(window, '!document.querySelector("#examDialog")?.open', '考纲校验错误子弹窗关闭');
+  await captureScreenshot(window, 'exam-validation-parent-error-zh.png');
+  const visibleParentExamValidation = await inspectInlineAlert(window, '#createExamError', '.exam-outline-entry', '#materialDropZone');
+  assert.equal(visibleParentExamValidation.hidden, false);
+  assert.equal(visibleParentExamValidation.visibleInViewport, true, '关闭子弹窗后父弹窗考纲校验错误应可见');
+  assert.equal(visibleParentExamValidation.visibleInDialog, true);
+  await click(window, '#createExamButton', '清除父弹窗考纲校验错误');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open && document.querySelector("#createExamError").hidden', '重新打开后父弹窗考纲错误已清除');
+  await click(window, '#examDialog [data-close="examDialog"]', '关闭已清理的考纲校验子弹窗');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭考纲校验位置测试');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '考纲校验位置测试已清理');
+
+  currentStage = '验证计划生成 API 失败提示紧邻生成按钮';
+  for (const language of ['zh-CN', 'en']) {
+    const imageLanguage = language === 'zh-CN' ? 'zh' : 'en';
+    const title = language === 'zh-CN' ? '计划生成失败局部提示' : 'English plan generation failure alert';
+    if (language === 'en') await setUiLanguage(window, 'en');
+    await openCreateFixture(title);
+    const failedPlanRequestStart = apiRecords.length;
+    failNextApiResponse('生成学习计划', 'desktop mock plan generation failed');
+    try {
+      await click(window, '#createSubmit', `触发 ${imageLanguage} 本地 mock 计划生成失败`);
+      await waitForJS(window, '!document.querySelector("#createError").hidden', `${imageLanguage} 计划生成失败显示在创建表单错误区`);
+    } finally {
+      nextApiFailure = null;
+    }
+    const failedPlanRecord = apiRecords.slice(failedPlanRequestStart).find(record => record.mockFailure);
+    assert.ok(failedPlanRecord, `${imageLanguage} 计划生成失败必须来自本地 API mock`);
+    assert.equal(failedPlanRecord.purpose, '生成学习计划');
+    assert.equal(failedPlanRecord.payload.outputLanguage, language);
+    const createPlanAlert = await inspectInlineAlert(window, '#createError', '#createForm', '#createSubmit');
+    assert.equal(createPlanAlert.role, 'alert');
+    assert.equal(createPlanAlert.hidden, false);
+    assert.equal(createPlanAlert.inContext, true);
+    assert.equal(createPlanAlert.hasBox, true);
+    assert.equal(createPlanAlert.visibleInViewport, true, '计划生成错误应滚动到生成按钮旁的可见区域');
+    assert.equal(createPlanAlert.visibleInDialog, true);
+    assert.equal(createPlanAlert.beforeAnchor, true, '计划生成错误应位于提交按钮之前');
+    assert.ok(createPlanAlert.anchorGap >= 0 && createPlanAlert.anchorGap < 120, '计划生成错误应紧邻提交按钮');
+    await captureScreenshot(window, `plan-generation-error-${imageLanguage}.png`);
+    if (language === 'en') {
+      assert.match(createPlanAlert.text, /API request failed \(HTTP 500\)\. Check the model name and API key\./);
+      assert.doesNotMatch(createPlanAlert.text, /API 请求失败|请检查/);
+    } else assert.match(createPlanAlert.text, /API 请求失败（HTTP 500）/);
+    assert.doesNotMatch(createPlanAlert.text, /Error invoking remote method/);
+    assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createDialog").open'), true, 'API 失败后仍留在新建表单');
+    assert.equal((await readState(window)).tasks.some(task => task.title === title), false, 'API 失败不得保存半成品计划');
+    await click(window, '#createDialog [data-close="createDialog"]', `关闭 ${imageLanguage} 计划生成失败测试`);
+    await waitForJS(window, '!document.querySelector("#createDialog")?.open', `${imageLanguage} 计划生成失败测试已清理`);
+  }
+  await setUiLanguage(window, 'zh-CN');
 
   currentStage = '验证多批材料达到10份后编辑删1再新增，并拒绝第11份';
   await openCreateFixture('考纲材料10份编辑边界');
@@ -2668,7 +2915,8 @@ async function run() {
   await waitForJS(window, 'document.querySelectorAll("#examMaterials .attachment-item").length === 0', '删除考纲附件后草稿空位已释放');
   const replacementOutlineName = 'count-outline-replacement.md';
   await dropMaterial(writeMarkdownFixture(replacementOutlineName, '替换后的考纲。'), '#examMaterialDropZone', '#examMaterials', replacementOutlineName);
-  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examError").hidden'), true, '删除一份后新增一份不得因旧材料计数而误拒绝');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#examMaterialError").hidden'), true, '删除一份后新增一份不得因旧材料计数而误拒绝');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createExamError").hidden'), true, '合法新增不得在父弹窗留下考纲错误');
   await click(window, '#saveExamDraft', '保存替换后的10份材料考纲');
   await waitForJS(window, '!document.querySelector("#examDialog")?.open && document.querySelector("#createExamSummary").innerText.includes("1")', '替换考纲保存后总量仍为10份');
 
@@ -2685,8 +2933,9 @@ async function run() {
   const overflowName = 'count-overflow-11.md';
   const overflowDrop = await dispatchActualFileDrop(window, writeMarkdownFixture(overflowName, '第11份材料。'), '#examMaterialDropZone');
   assert.equal(overflowDrop.prepared, true);
-  await waitForJS(window, '!document.querySelector("#examError").hidden', '连续多批材料达到10份后拒绝第11份');
-  assert.match(await window.webContents.executeJavaScript('document.querySelector("#examError").innerText'), /最多 10 份/);
+  await waitForJS(window, '!document.querySelector("#examMaterialError").hidden', '连续多批材料达到10份后拒绝第11份');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#examMaterialError").innerText'), /最多 10 份/);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createExamError").hidden'), false, '第11份考纲文件还应在父弹窗考纲区显示局部错误');
   assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#examMaterials .attachment-item").length'), 1, '超限材料不得进入草稿');
   await click(window, '#examDialog [data-close="examDialog"]', '关闭10份材料边界考纲');
   await click(window, '#createDialog [data-close="createDialog"]', '关闭10份材料边界计划');
@@ -2794,22 +3043,39 @@ async function run() {
   assert.equal(Object.hasOwn(gradeRecord.payload, 'examContext'), false, '评分请求不应重复发送考试范围上下文');
   assert.doesNotMatch(gradeRecord.requestBody.messages[1].content, /考试覆盖循环边界条件|COMBINED_EXAM_BODY_MARKER_0610/, '评分请求不应重复携带考纲文字或附件');
 
-  currentStage = '阻止考纲与学习材料合计超过200000字';
-  await openCreateFixture('学习材料总量边界测试');
-  const budgetStudyName = 'budget-study-120001.md';
-  await dropMaterial(writeMarkdownFixture(budgetStudyName, 'a'.repeat(120001)), '#materialDropZone', '#createMaterials', budgetStudyName);
-  await click(window, '#createExamButton', '打开材料总量边界考纲');
-  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '材料总量边界考纲对话框');
+  currentStage = '接受合计超过200000字符的study与考纲材料并成功保存草稿';
+  await openCreateFixture('超20万字符材料草稿');
+  const apiRequestsBeforeCharacterBoundary = apiRecords.length;
+  const budgetStudyName = 'budget-study-200001.md';
+  await dropMaterial(writeMarkdownFixture(budgetStudyName, 'a'.repeat(200001)), '#materialDropZone', '#createMaterials', budgetStudyName);
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createMaterialError").hidden'), true, '单份超过200,000字符的学习材料应成功导入');
+  await click(window, '#createExamButton', '打开超20万字符材料考纲');
+  await waitForJS(window, 'document.querySelector("#examDialog")?.open', '超20万字符材料考纲对话框');
   const budgetExamName = 'budget-exam-80001.md';
   const budgetExamDrop = await dispatchActualFileDrop(window, writeMarkdownFixture(budgetExamName, 'b'.repeat(80001)), '#examMaterialDropZone');
-  assert.equal(budgetExamDrop.prepared, true, '超限考纲文件仍应通过真实文件拖放流程到达 UI');
-  await waitForJS(window, '!document.querySelector("#examError").hidden && document.querySelector("#examMaterialImportStatus").hidden', '超出 200,000 字的合计材料量被拒绝并结束导入');
-  assert.match(await window.webContents.executeJavaScript('document.querySelector("#examError").textContent'), /200,000/);
-  assert.equal(await window.webContents.executeJavaScript('document.querySelectorAll("#examMaterials .attachment-item").length'), 0, '超限考纲附件不得进入草稿');
-  await click(window, '#examDialog [data-close="examDialog"]', '取消超限考纲草稿');
-  await click(window, '#createDialog [data-close="createDialog"]', '取消材料总量边界计划');
-  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '材料总量边界测试已清理');
-  assert.equal(apiRecords.some(record => record.purpose === '生成学习计划' && record.payload.title === '学习材料总量边界测试'), false, '超限材料测试不得调用模型');
+  assert.equal(budgetExamDrop.prepared, true, '大于200,000字符合计的考纲文件应经真实文件拖放流程到达 UI');
+  await waitForJS(window,
+    'document.querySelector("#examMaterials").innerText.includes(' + JSON.stringify(budgetExamName) + ') && document.querySelector("#examMaterialImportStatus").hidden',
+    '超出200,000字符总量的考纲文件成功导入');
+  for (const selector of ['#createMaterialError', '#examMaterialError', '#examError', '#createExamError', '#createError']) {
+    const errorState = await window.webContents.executeJavaScript('({ hidden: document.querySelector(' + JSON.stringify(selector) + ').hidden, text: document.querySelector(' + JSON.stringify(selector) + ').textContent.trim() })');
+    assert.deepEqual(errorState, { hidden: true, text: '' }, '超过字符总量后不得显示 ' + selector + ' 错误');
+  }
+  await click(window, '#saveExamDraft', '保存超过字符总量的考纲草稿');
+  await waitForJS(window,
+    '!document.querySelector("#examDialog")?.open && !document.querySelector("#createExamSummary").hidden && document.querySelector("#createExamSummary").innerText.includes("1 份大纲文件")',
+    '超过字符总量的考纲已成功保存到计划草稿');
+  assert.equal(await window.webContents.executeJavaScript('document.querySelector("#createError").hidden'), true, '保存超20万字符材料草稿不得显示字符限制错误');
+  await click(window, '#createExamButton', '重新打开已保存的超20万字符考纲草稿');
+  await waitForJS(window,
+    'document.querySelector("#examDialog")?.open && document.querySelectorAll("#examMaterials .attachment-item").length === 1',
+    '已保存的超20万字符考纲附件可重新打开');
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#examMaterials").innerText'), /budget-exam-80001\.md/);
+  assert.match(await window.webContents.executeJavaScript('document.querySelector("#createMaterials").innerText'), /budget-study-200001\.md.*200001/);
+  await click(window, '#examDialog [data-close="examDialog"]', '关闭已保存的超20万字符考纲草稿');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭超20万字符材料草稿测试');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '超20万字符材料草稿测试已清理');
+  assert.equal(apiRecords.length, apiRequestsBeforeCharacterBoundary, '材料字符总量测试不应调用模型');
 
   currentStage = '分别展示新 studyNotes、旧 warning 分类与材料阅读提示';
   let visualTask = JSON.parse(JSON.stringify((await readState(window)).tasks.find(task => task.id === combinedExamPlan.saved.id)));
@@ -3262,7 +3528,10 @@ async function captureDialog(name, selector, language, width) {
   assert.equal(clearedSettings.key, undefined);
   const regressionAdjustmentRequests = apiRecords.filter(record => record.purpose === '调整后续学习规划' && record.payload?.title === regressionTitle);
   assert.equal(regressionAdjustmentRequests.length, 1, '跳过已完成日回归测试应单独发起一次模拟调整请求');
-  const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record));
+  const planFailureMocks = apiRecords.filter(record => record.mockFailure);
+  assert.equal(planFailureMocks.length, 2, '双语计划失败位置测试应各触发一次显式注入的本地 mock 失败');
+  assert.deepEqual(planFailureMocks.map(record => record.payload.outputLanguage), ['zh-CN', 'en']);
+  const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record) && !record.mockFailure);
   assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈', '阅读材料片段'].includes(purpose)), [
     '连接测试',
     '生成周期测验',

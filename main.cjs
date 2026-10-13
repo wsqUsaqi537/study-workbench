@@ -10,6 +10,8 @@ const i18n = require('./i18n.js');
 const schedule = require('./schedule.js');
 const cadence = require('./cadence.cjs');
 
+const MAX_LOCAL_DATA_BYTES = 40 * 1024 * 1024;
+
 let window;
 let state;
 let settings;
@@ -34,9 +36,14 @@ function readJSON(name, fallback) {
   }
 }
 
-function writeJSON(name, value) {
+function serializeJSON(value) {
   const content = JSON.stringify(value, null, 2);
-  if (Buffer.byteLength(content) > 40 * 1024 * 1024) throw new Error('本地数据超过 40 MB，请导出并删除不再使用的任务。');
+  if (Buffer.byteLength(content) > MAX_LOCAL_DATA_BYTES) throw new Error('本地数据超过 40 MB，请导出并删除不再使用的任务。');
+  return content;
+}
+
+function writeJSON(name, value) {
+  const content = serializeJSON(value);
   const temp = file(`${name}.tmp`);
   fs.writeFileSync(temp, content, { mode: 0o600 });
   fs.renameSync(temp, file(name));
@@ -132,7 +139,6 @@ function validateTask(task) {
   if (task.plan.studyNotes !== undefined) services.validateStudyNotes(task.plan.studyNotes);
   assessments.validateAssessmentRecords(task);
   tutoring.validateTutoringRecords(task);
-  if (JSON.stringify(task).length > 2500000) throw new Error('单个任务数据过大，请减少材料。');
 }
 
 function fingerprint(value) {
@@ -246,9 +252,9 @@ function registerHandlers() {
     activeCredentials();
     if (!Array.isArray(filePaths) || filePaths.length !== 1) throw new Error('请选择一份学习计划 JSON 备份。');
     const stats = fs.statSync(filePaths[0]);
-    if (!stats.isFile() || stats.size > 10 * 1024 * 1024) throw new Error('备份文件超过 10 MB 或不是普通文件。');
+    if (!stats.isFile() || stats.size > MAX_LOCAL_DATA_BYTES) throw new Error('备份文件超过 40 MB 或不是普通文件。');
     const content = fs.readFileSync(filePaths[0], 'utf8');
-    if (Buffer.byteLength(content) > 10 * 1024 * 1024) throw new Error('备份文件超过 10 MB 或不是普通文件。');
+    if (Buffer.byteLength(content) > MAX_LOCAL_DATA_BYTES) throw new Error('备份文件超过 40 MB 或不是普通文件。');
     let backup;
     try { backup = JSON.parse(content); } catch { throw new Error('备份不是有效的 JSON 文件。'); }
     if (!services.isPlainObject(backup) || backup.format !== 'study-workbench-task' || !services.isPlainObject(backup.task)) throw new Error('这不是学习工作台导出的计划备份。');
@@ -283,6 +289,7 @@ function registerHandlers() {
   handle('plan:generate', async (input, requestId = randomUUID()) => {
     const config = activeCredentials();
     services.validateInput(input);
+    serializeJSON({ tasks: [...state.tasks, input] });
     if (typeof requestId !== 'string' || requestId.length > 100) throw new Error('计划请求编号无效。');
     planGeneration?.controller.abort();
     const controller = new AbortController();

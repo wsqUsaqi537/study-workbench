@@ -405,6 +405,37 @@
     element.hidden = !message;
   }
 
+  function setInlineMessage(element, message, type = 'error') {
+    if (typeof message === 'string') message = message.replace(/^Error invoking remote method ['"][^'"]+['"]:\s*(?:Error:\s*)?/, '');
+    setMessage(element, message, type);
+    if (message && type !== 'success' && !($('#examDialog').open && element?.closest('dialog') !== $('#examDialog'))) {
+      element?.scrollIntoView?.({ block: 'nearest' });
+    }
+  }
+
+  function setExamDraftError(message, type = 'error') {
+    setInlineMessage($('#examError'), message, type);
+    setInlineMessage($('#createExamError'), message, type);
+  }
+
+  function setMaterialImportError(target, message, type = 'error') {
+    if (target === 'exam') {
+      setInlineMessage($('#examMaterialError'), message, type);
+      setInlineMessage($('#createExamError'), message, type);
+    } else setInlineMessage($('#createMaterialError'), message, type);
+  }
+
+  function clearCreateDialogErrors() {
+    ['#createError', '#createMaterialError', '#createExamError', '#examError', '#examMaterialError']
+      .forEach(selector => setInlineMessage($(selector), ''));
+  }
+
+  function materialImportErrorMessage(error) {
+    const message = typeof error?.message === 'string' ? error.message.trim() : '';
+    const detail = message.replace(/^(?:(?:failed to import materials|could not import materials|material import failed)\s*[:：]\s*|导入材料失败[：:]\s*)/i, '').trim();
+    return detail || t("导入材料失败，请检查文件后重试。");
+  }
+
   function toast(message) {
     const element = $('#toast');
     const messageKey = findMessageKey(message);
@@ -880,7 +911,7 @@
     cancelMaterialImport();
     restoreCreateDialogDraft(null);
     resetGoalDiscussion();
-    setMessage($('#createError'), '');
+    clearCreateDialogErrors();
     renderCreateMaterials();
     renderCreateExamSummary();
     updateCreateCadenceControls();
@@ -1086,7 +1117,7 @@
     examDialogSessionId += 1;
     createSessionId += 1;
     createActivity = null;
-    setMessage($('#createError'), '');
+    clearCreateDialogErrors();
     setMessage($('#clarifyError'), '');
     renderCreateMaterials();
     renderCreateExamSummary();
@@ -1141,13 +1172,14 @@
 
   function openExamDialog() {
     if (!$('#createDialog').open) return;
-    if (createActivity) return toast(t("当前生成操作完成后再继续。"));
-    if (materialImportBusy) return toast(t("正在导入材料，请稍候。"));
+    if (createActivity) return setInlineMessage($('#createExamError'), t("当前生成操作完成后再继续。"), 'warning');
+    if (materialImportBusy) return setInlineMessage($('#createExamError'), t("正在导入材料，请稍候。"), 'warning');
     examDialogSessionId += 1;
     examDraft = { description: createExamDescription, materials: clone(createExamMaterials) };
     $('#examDescription').value = examDraft.description;
     $('#examMaterials').innerHTML = '';
-    setMessage($('#examError'), '');
+    setExamDraftError('');
+    setInlineMessage($('#examMaterialError'), '');
     renderExamMaterials();
     $('#examDialog').showModal();
     window.setTimeout(() => $('#examDescription').focus(), 0);
@@ -1155,20 +1187,22 @@
 
   function saveExamDraft() {
     if (!examDraft || !$('#examDialog').open) return;
-    if (materialImportBusy) return setMessage($('#examError'), t("正在导入材料，请稍候。"), 'warning');
+    setExamDraftError('');
+    if (materialImportBusy) return setExamDraftError(t("正在导入材料，请稍候。"), 'warning');
     const description = $('#examDescription').value;
-    if (description.length > 8000) return setMessage($('#examError'), t("考试范围补充最多 8,000 个字符。"), 'warning');
+    if (description.length > 8000) return setExamDraftError(t("考试范围补充最多 8,000 个字符。"), 'warning');
     const materials = [...createMaterials, ...examDraft.materials];
-    const totalChars = materials.reduce((sum, item) => sum + (typeof item.text === 'string' ? item.text.length : Number(item.chars) || 0), 0);
-    if (materials.length > 10) return setMessage($('#examError'), t("学习材料与大纲文件合计最多 10 份。"), 'warning');
-    if (totalChars > 200000) return setMessage($('#examError'), t("学习材料与大纲文件的文字总量不能超过 200,000 字。"), 'warning');
+    if (materials.length > 10) return setExamDraftError(t("学习材料与大纲文件合计最多 10 份。"), 'warning');
     createExamDescription = description.trim();
     createExamMaterials = clone(examDraft.materials);
     examDraft = null;
     invalidateGoalDiscussion();
     renderCreateExamSummary();
     refreshCreateConsent();
-    setMessage($('#createError'), '');
+    setExamDraftError('');
+    setInlineMessage($('#examMaterialError'), '');
+    setInlineMessage($('#createError'), '');
+    setInlineMessage($('#createMaterialError'), '');
     $('#examDialog').close();
     toast(t("考试大纲已添加到新建计划。"));
   }
@@ -1235,10 +1269,6 @@
     }
   }
 
-  function materialTextLength(material) {
-    return typeof material?.text === 'string' ? material.text.length : Number(material?.chars) || 0;
-  }
-
   function addImportedMaterials(imported, activity) {
     if (!materialImportIsCurrent(activity)) return;
     if (!Array.isArray(imported) || imported.length === 0) return;
@@ -1252,16 +1282,16 @@
     });
     if (!added.length) return;
     const totalCount = existingMaterials.length + added.length;
-    const totalChars = [...existingMaterials, ...added].reduce((sum, item) => sum + materialTextLength(item), 0);
     if (totalCount > 10) throw new Error(t("学习材料与大纲文件合计最多 10 份。"));
-    if (totalChars > 200000) throw new Error(t("学习材料与大纲文件的文字总量不能超过 200,000 字。"));
     if (activity.target === 'exam') {
       examDraft.materials.push(...added);
       renderExamMaterials();
-      setMessage($('#examError'), '');
+      setInlineMessage($('#examMaterialError'), '');
+      setExamDraftError('');
     } else {
       createMaterials.push(...added);
-      setMessage($('#createError'), '');
+      setInlineMessage($('#createMaterialError'), '');
+      setInlineMessage($('#createError'), '');
       invalidateGoalDiscussion();
       renderCreateMaterials();
     }
@@ -1270,12 +1300,13 @@
 
   async function importMaterials(target = 'study', files = null) {
     if (!apiEnabled()) return openSettings();
-    if (createActivity) return toast(t("当前操作完成后再添加材料。"));
-    if (materialImportBusy) return toast(t("正在导入材料，请稍候。"));
     if (target === 'exam' && (!$('#examDialog').open || !examDraft)) return;
-    if (!api?.importMaterials && !files) return toast(t("当前运行环境没有文件导入服务。"));
-    if (files && !api?.importDroppedMaterials) return toast(t("当前运行环境没有拖入材料服务。"));
-    if (files && currentCreateMaterials(target === 'exam').length + files.length > 10) return setMessage(target === 'exam' ? $('#examError') : $('#createError'), t("学习材料与大纲文件合计最多 10 份。"));
+    setMaterialImportError(target, '');
+    if (createActivity) return setMaterialImportError(target, t("当前操作完成后再添加材料。"), 'warning');
+    if (materialImportBusy) return setMaterialImportError(target, t("正在导入材料，请稍候。"), 'warning');
+    if (!api?.importMaterials && !files) return setMaterialImportError(target, t("当前运行环境没有文件导入服务。"));
+    if (files && !api?.importDroppedMaterials) return setMaterialImportError(target, t("当前运行环境没有拖入材料服务。"));
+    if (files && currentCreateMaterials(target === 'exam').length + files.length > 10) return setMaterialImportError(target, t("学习材料与大纲文件合计最多 10 份。"), 'warning');
     const activity = materialImportContext(target, makeId());
     activeMaterialImport = activity;
     materialImportBusy = true;
@@ -1288,7 +1319,7 @@
       if (!materialImportIsCurrent(activity)) return;
       addImportedMaterials(imported, activity);
     } catch (error) {
-      if (materialImportIsCurrent(activity)) setMessage(target === 'exam' ? $('#examError') : $('#createError'), error.message || t("导入材料失败，请检查文件后重试。"));
+      if (materialImportIsCurrent(activity)) setMaterialImportError(target, materialImportErrorMessage(error));
     } finally {
       if (activeMaterialImport?.requestId === activity.requestId) {
         activeMaterialImport = null;
@@ -1330,12 +1361,12 @@
   }
 
   function validateCreateInput(input, errorElement = $('#createError')) {
-    if (!input.title || !input.goal) return setMessage(errorElement, t("请填写学习主题和目标。"), 'warning'), false;
-    if (!input.startDate || !dateObject(input.startDate)) return setMessage(errorElement, t("请选择有效的开始日期。")), false;
-    if (!Number.isInteger(input.calendarDays) || input.calendarDays < 2 || input.calendarDays > 180) return setMessage(errorElement, t("日历跨度需要在 2 到 180 天之间。")), false;
-    try { schedule.validateScheduleInput(input); } catch (error) { return setMessage(errorElement, t(error.message)), false; }
-    if (!Number.isInteger(input.minutesPerDay) || input.minutesPerDay < 15 || input.minutesPerDay > 480) return setMessage(errorElement, t("每天投入需要在 15 到 480 分钟之间。")), false;
-    if (!['exam', 'balanced', 'deep'].includes(input.learningMode)) return setMessage(errorElement, t("请选择有效的学习方式。")), false;
+    if (!input.title || !input.goal) return setInlineMessage(errorElement, t("请填写学习主题和目标。"), 'warning'), false;
+    if (!input.startDate || !dateObject(input.startDate)) return setInlineMessage(errorElement, t("请选择有效的开始日期。")), false;
+    if (!Number.isInteger(input.calendarDays) || input.calendarDays < 2 || input.calendarDays > 180) return setInlineMessage(errorElement, t("日历跨度需要在 2 到 180 天之间。")), false;
+    try { schedule.validateScheduleInput(input); } catch (error) { return setInlineMessage(errorElement, t(error.message)), false; }
+    if (!Number.isInteger(input.minutesPerDay) || input.minutesPerDay < 15 || input.minutesPerDay > 480) return setInlineMessage(errorElement, t("每天投入需要在 15 到 480 分钟之间。")), false;
+    if (!['exam', 'balanced', 'deep'].includes(input.learningMode)) return setInlineMessage(errorElement, t("请选择有效的学习方式。")), false;
     return true;
   }
 
@@ -1394,14 +1425,14 @@
   async function createPlan(event) {
     event?.preventDefault();
     if (!apiEnabled()) return openSettings();
-    if (createActivity) return toast(t("当前生成操作完成后再继续。"));
-    if (materialImportBusy) return setMessage($('#createError'), t("正在导入材料，请稍候。"), 'warning');
+    if (createActivity) return setInlineMessage($('#createError'), t("当前生成操作完成后再继续。"), 'warning');
+    if (materialImportBusy) return setInlineMessage($('#createError'), t("正在导入材料，请稍候。"), 'warning');
     const form = $('#createForm');
     const error = $('#createError');
-    setMessage(error, '');
+    setInlineMessage(error, '');
     const input = currentCreateInput();
     if (!validateCreateInput(input, error)) return;
-    if (hasUnconsentedMaterials(input)) return setMessage(error, t("本次计划包含材料文字。请先勾选同意，之后才会发送给模型服务。"), 'warning');
+    if (hasUnconsentedMaterials(input)) return setInlineMessage(error, t("本次计划包含材料文字。请先勾选同意，之后才会发送给模型服务。"), 'warning');
     const sessionId = createSessionId;
     const epoch = configEpoch;
     const snapshot = createInputSnapshot();
@@ -1431,7 +1462,7 @@
       $('#createDialog').close();
       toast(t("学习计划已生成并保存。"));
     } catch (errorValue) {
-      if (sessionId === createSessionId && epoch === configEpoch) setMessage(error, errorValue.message || t("生成学习计划失败，请稍后重试。"));
+      if (sessionId === createSessionId && epoch === configEpoch) setInlineMessage(error, errorValue.message || t("生成学习计划失败，请稍后重试。"));
     } finally {
       if (createActivity?.id === requestId) {
         clearDelayedLoading(createActivity);
@@ -2584,10 +2615,15 @@
     else if (action === 'import-create') await importMaterials();
     else if (action === 'remove-exam-material') {
       examDraft?.materials.splice(Number(button.dataset.materialIndex), 1);
+      setInlineMessage($('#examMaterialError'), '');
+      setExamDraftError('');
+      setInlineMessage($('#createError'), '');
       renderExamMaterials();
     } else if (action === 'preview-exam-material') showMaterial(examDraft?.materials[Number(button.dataset.materialIndex)]);
     else if (action === 'remove-create-material') {
       createMaterials.splice(Number(button.dataset.materialIndex), 1);
+      setInlineMessage($('#createMaterialError'), '');
+      setInlineMessage($('#createError'), '');
       invalidateGoalDiscussion();
       renderCreateMaterials();
     } else if (action === 'preview-create-material') showMaterial(createMaterials[Number(button.dataset.materialIndex)]);
@@ -2623,12 +2659,18 @@
     if (!['title', 'goal', 'level', 'learningMode', 'startDate', 'days', 'minutesPerDay', 'cadenceMode', 'cadenceWeekday'].includes(fieldName)) return;
     if (['title', 'goal', 'level', 'learningMode'].includes(fieldName)) invalidateGoalDiscussion();
     else invalidatePendingClarification();
-    setMessage($('#createError'), '');
+    setInlineMessage($('#createError'), '');
     updateCreateCadenceControls();
       updateCreateDraftControls();
   };
   $('#createForm').addEventListener('input', handleCreateInputChange);
   $('#createForm').addEventListener('change', handleCreateInputChange);
+  const clearExamDraftErrors = () => {
+    setExamDraftError('');
+    setInlineMessage($('#examMaterialError'), '');
+  };
+  $('#examDescription').addEventListener('input', clearExamDraftErrors);
+  $('#examDescription').addEventListener('change', clearExamDraftErrors);
   $('#clarifyInput').addEventListener('input', updateCreateDraftControls);
   $('#cadenceForm').addEventListener('submit', event => { event.preventDefault(); previewCadence(); });
   const invalidateCadencePreview = event => {
@@ -2702,7 +2744,7 @@
     setBusy($('#createSubmit'), false);
     $('#createLoadingStatus').hidden = true;
     $('#createLoadingStatus').textContent = '';
-    setMessage($('#createError'), '');
+    clearCreateDialogErrors();
     if (discardDraft) {
       createMaterials = [];
       createExamDescription = '';
@@ -2725,8 +2767,12 @@
     $('#examMaterialDropZone').classList.remove('is-dragging');
     examDraft = null;
     cancelMaterialImport('exam');
-    setMessage($('#examError'), '');
+    setInlineMessage($('#examError'), '');
+    setInlineMessage($('#examMaterialError'), '');
     renderMaterialImportStatus();
+    if ($('#createDialog').open && !$('#createExamError').hidden) {
+      $('#createExamError').scrollIntoView({ block: 'nearest' });
+    }
   });
   $('#cadenceDialog').addEventListener('close', () => {
     if ($('#cadenceDialog').open) return;
