@@ -1,18 +1,18 @@
 {
   "name": "study-workbench",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "将学习材料转为每日学习计划的本地桌面应用",
   "author": "Study Workbench",
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "test": "node --test main.test.cjs services.test.cjs assessment.test.cjs tutoring.test.cjs i18n.test.cjs language-generation.test.cjs schedule.test.cjs planning.test.cjs cadence.test.cjs reading.test.cjs ocr.test.cjs",
+    "test": "node --test main.test.cjs services.test.cjs assessment.test.cjs tutoring.test.cjs i18n.test.cjs language-generation.test.cjs schedule.test.cjs planning.test.cjs cadence.test.cjs reading.test.cjs ocr.test.cjs windows-build.test.cjs",
     "test:desktop": "electron desktop.test.cjs",
-    "check": "node --check main.cjs && node --check preload.cjs && node --check services.cjs && node --check app.js && node --check exampass.cjs && node --check assessment.cjs && node --check tutoring.cjs && node --check i18n.js && node --check ui-messages.js && node --check service-messages.js && node --check schedule.js && node --check cadence.cjs && node --check ocr.cjs && node --check document-reading.cjs",
+    "check": "node --check main.cjs && node --check preload.cjs && node --check services.cjs && node --check app.js && node --check exampass.cjs && node --check assessment.cjs && node --check tutoring.cjs && node --check i18n.js && node --check ui-messages.js && node --check service-messages.js && node --check schedule.js && node --check cadence.cjs && node --check ocr.cjs && node --check document-reading.cjs && node --check windows-build.cjs",
     "pack": "electron-builder --dir",
     "build:mac": "electron-builder --mac zip",
-    "build:win": "electron-builder --win nsis --x64"
+    "build:win": "node windows-build.cjs"
   },
   "build": {
     "appId": "com.studyworkbench.desktop",
@@ -112,7 +112,9 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "include": "installer.nsh",
+      "artifactName": "study-workbench-${version}-windows-${arch}-installer.${ext}"
     },
     "asarUnpack": [
       "node_modules/tesseract.js/**",

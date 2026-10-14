@@ -6,10 +6,10 @@
 
 ## 下载与安装
 
-下载 1.0.1 版本：
+下载适用于你的系统的最新安装包：
 
-- **macOS — Apple 芯片：**[下载 ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.1/study-workbench-1.0.1-mac-arm64.zip)。解压后将“学习工作台”移入“应用程序”。
-- **Windows — x64：**[下载 EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.1/study-workbench-1.0.1-windows-x64.exe)。运行安装程序并按提示操作。
+- **macOS — Apple 芯片（1.0.1）：**[下载 ZIP](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.1/study-workbench-1.0.1-mac-arm64.zip)。解压后将“学习工作台”移入“应用程序”。
+- **Windows — x64（1.0.2）：**[下载 EXE](https://github.com/wsqUsaqi537/study-workbench/releases/download/v1.0.2/study-workbench-1.0.2-windows-x64-installer.exe)。运行安装器并选择安装位置。更新时直接运行新安装器，计划和设置会保留；可从 Windows“设置 → 应用”卸载，或运行安装目录内的 `uninstaller.exe`。
 
 安装包未经代码签名，macOS 版本未经公证；Windows 版本尚未在 Windows 电脑上实机测试。
 
