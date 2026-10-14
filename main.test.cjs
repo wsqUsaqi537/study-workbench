@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
+const { createHash } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { createRequire } = require('node:module');
 
@@ -22,7 +23,44 @@ function taskFixture() {
   };
 }
 
-async function harness(t, tasks = []) {
+function planInputFixture(extra = {}) {
+  return {
+    title: 'Python 入门', goal: '掌握变量、循环和函数', level: 'beginner',
+    startDate: '2026-10-11', days: 2, minutesPerDay: 60, materials: [],
+    ...extra
+  };
+}
+
+function checkpointKey(version, input, settings) {
+  const identity = {
+    version,
+    input,
+    endpoint: settings.endpoint,
+    model: settings.model,
+    language: 'zh-CN'
+  };
+  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
+
+function completePlanCheckpoint(input) {
+  const guide = {
+    summary: '从基础开始，逐步练习。', difficulty: '入门', warnings: [],
+    knowledge: [{ title: '变量', priority: '重点', explanation: '变量保存数据。', source: '主题与学习目标' }]
+  };
+  const days = Array.from({ length: input.days }, (_, index) => ({
+    day: index + 1,
+    date: `2026-10-${11 + index}`,
+    title: `第 ${index + 1} 天学习`,
+    minutes: 45,
+    tasks: index === input.days - 1
+      ? ['完成 5 题小测，用时 10 分钟。', '完成 10 题周期测验，用时 20 分钟。']
+      : ['完成 5 题小测，用时 10 分钟。'],
+    source: '主题与学习目标'
+  }));
+  return { guide, days };
+}
+
+async function harness(t, tasks = [], serviceOverrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'study-backup-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const settings = { endpoint: 'https://example.test/v1', model: 'mock', encryptedKey: 'test-only' };
@@ -47,8 +85,12 @@ async function harness(t, tasks = []) {
     }
   };
   const realRequire = createRequire(path.join(__dirname, 'main.cjs'));
+  const services = Object.keys(serviceOverrides).length
+    ? { ...realRequire('./services.cjs'), ...serviceOverrides }
+    : null;
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8'), {
-    require: name => name === 'electron' ? electron : realRequire(name),
+    require: name => name === 'electron' ? electron
+      : (name === './services.cjs' && services ? services : realRequire(name)),
     __dirname, process: { env: { STUDY_APP_DATA_DIR: dir } }, Buffer, AbortController
   }, { filename: 'main.cjs' });
   await new Promise(resolve => setImmediate(resolve));
@@ -181,4 +223,96 @@ test('旧报告错误题号不会阻止备份恢复与进度保存，历史追�
   await h.invoke('task:save', restored.task);
   assert.equal(h.stored().tasks[0].plan.days[1].completed, true);
   await assert.rejects(h.invoke('plan:adjust', { task: restored.task, dayIndex: 0 }), /报告引用了不存在的题目/);
+});
+
+test('匹配的 v3 材料检查点续用，概要检查点清空旧天数并续用新 v4 完成检查点', async t => {
+  const input = planInputFixture();
+  const v3Guide = {
+    summary: '旧计划概要', difficulty: '入门', warnings: [],
+    knowledge: [{ title: '变量', priority: '重点', explanation: '旧知识点', source: '主题与学习目标' }]
+  };
+  const legacyDay = {
+    day: 1, date: input.startDate, title: '旧缓存日程', minutes: 60,
+    tasks: ['完成 5 题小测和阅读 0 分钟'], source: '主题与学习目标'
+  };
+  const cases = [
+    {
+      checkpoint: { stage: 'materials', notes: [{ summary: '已读材料提要' }], compressions: [], nextChunk: 1 },
+      expected: checkpoint => checkpoint
+    },
+    {
+      checkpoint: { stage: 'guide', guide: v3Guide, days: [legacyDay] },
+      expected: checkpoint => ({ guide: checkpoint.guide, days: [] })
+    }
+  ];
+  const completeV4 = completePlanCheckpoint(input);
+
+  for (const { checkpoint: legacyCheckpoint, expected } of cases) {
+    const received = [];
+    const serviceOverrides = {
+      generatePlan: async (_input, _config, hooks) => {
+        received.push(hooks.checkpoint === undefined
+          ? undefined
+          : JSON.parse(JSON.stringify(hooks.checkpoint)));
+        await hooks.onCheckpoint(completeV4);
+        return { days: completeV4.days };
+      }
+    };
+    const h = await harness(t, [], serviceOverrides);
+    const v3Key = checkpointKey(3, input, h.settings);
+    const v4Key = checkpointKey(4, input, h.settings);
+    fs.writeFileSync(path.join(h.dir, 'plan-generation.json'), JSON.stringify({
+      key: v3Key, checkpoint: legacyCheckpoint
+    }));
+
+    await h.invoke('plan:generate', input);
+
+    assert.deepEqual(received[0], expected(legacyCheckpoint));
+    let saved = JSON.parse(fs.readFileSync(path.join(h.dir, 'plan-generation.json'), 'utf8'));
+    assert.equal(saved.key, v4Key);
+    assert.deepEqual(saved.checkpoint, completeV4);
+
+    await h.invoke('plan:generate', input);
+
+    assert.deepEqual(received[1], completeV4, `${legacyCheckpoint.stage} 迁移后的 v4 检查点应可复用`);
+    saved = JSON.parse(fs.readFileSync(path.join(h.dir, 'plan-generation.json'), 'utf8'));
+    assert.equal(saved.key, v4Key);
+  }
+});
+
+test('输入不同的旧 v3 计划检查点不复用，后续同输入仍复用 v4 检查点', async t => {
+  const oldInput = planInputFixture();
+  const input = { ...oldInput, goal: '更换后的学习目标' };
+  const oldCheckpoint = {
+    stage: 'guide',
+    guide: { summary: '另一任务的概要', difficulty: '入门', warnings: [], knowledge: [] },
+    days: [{ day: 1, tasks: ['不应复用'] }]
+  };
+  const completeV4 = completePlanCheckpoint(input);
+  const received = [];
+  const serviceOverrides = {
+    generatePlan: async (_input, _config, hooks) => {
+      received.push(hooks.checkpoint === undefined
+        ? undefined
+        : JSON.parse(JSON.stringify(hooks.checkpoint)));
+      await hooks.onCheckpoint(completeV4);
+      return { days: completeV4.days };
+    }
+  };
+  const h = await harness(t, [], serviceOverrides);
+  fs.writeFileSync(path.join(h.dir, 'plan-generation.json'), JSON.stringify({
+    key: checkpointKey(3, oldInput, h.settings), checkpoint: oldCheckpoint
+  }));
+
+  await h.invoke('plan:generate', input);
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0], undefined);
+  const saved = JSON.parse(fs.readFileSync(path.join(h.dir, 'plan-generation.json'), 'utf8'));
+  assert.equal(saved.key, checkpointKey(4, input, h.settings));
+  assert.deepEqual(saved.checkpoint, completeV4);
+
+  await h.invoke('plan:generate', input);
+
+  assert.deepEqual(received[1], completeV4);
 });

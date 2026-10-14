@@ -909,9 +909,21 @@ function validateSource(source, input, label) {
   }
   const names = [...new Set(input.materials.map(material => material.name))]
     .sort((left, right) => right.length - left.length);
-  const pattern = new RegExp(names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
+  const pattern = new RegExp('(?<![\\p{L}\\p{N}_.-])(?:' +
+    names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') +
+    ')(?![\\p{L}\\p{N}_.-])', 'gu');
   const matches = [...source.matchAll(pattern)];
   if (!matches.length) fail(label + '必须引用输入材料名称。');
+  const unknownFilePattern = /(?:^|[^\p{L}\p{N}_.-])[\p{L}\p{N}_][\p{L}\p{N}_ .-]*\.(?:pdf|docx?|pptx?|md|tex|txt|rtf|odt|csv|xlsx?)(?=$|[^\p{L}\p{N}_-])/iu;
+  if (unknownFilePattern.test(source.replace(pattern, ''))) {
+    fail(label + '引用了输入中不存在的材料文件。');
+  }
+  for (const segment of source.split(/[;；]/u)) {
+    pattern.lastIndex = 0;
+    const hasMaterial = pattern.test(segment);
+    pattern.lastIndex = 0;
+    if (!hasMaterial) fail(label + '每个来源片段都必须引用实际材料名称。');
+  }
   if (extractSourceReferences(source.slice(0, matches[0].index)).length) {
     fail(label + '应先写材料名称，再写对应页码或幻灯片。');
   }
@@ -1334,38 +1346,78 @@ function validateSessions(input, sessions) {
   });
 }
 
-function validateGeneratedDay(day, session, input, allowedSources) {
-  exactKeys(day, ['day', 'date', 'title', 'minutes', 'tasks', 'source'], '模型每日计划');
-  if (day.day !== session.day || day.date !== session.date) fail('模型计划日期或天数顺序无效。');
-  requireString(day.title, '每日标题', 1, 300);
-  if (!Number.isInteger(day.minutes) || day.minutes < 1 || day.minutes > input.minutesPerDay) {
-    fail('每日计划时间超过预算或格式无效。');
+const PLAN_DAY_FIELD_LABELS = {
+  keys: '字段',
+  date: '日期',
+  title: '标题',
+  minutes: '每日时间',
+  tasks: '学习任务',
+  source: '来源',
+  dailyQuiz: '每日小测',
+  finalQuiz: '期末测验'
+};
+
+function planDayValidationError(session, field, detail) {
+  const label = PLAN_DAY_FIELD_LABELS[field] || field;
+  const error = new Error(`第 ${session.day} 次学习（${session.date}）的${label}不符合要求：${detail}`);
+  error.code = 'PLAN_DAY_VALIDATION';
+  error.field = field;
+  error.day = session.day;
+  error.date = session.date;
+  error.detail = detail;
+  return error;
+}
+
+function validateGeneratedDay(day, session, input) {
+  let field = 'keys';
+  try {
+    exactKeys(day, ['day', 'date', 'title', 'minutes', 'tasks', 'source'], '模型每日计划');
+    field = 'date';
+    if (day.day !== session.day || day.date !== session.date) fail('模型计划日期或天数顺序无效。');
+    field = 'title';
+    requireString(day.title, '每日标题', 1, 300);
+    field = 'minutes';
+    if (!Number.isInteger(day.minutes) || day.minutes < 1 || day.minutes > input.minutesPerDay) {
+      fail('每日计划分钟数超过预算或格式无效。');
+    }
+    field = 'tasks';
+    if (!Array.isArray(day.tasks) || day.tasks.length < 1 || day.tasks.length > 20 ||
+        day.tasks.some(task => typeof task !== 'string' || task.trim().length < 1 || task.length > 2000)) {
+      fail('每日学习任务格式无效。');
+    }
+    field = 'source';
+    requireString(day.source, '每日来源', 1, 2000);
+    validateSource(day.source, input, '每日来源');
+    field = 'dailyQuiz';
+    const dailyQuizMinutes = timedQuizMinutes(day.tasks, 5, false, day.minutes);
+    if (dailyQuizMinutes === null) fail('每日计划必须保留含正数分钟用时的 5 题小测。');
+    if (session.day === input.days) {
+      field = 'finalQuiz';
+      const finalQuizMinutes = timedQuizMinutes(day.tasks, 10, true, day.minutes);
+      if (finalQuizMinutes === null) fail('最后一天必须保留含正数分钟用时的 10 题周期测验。');
+      field = 'minutes';
+      if (dailyQuizMinutes + finalQuizMinutes > day.minutes) {
+        fail('每日小测和期末测验的用时合计超过每日计划时间。');
+      }
+    }
+    return { ...day, completed: false };
+  } catch (error) {
+    if (error && error.code === 'PLAN_DAY_VALIDATION') throw error;
+    throw planDayValidationError(session, field, error && error.message ? error.message : '格式无效。');
   }
-  if (!Array.isArray(day.tasks) || day.tasks.length < 1 || day.tasks.length > 3 ||
-      day.tasks.some(task => typeof task !== 'string' || task.trim().length < 1 || task.length > 120)) {
-    fail('每日学习任务格式无效。');
-  }
-  requireString(day.source, '每日来源', 1, 2000);
-  if (!allowedSources.includes(day.source)) fail('频率调整计划引用了未提供的来源。');
-  validateSource(day.source, input, '每日来源');
-  if (!timedQuizPresent(day.tasks, 5)) fail('每日计划必须保留含时间预算的 5 题小测。');
-  if (session.day === input.days && !timedQuizPresent(day.tasks, 10, true)) {
-    fail('最后一天必须保留含时间预算的 10 题周期测验。');
-  }
-  return { ...day, completed: false };
 }
 
 function checkpointValue(guide, days) {
   return { guide, days: days.map(({ completed, ...day }) => day) };
 }
 
-function validateCheckpoint(checkpoint, input, sessions, allowedSources) {
+function validateCheckpoint(checkpoint, input, sessions) {
   exactKeys(checkpoint, ['guide', 'days'], '计划生成检查点');
   const guide = validateBatchGuide(checkpoint.guide, input);
   if (!Array.isArray(checkpoint.days) || checkpoint.days.length > sessions.length) {
     fail('模型计划天数格式无效。');
   }
-  const days = checkpoint.days.map((day, index) => validateGeneratedDay(day, sessions[index], input, allowedSources));
+  const days = checkpoint.days.map((day, index) => validateGeneratedDay(day, sessions[index], input));
   return { guide, days };
 }
 
@@ -1424,18 +1476,175 @@ function shouldRetrySmallerBatch(error) {
   return Boolean(error && ['MODEL_OUTPUT_LENGTH', 'MODEL_OUTPUT_SIZE', 'PLAN_BATCH_CONTEXT_TOO_LARGE'].includes(error.code));
 }
 
-function timedQuizPresent(tasks, count, final = false) {
-  const text = tasks.join(' ');
-  const countPattern = count === 5
-    ? /(?:5\s*题|五\s*题|5\s*(?:-?\s*)questions?|five\s*(?:-?\s*)questions?)/i
-    : /(?:10\s*题|十\s*题|10\s*(?:-?\s*)questions?|ten\s*(?:-?\s*)questions?)/i;
-  const testPattern = final
-    ? /(周期测验|期末测验|综合测验|(?:final|end[- ]of[- ]cycle|comprehensive)\s+(?:quiz|test|assessment))/i
-    : /(小测|测验|自测|\b(?:quiz|test)\b)/i;
-  return countPattern.test(text) && testPattern.test(text) &&
-    /(?:\d{1,3}\s*分钟|用时\s*\d{1,3}|\b\d{1,3}\s*(?:minutes?|mins?)\b)/i.test(text);
+function parseChineseInteger(value) {
+  const digits = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  let total = 0;
+  let current = 0;
+  for (const character of value) {
+    if (Object.hasOwn(digits, character)) current = digits[character];
+    else if (character === '十') { total += (current || 1) * 10; current = 0; }
+    else if (character === '百') { total += (current || 1) * 100; current = 0; }
+    else return NaN;
+  }
+  return total + current;
 }
 
+function timedQuizMinutes(tasks, count, final, maxMinutes) {
+  const countText = count === 5
+    ? '(?:(?<!\\d)5|(?<![\\p{L}\\d])five|(?<![一二两三四五六七八九十百零〇])五)'
+    : '(?:(?<!\\d)10|(?<![\\p{L}\\d])ten|(?<![一二两三四五六七八九十百零〇])十)';
+  const countPattern = new RegExp(countText +
+    '(?:\\s*(?:道\\s*)?题|[\\s-]*questions?(?![\\p{L}\\d]))', 'giu');
+  const finalPattern = /(?:周期(?:测验|测试|测评|考试)|期末(?:测验|测试|测评|考试|考核)|综合(?:测验|测试|测评|考试)|\b(?:final|end[- ]of[- ]cycle|comprehensive)\s+(?:quiz|test|assessment|exam)\b)/giu;
+  const dailyPattern = /(?:小测|自测|测验|测评|测试|\b(?:quiz|test|assessment)\b)/giu;
+  const durationPattern = /([+-]?\d{1,3}|[零〇一二两三四五六七八九十百]+)\s*(?:分钟|minutes?|mins?)/giu;
+  const countGapPattern = /^(?:(?:[\s,，:：、()（）\-–—])|的|共|每日|每天|日常|安排|完成|进行|开展|做|答|包含|含|共计|with|of|has|having|containing)*$/iu;
+  const durationGapPattern = /^(?:[\s,，:：、()（）\-–—]|用时|耗时|需时|时长|预计|约|大约|共|每日|每天|takes?|requires?|for|in|lasting|about|approximately)*$/iu;
+
+  const questionCountMatch = (sentence, event) => [...sentence.matchAll(countPattern)].find(countMatch => {
+    if (/第\s*$/u.test(sentence.slice(0, countMatch.index))) return false;
+    const countEnd = countMatch.index + countMatch[0].length;
+    if (countEnd <= event.index) {
+      const gap = sentence.slice(countEnd, event.index);
+      return gap.length <= 16 && countGapPattern.test(gap);
+    }
+    if (countMatch.index >= event.index + event[0].length) {
+      const gap = sentence.slice(event.index + event[0].length, countMatch.index);
+      return gap.length <= 16 && countGapPattern.test(gap);
+    }
+    return false;
+  });
+
+  for (const task of tasks) {
+    for (const sentence of task.split(/[。.!?！？;；\n]+/u)) {
+      const finalEvents = [...sentence.matchAll(finalPattern)];
+      const allEvents = [
+        ...finalEvents,
+        ...[...sentence.matchAll(dailyPattern)].filter(event =>
+          !finalEvents.some(finalEvent => event.index >= finalEvent.index &&
+            event.index < finalEvent.index + finalEvent[0].length))
+      ].sort((left, right) => left.index - right.index);
+      const targetEvents = final ? finalEvents : allEvents.filter(event =>
+        !finalEvents.some(finalEvent => event.index === finalEvent.index));
+
+      for (const event of targetEvents) {
+        const countMatch = questionCountMatch(sentence, event);
+        if (!countMatch) continue;
+        const nextEvent = allEvents.find(candidate => candidate.index > event.index);
+        const end = nextEvent ? nextEvent.index : sentence.length;
+        const afterEvent = sentence.slice(event.index + event[0].length, end);
+        for (const duration of afterEvent.matchAll(durationPattern)) {
+          let gap = afterEvent.slice(0, duration.index);
+          const countStart = countMatch.index - event.index - event[0].length;
+          const countEnd = countStart + countMatch[0].length;
+          if (countStart >= 0 && countEnd <= duration.index) {
+            gap = gap.slice(0, countStart) + gap.slice(countEnd);
+          }
+          if (!durationGapPattern.test(gap)) continue;
+          const minutes = /^[+-]?\d+$/u.test(duration[1]) ? Number(duration[1]) : parseChineseInteger(duration[1]);
+          if (!Number.isInteger(minutes) || minutes < 1 || minutes > Math.min(480, maxMinutes)) break;
+          return minutes;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function boundedRepairDay(day) {
+  const value = isPlainObject(day) ? day : {};
+  const truncatedFields = [];
+  const clip = (item, name, limit) => {
+    if (typeof item !== 'string') {
+      if (item === undefined) return null;
+      if (item === null || ['number', 'boolean'].includes(typeof item)) return item;
+      truncatedFields.push(name + ':invalid-type');
+      return Array.isArray(item) ? '[array]' : '[object]';
+    }
+    if (item.length <= limit) return item;
+    truncatedFields.push(name);
+    return item.slice(0, limit);
+  };
+  const expected = ['day', 'date', 'title', 'minutes', 'tasks', 'source'];
+  const extras = Object.keys(value).filter(key => !expected.includes(key));
+  const tasks = Array.isArray(value.tasks)
+    ? value.tasks.slice(0, 3).map((task, index) => clip(task, `tasks[${index}]`, 300))
+    : clip(value.tasks, 'tasks', 300);
+  if (Array.isArray(value.tasks) && value.tasks.length > 3) truncatedFields.push('tasks:omitted');
+  return {
+    day: clip(value.day, 'day', 40), date: clip(value.date, 'date', 40),
+    title: clip(value.title, 'title', 300), minutes: clip(value.minutes, 'minutes', 40), tasks,
+    source: clip(value.source, 'source', 500),
+    missingKeys: expected.filter(key => !Object.hasOwn(value, key)),
+    extraKeys: extras.slice(0, 10).map(key => key.slice(0, 80)),
+    ...(extras.length > 10 ? { omittedKeys: extras.length - 10 } : {}),
+    ...(Array.isArray(value.tasks) && value.tasks.length > 3 ? { omittedTasks: value.tasks.length - 3 } : {}),
+    ...(truncatedFields.length ? { truncatedFields } : {})
+  };
+}
+
+async function repairGeneratedDays(failures, payload, input, guide, settings, hooks) {
+  const sessions = failures.map(failure => failure.session);
+  const repairPayload = { ...payload };
+  delete repairPayload.previousDays;
+  Object.assign(repairPayload, {
+    purpose: '修正学习计划每日安排',
+    sessions,
+    originalPlan: { summary: guide.summary.slice(0, 1000), difficulty: guide.difficulty },
+    knowledge: guide.knowledge.map(({ title, priority, source }) => ({ title, priority, source })),
+    validationErrors: failures.map(({ error }) => ({
+      day: error.day, date: error.date, field: error.field, message: error.message
+    })),
+    originalDays: failures.map(failure => boundedRepairDay(failure.day))
+  });
+  const systemMessage = [
+    '只修正 validationErrors 列出的 sessions。仅返回 days 数组，结构为 {"days":[{"day":number,"date":"YYYY-MM-DD","title":string,"minutes":number,"tasks":string[],"source":string}]}；数量和顺序必须与 sessions 相同，day、date 照抄。',
+    '不得更改 sessions、主题、目标、每日分钟预算或材料元数据。source 必须引用真实材料名称和有效位置；无附件时写“主题与学习目标”。',
+    '每天保留含正数分钟用时的 5 题小测；最后一天另保留含正数分钟用时的 10 题周期测验，合计不超过每日预算。每天建议最多 3 项任务、每项不超过 120 字。',
+    'originalDays 的 truncatedFields 标记表示预览被截短，不可当作完整原文。不要要求或复述原始附件全文。',
+    languageInstruction(settings.language)
+  ].join('\n');
+  const userMessage = JSON.stringify(repairPayload);
+  if (systemMessage.length + userMessage.length > MAX_CONTEXT_CHARS) {
+    const error = new Error('定向修正请求超过 60,000 字符上下文上限。');
+    error.code = 'PLAN_BATCH_CONTEXT_TOO_LARGE';
+    throw error;
+  }
+  let content;
+  try {
+    content = await requestChat(settings, systemMessage, userMessage, undefined, false, true, {
+      signal: hooks.signal, omitTokenBudget: true
+    });
+  } catch (error) {
+    if (shouldRetrySmallerBatch(error)) {
+      throw planDayValidationError(sessions[0], 'keys', '模型修正后仍未返回完整的每日安排。');
+    }
+    throw error;
+  }
+  throwIfAborted(hooks.signal);
+  let result;
+  try {
+    result = parseModelJson(content, '每日计划修正');
+  } catch {
+    throw planDayValidationError(sessions[0], 'keys', '模型修正后仍未返回有效 JSON。');
+  }
+  try {
+    exactKeys(result, ['days'], '修正后的每日计划');
+  } catch {
+    throw planDayValidationError(sessions[0], 'keys', '模型修正后仍未返回指定日期的有效安排。');
+  }
+  if (!Array.isArray(result.days) || result.days.length !== sessions.length) {
+    throw planDayValidationError(sessions[0], 'keys', '模型修正后返回的日期数量与指定 sessions 不一致。');
+  }
+  return result.days.map((day, index) => {
+    try {
+      return validateGeneratedDay(day, sessions[index], input);
+    } catch (error) {
+      if (!error || error.code !== 'PLAN_DAY_VALIDATION') throw error;
+      throw planDayValidationError(sessions[index], error.field, '模型修正后仍未通过：' + error.detail);
+    }
+  });
+}
 async function generateDayBatches(input, settings = {}, guide, sessions, hooks = {}) {
   if (!isPlainObject(input)) fail('学习任务格式无效。');
   validateInput(input);
@@ -1446,7 +1655,7 @@ async function generateDayBatches(input, settings = {}, guide, sessions, hooks =
   const stage = cadenceMode ? 'cadence' : 'days';
   let days = [];
   if (hooks.checkpoint !== undefined && hooks.checkpoint !== null) {
-    const checkpoint = validateCheckpoint(hooks.checkpoint, input, sessions, allowedSources);
+    const checkpoint = validateCheckpoint(hooks.checkpoint, input, sessions);
     guide = checkpoint.guide;
     days = checkpoint.days;
   }
@@ -1459,7 +1668,7 @@ async function generateDayBatches(input, settings = {}, guide, sessions, hooks =
     EXAMPASS_RULES,
     examScopeGuidance(input),
     '不要接收、要求或复述原始附件全文。只依据输入的材料来源、概要和知识清单安排学习。',
-    '只返回合法 JSON 对象，结构为 {"days":[{"day":number,"date":"YYYY-MM-DD","title":string,"minutes":number,"tasks":string[],"source":string}]}。只生成 sessions 指定的日期，day 和 date 必须逐项照抄，不得增删或重排。source 必须是 allowedSources 中的一项。',
+    '只返回合法 JSON 对象，结构为 {"days":[{"day":number,"date":"YYYY-MM-DD","title":string,"minutes":number,"tasks":string[],"source":string}]}。只生成 sessions 指定的日期，day 和 date 必须逐项照抄，不得增删或重排。source 必须引用真实材料名称和有效位置；allowedSources 仅用于参考，不能编造来源。',
     'days 是整个计划的实际学习次数；每天安排含用时的 5 题小测；若 day 等于 days，还须安排覆盖本周期知识、含用时的 10 题周期测验。测验时间计入 minutes，不能超出每日预算。每天最多 3 个任务，每个任务不超过 120 字；不要为测验创建额外 JSON 字段。',
     '根据 previousDays 保持知识顺序衔接，并按全局 day 序号安排进度；后续批次继续学习，不要重新从基础开始。',
     '如果提供原计划提纲，保留仍然适用的内容，并结合新的 sessions 调整休息日和任务顺序。',
@@ -1502,7 +1711,7 @@ async function generateDayBatches(input, settings = {}, guide, sessions, hooks =
       materials: input.materials.map(({ id, name, units, chars }) => ({ id, name, units, chars })),
       allowedSources
     };
-    let generated;
+    let content;
     try {
       const userMessage = JSON.stringify(payload);
       if (systemMessage.length + userMessage.length > MAX_CONTEXT_CHARS) {
@@ -1510,16 +1719,9 @@ async function generateDayBatches(input, settings = {}, guide, sessions, hooks =
         error.code = 'PLAN_BATCH_CONTEXT_TOO_LARGE';
         throw error;
       }
-      const content = await requestChat(settings, systemMessage, userMessage, undefined, false, true, {
+      content = await requestChat(settings, systemMessage, userMessage, undefined, false, true, {
         signal: hooks.signal, omitTokenBudget: true
       });
-      throwIfAborted(hooks.signal);
-      const modelResult = parseModelJson(content, cadenceMode ? '频率调整计划生成' : '每日计划生成');
-      exactKeys(modelResult, ['days'], cadenceMode ? '频率调整计划' : '模型每日计划');
-      if (!Array.isArray(modelResult.days) || modelResult.days.length !== batch.length) {
-        fail('模型计划天数与学习周期不一致。');
-      }
-      generated = modelResult.days.map((day, index) => validateGeneratedDay(day, batch[index], input, allowedSources));
     } catch (error) {
       if (error && error.message === '学习目标、材料名称或题目本身超过 60,000 字符上下文上限。') {
         error.code = 'PLAN_BATCH_CONTEXT_TOO_LARGE';
@@ -1545,6 +1747,28 @@ async function generateDayBatches(input, settings = {}, guide, sessions, hooks =
         throw friendly;
       }
       throw error;
+    }
+    throwIfAborted(hooks.signal);
+    const modelResult = parseModelJson(content, cadenceMode ? '频率调整计划生成' : '每日计划生成');
+    exactKeys(modelResult, ['days'], cadenceMode ? '频率调整计划' : '模型每日计划');
+    if (!Array.isArray(modelResult.days) || modelResult.days.length !== batch.length) {
+      fail('模型计划天数与学习周期不一致。');
+    }
+    let generated = [];
+    const failures = [];
+    modelResult.days.forEach((day, index) => {
+      try {
+        generated[index] = validateGeneratedDay(day, batch[index], input);
+      } catch (error) {
+        if (!error || error.code !== 'PLAN_DAY_VALIDATION') throw error;
+        generated[index] = null;
+        failures.push({ session: batch[index], day, error });
+      }
+    });
+    if (failures.length) {
+      const repaired = await repairGeneratedDays(failures, payload, input, guide, settings, hooks);
+      const repairedByDay = new Map(repaired.map(day => [day.day, day]));
+      generated = batch.map((session, index) => generated[index] || repairedByDay.get(session.day));
     }
     days = [...days, ...generated];
     await savePlanCheckpoint(hooks, guide, days);

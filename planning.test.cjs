@@ -62,6 +62,18 @@ function generatedDays(payload, language = 'zh-CN', override = {}) {
   });
 }
 
+function generatedDay(session, data, tasks, override = {}) {
+  return {
+    day: session.day,
+    date: session.date,
+    title: `第 ${session.day} 天学习`,
+    minutes: 45,
+    tasks,
+    source: guide(data).knowledge[0].source,
+    ...override
+  };
+}
+
 function installFetch(t, respond) {
   const original = global.fetch;
   const requests = [];
@@ -544,16 +556,24 @@ test('拒绝无效日期、未允许来源，并可通过 signal 取消规划', 
   respond = ({ payload }) => response({
     days: generatedDays(payload, 'zh-CN', { date: '2026-02-30' })
   });
+  const beforeInvalidModelDate = requests.length;
   await assert.rejects(service.generateDayBatches(data, settings, planGuide,
     [{ day: 1, date: data.startDate }]), /日期|顺序/);
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, beforeInvalidModelDate + 2);
+  assert.equal(requests.at(-1).payload.purpose, '修正学习计划每日安排');
 
   respond = ({ payload }) => response({
-    days: generatedDays(payload, 'zh-CN', { source: '未提供的来源' })
+    days: payload.purpose === '修正学习计划每日安排'
+      ? payload.sessions.map(session => generatedDay(session, data, ['完成 5 题小测，用时 10 分钟。'], {
+        source: '未提供的来源'
+      }))
+      : generatedDays(payload, 'zh-CN', { source: '未提供的来源' })
   });
+  const beforeInvalidSource = requests.length;
   await assert.rejects(service.generateDayBatches(data, settings, planGuide,
-    [{ day: 1, date: data.startDate }]), /未提供|引用|来源/);
-  assert.equal(requests.length, 2);
+    [{ day: 1, date: data.startDate }]), /未提供|引用|来源|source/);
+  assert.equal(requests.length, beforeInvalidSource + 2, '无效来源定向修正一次后仍应拒绝');
+  assert.equal(requests.at(-1).payload.purpose, '修正学习计划每日安排');
 
   const beforeAbort = global.fetch;
   let started;
@@ -572,4 +592,460 @@ test('拒绝无效日期、未允许来源，并可通过 signal 取消规划', 
   controller.abort();
   await assert.rejects(pending, error => error.name === 'AbortError' && error.code === 'ABORT_ERR');
   global.fetch = beforeAbort;
+});
+
+test('存储校验接受 20 项与 2,000 字安全边界且完整保留任务', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const planGuide = guide(data);
+  const session = { day: 1, date: data.startDate };
+  const firstTask = '完成 5 题小测，用时 10 分钟。'.padEnd(2000, '练');
+  const tasks = [firstTask, ...Array.from({ length: 19 }, (_, index) => `补充练习 ${index + 1}`)];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  const days = await service.generateDayBatches(data, settings, planGuide, [session]);
+
+  assert.equal(requests.length, 1);
+  assert.equal(days[0].tasks.length, 20);
+  assert.equal(days[0].tasks[0].length, 2000);
+  assert.deepEqual(days[0].tasks, tasks);
+  assert.match(requests[0].body.messages[0].content, /每天最多 3 个任务，每个任务不超过 120 字/);
+});
+
+test('存储校验仍拒绝超过 20 项或 2,000 字的任务', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const planGuide = guide(data);
+  const session = { day: 1, date: data.startDate };
+  const cases = [
+    ['任务数', ['完成 5 题小测，用时 10 分钟。', ...Array.from({ length: 20 }, (_, index) => `任务 ${index}`)]],
+    ['任务长度', ['完成 5 题小测，用时 10 分钟。'.padEnd(2001, '练')]]
+  ];
+  const requests = installFetch(t, () => response({ days: [] }));
+
+  for (const [field, tasks] of cases) {
+    await assert.rejects(service.generateDayBatches(data, settings, planGuide, [session], {
+      checkpoint: {
+        guide: planGuide,
+        days: [generatedDay(session, data, tasks)]
+      }
+    }), /任务/ , field);
+  }
+  assert.equal(requests.length, 0);
+});
+
+test('有效材料页来源不必与知识清单来源文字完全相同', async t => {
+  const text = '【第 1 页】第一部分。\n【第 2 页】第二部分。';
+  const data = input({
+    days: 2,
+    materials: [{ id: 'm1', name: 'lesson.pdf', units: 1, chars: text.length, text }]
+  });
+  const planGuide = guide(data);
+  planGuide.knowledge[0].source = 'lesson.pdf 第 1 页';
+  const session = { day: 1, date: data.startDate };
+  const requests = installFetch(t, () => response({
+    days: [generatedDay(session, data, ['完成 5 题小测，用时 10 分钟。'], { source: 'lesson.pdf 第 2 页' })]
+  }));
+
+  const days = await service.generateDayBatches(data, settings, planGuide, [session]);
+
+  assert.equal(requests.length, 1);
+  assert.equal(days[0].source, 'lesson.pdf 第 2 页');
+});
+
+test('来源仍须指向材料中真实存在的页码', async t => {
+  const text = '【第 1 页】第一部分。\n【第 2 页】第二部分。';
+  const data = input({
+    days: 2,
+    materials: [{ id: 'm1', name: 'lesson.pdf', units: 1, chars: text.length, text }]
+  });
+  const planGuide = guide(data);
+  planGuide.knowledge[0].source = 'lesson.pdf 第 1 页';
+  const session = { day: 1, date: data.startDate };
+  const requests = installFetch(t, ({ payload }) => response({
+    days: payload.sessions.map(session => generatedDay(session, data,
+      ['完成 5 题小测，用时 10 分钟。'], { source: 'lesson.pdf 第 999 页' }))
+  }));
+
+  await assert.rejects(service.generateDayBatches(data, settings, planGuide, [session]), /页码/);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+test('接受 5道题、五题和十分钟等中文计数与时长写法', async t => {
+  const data = input({ days: 3, calendarDays: 3 });
+  const sessions = [
+    { day: 1, date: data.startDate },
+    { day: 2, date: dateOffset(data.startDate, 1) }
+  ];
+  const tasks = [
+    ['完成 5道题小测，用时十分钟。'],
+    ['完成五题测验，用时十分钟。']
+  ];
+  const requests = installFetch(t, () => response({
+    days: sessions.map((session, index) => generatedDay(session, data, tasks[index]))
+  }));
+
+  const days = await service.generateDayBatches(data, settings, guide(data), sessions);
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(days.map(day => day.tasks), tasks);
+});
+
+test('5 题、测验类型和正数用时必须属于同一个任务', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['完成 5 题。', '安排一次小测。', '阅读 10 分钟。'];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]), /测验|小测|任务/);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+test('测验用时不能为零', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['完成 5 题小测，用时 0 分钟。'];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]), /用时|分钟|测验/);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+test('测验用时不能借用另一条阅读任务的时间', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['阅读 40 分钟。', '完成 5 题小测。'];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]), /用时|分钟|测验|任务/);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+test('15 题不能匹配 5 题小测', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['完成 15 题小测，用时 10 分钟。'];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]), /5 题|测验|小测|任务/);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+test('英文 five-question quiz 表达保留为有效的计时日测', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['Complete a five-question quiz in 10 minutes.'];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  const days = await service.generateDayBatches(data, { ...settings, language: 'en' }, guide(data, 'en'), [session]);
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(days[0].tasks, tasks);
+});
+
+test('末日分别保留带用时的 5 题日测和 10 题期末测验', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 2, date: dateOffset(data.startDate, 1) };
+  const tasks = ['完成 5 题小测，用时 10 分钟。', '完成 10 题期末测验，用时 20 分钟。'];
+  const requests = installFetch(t, () => response({ days: [generatedDay(session, data, tasks)] }));
+
+  const days = await service.generateDayBatches(data, settings, guide(data), [session]);
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(days[0].tasks, tasks);
+});
+
+test('多日批次只修正无效日期，保留已合格日期并限制修正载荷', async t => {
+  const rawText = '【第 1 页】RAW_MATERIAL_SECRET';
+  const data = input({
+    days: 3,
+    calendarDays: 3,
+    materials: [{ id: 'm1', name: 'lesson.md', units: 1, chars: rawText.length, text: rawText }]
+  });
+  const planGuide = guide(data);
+  const sessions = [
+    { day: 1, date: data.startDate },
+    { day: 2, date: dateOffset(data.startDate, 1) }
+  ];
+  const goodTasks = ['完成 5 题小测，用时 10 分钟。'];
+  const invalidTasks = [...goodTasks, ...Array.from({ length: 20 }, (_, index) => `越界任务 ${index}`)];
+  const snapshots = [];
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '修正学习计划每日安排') {
+      return response({ days: payload.sessions.map(session => generatedDay(session, data, goodTasks)) });
+    }
+    return response({ days: [
+      generatedDay(sessions[0], data, goodTasks),
+      generatedDay(sessions[1], data, invalidTasks)
+    ] });
+  });
+
+  const days = await service.generateDayBatches(data, settings, planGuide, sessions, {
+    onCheckpoint: checkpoint => snapshots.push(checkpoint)
+  });
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].payload.purpose, '生成学习计划每日安排');
+  const repair = requests[1].payload;
+  assert.equal(repair.purpose, '修正学习计划每日安排');
+  assert.deepEqual(repair.sessions, [sessions[1]]);
+  assert.equal(repair.originalDays.length, 1);
+  assert.equal(repair.originalDays[0].day, 2);
+  assert.ok(Array.isArray(repair.validationErrors));
+  assert.ok(repair.validationErrors.some(error => error.day === 2 && error.field === 'tasks' &&
+    typeof error.message === 'string' && error.message.length > 0));
+  assert.doesNotMatch(JSON.stringify(repair), /RAW_MATERIAL_SECRET/);
+  assert.equal(days[0].title, '第 1 天学习');
+  assert.deepEqual(days[0].tasks, goodTasks);
+  assert.deepEqual(days[1].tasks, goodTasks);
+  assert.deepEqual(snapshots.at(-1).days.map(day => day.day), [1, 2]);
+  assert.deepEqual(snapshots.at(-1).days[0].tasks, goodTasks);
+});
+
+test('修正后仍无效时报告日期和字段，且本批最多修正一次', async t => {
+  const text = '【第 1 页】第一部分。';
+  const data = input({
+    days: 3,
+    calendarDays: 3,
+    materials: [{ id: 'm1', name: 'lesson.md', units: 1, chars: text.length, text }]
+  });
+  const planGuide = guide(data);
+  const sessions = [
+    { day: 1, date: data.startDate },
+    { day: 2, date: dateOffset(data.startDate, 1) }
+  ];
+  const goodTasks = ['完成 5 题小测，用时 10 分钟。'];
+  const invalidSource = 'lesson.md 第 999 页';
+  const snapshots = [];
+  const requests = installFetch(t, ({ payload }) => {
+    const invalidDay = generatedDay(sessions[1], data, goodTasks, { source: invalidSource });
+    if (payload.purpose === '修正学习计划每日安排') {
+      return response({ days: payload.sessions.map(session => generatedDay(session, data, goodTasks, {
+        source: invalidSource
+      })) });
+    }
+    return response({ days: [generatedDay(sessions[0], data, goodTasks), invalidDay] });
+  });
+
+  await assert.rejects(service.generateDayBatches(data, settings, planGuide, sessions, {
+    onCheckpoint: checkpoint => snapshots.push(checkpoint)
+  }), error => /2/.test(error.message) && /source|来源/.test(error.message));
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+  assert.deepEqual(requests[1].payload.sessions, [sessions[1]]);
+  assert.deepEqual(requests[1].payload.originalDays.map(day => day.day), [2]);
+  assert.ok(snapshots.every(snapshot => snapshot.days.every(day => day.day !== 2)));
+});
+
+test('学习频率重拟只修正无效末日，保留未来日期和末日双测验', async t => {
+  const data = input({
+    days: 4,
+    calendarDays: 8,
+    cadence: { mode: 'alternate', weekdays: [] }
+  });
+  const today = dateOffset(data.startDate, 2);
+  const sessions = [
+    { day: 3, date: dateOffset(data.startDate, 4) },
+    { day: 4, date: dateOffset(data.startDate, 6) }
+  ];
+  const dailyTasks = ['完成 5 题小测，用时 10 分钟。'];
+  const finalTasks = ['完成 5 题小测，用时 10 分钟。', '完成 10 题期末测验，用时 20 分钟。'];
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '修正学习计划每日安排') {
+      return response({ days: payload.sessions.map(session => generatedDay(session, data, finalTasks)) });
+    }
+    return response({ days: [
+      generatedDay(sessions[0], data, dailyTasks),
+      generatedDay(sessions[1], data, dailyTasks)
+    ] });
+  });
+
+  const days = await service.generateDayBatches(data, settings, guide(data), sessions, { today });
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].payload.purpose, '按学习频率重拟未来计划');
+  assert.equal(requests[0].payload.today, today);
+  assert.deepEqual(requests[0].payload.cadence, data.cadence);
+  assert.deepEqual(requests[0].payload.sessions, sessions);
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+  assert.deepEqual(requests[1].payload.sessions, [sessions[1]]);
+  assert.equal(requests[1].payload.today, today);
+  assert.deepEqual(requests[1].payload.cadence, data.cadence);
+  assert.deepEqual(days[0].tasks, dailyTasks);
+  assert.equal(days[0].date, sessions[0].date);
+  assert.deepEqual(days[1].tasks, finalTasks);
+  assert.equal(days[1].date, sessions[1].date);
+});
+
+test('定向修正不能更改学习日期或超出每日分钟预算', async t => {
+  const data = input({ days: 2, calendarDays: 2, minutesPerDay: 60 });
+  const session = { day: 1, date: data.startDate };
+  const invalidTasks = ['完成 5 题小测，用时 10 分钟。', ...Array.from({ length: 20 }, (_, index) => `越界任务 ${index}`)];
+  const requests = installFetch(t, ({ payload, index }) => {
+    if (payload.purpose !== '修正学习计划每日安排') {
+      return response({ days: [generatedDay(session, data, invalidTasks)] });
+    }
+    const override = index === 1
+      ? { date: dateOffset(session.date, 1) }
+      : { minutes: 61 };
+    return response({ days: [generatedDay(session, data, ['完成 5 题小测，用时 10 分钟。'], override)] });
+  });
+
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]),
+    error => /1/.test(error.message) && /date|日期/.test(error.message));
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]),
+    error => /1/.test(error.message) && /minutes|分钟|用时/.test(error.message));
+
+  assert.equal(requests.length, 4);
+  assert.deepEqual(requests[1].payload.sessions, [session]);
+  assert.deepEqual(requests[3].payload.sessions, [session]);
+});
+
+test('取消、HTTP 401 和网络错误都不触发格式修正', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  let cancelStarted;
+  const started = new Promise(resolve => { cancelStarted = resolve; });
+  const requests = installFetch(t, ({ options, index }) => {
+    if (index === 0) return { ok: false, status: 401, text: async () => '{}' };
+    if (index === 1) throw new Error('synthetic network failure');
+    cancelStarted();
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    });
+  });
+
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]), /HTTP 401/);
+  await assert.rejects(service.generateDayBatches(data, settings, guide(data), [session]), /检查地址|网络|API/);
+  const controller = new AbortController();
+  const pending = service.generateDayBatches(data, settings, guide(data), [session], { signal: controller.signal });
+  await started;
+  controller.abort();
+  await assert.rejects(pending, error => error.name === 'AbortError');
+
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every(request => request.payload.purpose === '生成学习计划每日安排'));
+});
+
+for (const [label, source] of [
+  ['中文页码', 'known.pdf 第 1 页；fake.pdf 第 2 页'],
+  ['英文页码', 'known.pdf page 1; fake.pdf page 2'],
+  ['缩写页码', 'known.pdf p. 1（fake.pdf 第 2 页）']
+]) {
+  test(`拒绝已知材料与假文件混合来源（${label}）`, async t => {
+    const text = '【第 1 页】第一部分。\n【第 2 页】第二部分。';
+    const data = input({
+      days: 2,
+      calendarDays: 2,
+      materials: [{ id: 'm1', name: 'known.pdf', units: 1, chars: text.length, text }]
+    });
+    const session = { day: 1, date: data.startDate };
+    const tasks = ['完成 5 题小测，用时 10 分钟。'];
+    const requests = installFetch(t, ({ payload }) => response({
+      days: payload.sessions.map(item => generatedDay(item, data, tasks, { source }))
+    }));
+
+    await assert.rejects(
+      service.generateDayBatches(data, settings, guide(data), [session]),
+      error => /1/.test(error.message) && /source|来源/.test(error.message)
+    );
+
+    assert.equal(requests.length, 2, '混合来源应定向修正一次后仍拒绝');
+    assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+  });
+}
+
+test('负数小测时长不能被当成正数接受', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['完成 5 题小测，用时 -10 分钟。'];
+  const requests = installFetch(t, ({ payload }) => response({
+    days: payload.sessions.map(item => generatedDay(item, data, tasks))
+  }));
+
+  await assert.rejects(
+    service.generateDayBatches(data, settings, guide(data), [session]),
+    error => /1/.test(error.message) && /dailyQuiz|小测|测验|任务/.test(error.message)
+  );
+
+  assert.equal(requests.length, 2, '负数时长应定向修正一次后仍拒绝');
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+for (const [label, task] of [
+  ['序号例题', '阅读第 5 题例题并完成小测，用时 10 分钟。'],
+  ['五题例题', '阅读 5 题例题，然后安排小测，用时 10 分钟。']
+]) {
+  test(`题号或例题数量不能充当小测题数（${label}）`, async t => {
+    const data = input({ days: 2, calendarDays: 2 });
+    const session = { day: 1, date: data.startDate };
+    const tasks = [task];
+    const requests = installFetch(t, ({ payload }) => response({
+      days: payload.sessions.map(item => generatedDay(item, data, tasks))
+    }));
+
+    await assert.rejects(
+      service.generateDayBatches(data, settings, guide(data), [session]),
+      error => /1/.test(error.message) && /dailyQuiz|小测|测验|任务/.test(error.message)
+    );
+
+    assert.equal(requests.length, 2, '缺少小测题数应定向修正一次后仍拒绝');
+    assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+  });
+}
+
+test('末日的期末测验与日测分开计时，分别合计不超预算时通过', async t => {
+  const data = input({ days: 2, calendarDays: 2, minutesPerDay: 45 });
+  const session = { day: 2, date: dateOffset(data.startDate, 1) };
+  const tasks = [
+    '完成 10 题期末测验，用时 30 分钟。',
+    '完成 5 题小测，用时 10 分钟。'
+  ];
+  const requests = installFetch(t, ({ payload }) => response({
+    days: payload.sessions.map(item => generatedDay(item, data, tasks, { minutes: 45 }))
+  }));
+
+  const days = await service.generateDayBatches(data, settings, guide(data), [session]);
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(days[0].tasks, tasks);
+});
+
+test('同一句的单一时长不能同时充当日测和期末测时长', async t => {
+  const data = input({ days: 2, calendarDays: 2, minutesPerDay: 45 });
+  const session = { day: 2, date: dateOffset(data.startDate, 1) };
+  const tasks = ['完成 5 题小测，完成 10 题周期测验，用时 20 分钟。'];
+  const requests = installFetch(t, ({ payload }) => response({
+    days: payload.sessions.map(item => generatedDay(item, data, tasks, { minutes: 45 }))
+  }));
+
+  await assert.rejects(
+    service.generateDayBatches(data, settings, guide(data), [session]),
+    error => /2/.test(error.message) && /dailyQuiz|finalQuiz|分钟|用时|测验/.test(error.message)
+  );
+
+  assert.equal(requests.length, 2, '共享时长应定向修正一次后仍拒绝');
+  assert.equal(requests[1].payload.purpose, '修正学习计划每日安排');
+});
+
+test('小测标题后明确写 5 道题和正数时长时接受', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const session = { day: 1, date: data.startDate };
+  const tasks = ['每日小测：5道题，用时10分钟。'];
+  const requests = installFetch(t, ({ payload }) => response({
+    days: payload.sessions.map(item => generatedDay(item, data, tasks))
+  }));
+
+  const days = await service.generateDayBatches(data, settings, guide(data), [session]);
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(days[0].tasks, tasks);
 });

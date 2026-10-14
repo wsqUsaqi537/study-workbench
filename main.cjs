@@ -296,12 +296,20 @@ function registerHandlers() {
     const generation = { controller, requestId };
     planGeneration = generation;
     const revision = configRevision;
-    const key = fingerprint({ version: 3, input, endpoint: config.endpoint, model: config.model, language: config.language });
+    const identity = { input, endpoint: config.endpoint, model: config.model, language: config.language };
+    const key = fingerprint({ version: 4, ...identity });
     const saved = readJSON('plan-generation.json', null);
+    let checkpoint = saved?.key === key ? saved.checkpoint : undefined;
+    if (saved?.key === fingerprint({ version: 3, ...identity })) {
+      // Reuse expensive material reading and the outline, then validate days under the new rules.
+      checkpoint = saved.checkpoint?.stage === 'materials'
+        ? saved.checkpoint
+        : { guide: saved.checkpoint?.guide, days: [] };
+    }
     try {
       const plan = await services.generatePlan(input, config, {
         signal: controller.signal,
-        checkpoint: saved?.key === key ? saved.checkpoint : undefined,
+        checkpoint,
         onCheckpoint: checkpoint => {
           if (!controller.signal.aborted && revision === configRevision && planGeneration === generation) {
             writeJSON('plan-generation.json', { key, checkpoint });

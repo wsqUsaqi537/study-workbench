@@ -291,7 +291,19 @@ function responseFor(purpose, payload) {
   }
   if (purpose === '解释当前测验题和评分反馈') return { text: '把记录拆分后，先校验输入，再汇总数值；用一个简单例子逐步检查。', sources: payload.allowedSources.slice(0, 1), limitations: [] };
   if (purpose === '生成学习计划概要与知识清单') return makePlanOutline(payload);
-  if (purpose === '生成学习计划每日安排') return makePlanBatch(payload);
+  if (purpose === '生成学习计划每日安排') {
+    const batch = makePlanBatch(payload);
+    if (['自动修正生成计划', 'Invalid daily plan details'].includes(payload.title)) {
+      const day = batch.days.find(day => day.day === 2);
+      if (day) day.source = '不存在的材料.pdf 第 999 页';
+    }
+    return batch;
+  }
+  if (purpose === '修正学习计划每日安排') {
+    const batch = makePlanBatch(payload);
+    if (payload.title === 'Invalid daily plan details') batch.days.forEach(day => { day.source = '不存在的材料.pdf 第 999 页'; });
+    return batch;
+  }
   if (purpose === '按学习频率重拟未来计划') return makeCadenceBatch(payload);
   if (purpose === '生成学习计划') return makeModelPlan(payload);
   if (purpose === '生成每日小测') return { questions: makeAssessmentQuestions('daily') };
@@ -2892,6 +2904,41 @@ async function run() {
   }
   await setUiLanguage(window, 'zh-CN');
 
+  currentStage = '验证一次点击只修正不合规日期并显示具体双语错误';
+  await openCreateFixture('自动修正生成计划');
+  await setValue(window, '#createForm [name="days"]', 8);
+  const repairRequestStart = apiRecords.length;
+  await click(window, '#createSubmit', '单次提交触发第二日来源自动修正');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '自动修正后一次生成并保存计划');
+  const repairedTask = (await readState(window)).tasks.find(task => task.title === '自动修正生成计划');
+  assert.equal(repairedTask.plan.days.length, 8);
+  assert.equal(repairedTask.plan.days[0].tasks[0], '理解概念并完成练习', '合格日保持原内容');
+  const repairs = apiRecords.slice(repairRequestStart).filter(record => record.purpose === '修正学习计划每日安排');
+  assert.equal(repairs.length, 1);
+  assert.deepEqual(repairs[0].payload.sessions.map(day => day.day), [2]);
+  assert.equal(repairs[0].payload.originalDays.length, 1);
+  assert.ok(repairs[0].payload.validationErrors.some(error => error.day === 2 && error.field === 'source'));
+  assert.equal(repairedTask.plan.days[1].source, '主题与学习目标');
+
+  await setUiLanguage(window, 'en');
+  await openCreateFixture('Invalid daily plan details');
+  await setValue(window, '#createForm [name="days"]', 8);
+  const invalidRepairStart = apiRecords.length;
+  await click(window, '#createSubmit', '验证修正仍失败时英文日期字段提示');
+  await waitForJS(window, '!document.querySelector("#createError").hidden', '具体计划修正错误显示在生成按钮旁');
+  const repairAlert = await inspectInlineAlert(window, '#createError', '#createForm', '#createSubmit');
+  assert.equal(repairAlert.visibleInDialog, true);
+  assert.equal(repairAlert.beforeAnchor, true);
+  assert.match(repairAlert.text, /2/);
+  assert.match(repairAlert.text, /source/i);
+  assert.doesNotMatch(repairAlert.text, /[\u3400-\u9fff]/);
+  assert.equal(apiRecords.slice(invalidRepairStart).filter(record => record.purpose === '修正学习计划每日安排').length, 1);
+  assert.equal((await readState(window)).tasks.some(task => task.title === 'Invalid daily plan details'), false);
+  await captureScreenshot(window, 'plan-repair-error-en.png');
+  await click(window, '#createDialog [data-close="createDialog"]', '关闭英文修正错误测试');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '英文修正错误测试已清理');
+  await setUiLanguage(window, 'zh-CN');
+
   currentStage = '验证多批材料达到10份后编辑删1再新增，并拒绝第11份';
   await openCreateFixture('考纲材料10份编辑边界');
   const studyBatchOne = Array.from({ length: 5 }, (_, index) => writeMarkdownFixture(`count-study-a-${index + 1}.md`, `学习资料 A${index + 1}`));
@@ -3531,7 +3578,8 @@ async function captureDialog(name, selector, language, width) {
   const planFailureMocks = apiRecords.filter(record => record.mockFailure);
   assert.equal(planFailureMocks.length, 2, '双语计划失败位置测试应各触发一次显式注入的本地 mock 失败');
   assert.deepEqual(planFailureMocks.map(record => record.payload.outputLanguage), ['zh-CN', 'en']);
-  const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record) && !record.mockFailure);
+  const repairTestTitles = new Set(['自动修正生成计划', 'Invalid daily plan details']);
+  const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record) && !record.mockFailure && !repairTestTitles.has(record.payload?.title));
   assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈', '阅读材料片段'].includes(purpose)), [
     '连接测试',
     '生成周期测验',
@@ -3552,7 +3600,7 @@ async function captureDialog(name, selector, language, width) {
     '生成每日小测', '评分并生成学习报告',
     '调整后续学习规划'
   ]);
-  const plannerPurposes = new Set(['生成学习计划', '生成学习计划概要与知识清单', '生成学习计划每日安排', '按学习频率重拟未来计划']);
+  const plannerPurposes = new Set(['生成学习计划', '生成学习计划概要与知识清单', '生成学习计划每日安排', '按学习频率重拟未来计划', '修正学习计划每日安排']);
   assert.ok(apiRecords.filter(record => plannerPurposes.has(record.purpose)).every(record => record.requestBody.max_tokens === undefined), '所有新旧计划生成与频率重排请求都必须省略 max_tokens');
   assert.ok(apiRecords.find(record => record.purpose === '连接测试').requestBody.max_tokens >= 512, '连接测试仍须留出足够的输出空间');
   console.log(`PASS desktop flow: old history and profile gates restored; native file drop imported; ${newTask.plan.knowledge.length} knowledge points; daily report ${adjustedTask.dailyQuizzes['0'].result.score}/100; future adjustment preserved completed history`);
