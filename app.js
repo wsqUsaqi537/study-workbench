@@ -1362,12 +1362,54 @@
 
   function validateCreateInput(input, errorElement = $('#createError')) {
     if (!input.title || !input.goal) return setInlineMessage(errorElement, t("请填写学习主题和目标。"), 'warning'), false;
-    if (!input.startDate || !dateObject(input.startDate)) return setInlineMessage(errorElement, t("请选择有效的开始日期。")), false;
-    if (!Number.isInteger(input.calendarDays) || input.calendarDays < 2 || input.calendarDays > 180) return setInlineMessage(errorElement, t("日历跨度需要在 2 到 180 天之间。")), false;
+    if (!input.startDate || !schedule.validDate(input.startDate)) return setInlineMessage(errorElement, t("开始日期无效，请从日期选择器中重新选择一个真实存在的日期。")), false;
+    if (!Number.isInteger(input.calendarDays) || input.calendarDays < 2 || input.calendarDays > 180) return setInlineMessage(errorElement, t("日历跨度需要是 2 到 180 天的整数，请调整后继续。")), false;
+    if (input.cadence?.mode === 'weekly' && !input.cadence.weekdays.length) return setInlineMessage(errorElement, t("每周安排至少选择一个星期，再继续生成计划。")), false;
+    if (!Number.isInteger(input.days) || input.days < 2) {
+      const count = Number.isInteger(input.days) && input.days > 0 ? input.days : 0;
+      let message = t`当前周期与频率只安排了 ${count} 次学习，至少需要 2 次；请延长周期或提高频率。`;
+      if (input.cadence?.mode === 'alternate' && count === 1) {
+        message = t`当前周期与隔日频率只安排了 ${count} 次学习，至少需要 2 次；请把周期延长到至少 3 个日历日，或改为每天学习。`;
+      } else if (input.cadence?.mode === 'weekly' && count === 1) {
+        message = t`当前周期与每周频率只安排了 ${count} 次学习，至少需要 2 次；请延长周期或多选学习日。`;
+      }
+      return setInlineMessage(errorElement, message), false;
+    }
     try { schedule.validateScheduleInput(input); } catch (error) { return setInlineMessage(errorElement, t(error.message)), false; }
-    if (!Number.isInteger(input.minutesPerDay) || input.minutesPerDay < 15 || input.minutesPerDay > 480) return setInlineMessage(errorElement, t("每天投入需要在 15 到 480 分钟之间。")), false;
+    if (!Number.isInteger(input.minutesPerDay) || input.minutesPerDay < 15 || input.minutesPerDay > 480) return setInlineMessage(errorElement, t("每天学习时间需要是 15 到 480 分钟的整数，请调整后继续。")), false;
     if (!['exam', 'balanced', 'deep'].includes(input.learningMode)) return setInlineMessage(errorElement, t("请选择有效的学习方式。")), false;
     return true;
+  }
+
+  function isModelPlanScheduleError(error) {
+    const message = typeof error?.message === 'string'
+      ? error.message.trim().replace(/^Error invoking remote method ['"][^'"]+['"]:\s*(?:Error:\s*)?/, '')
+      : '';
+    if (!message) return false;
+    if (/第\s*\d+\s*次学习（[^）]*）的.+不符合要求：/u.test(message) || /Study session \d+ \([^)]*\) has invalid .+:/i.test(message)) return true;
+    const explicitScheduleErrors = [
+      '模型计划天数与学习周期不一致。',
+      'The model plan day count does not match the study duration.',
+      '服务返回的计划天数与学习周期不一致，请重试。',
+      'The number of days in the returned plan does not match the study period. Please try again.',
+      '模型计划日期或天数顺序无效。',
+      'The model plan dates or day order are invalid.',
+      '模型没有返回该学习日的安排。',
+      'The model did not return this study session.',
+      '模型重复返回了该学习日。',
+      'The model returned this study session more than once.'
+    ];
+    if (explicitScheduleErrors.some(phrase => message.includes(phrase))) return true;
+    const explicitDayErrors = [
+      '每日计划内容或时间无效。',
+      'Invalid daily plan content or time budget.',
+      '每日学习任务格式无效。',
+      'Invalid daily learning tasks.',
+      'Invalid daily study tasks.'
+    ];
+    if (explicitDayErrors.some(phrase => message.includes(phrase))) return true;
+    const correctedResponse = /(?:模型修正后仍未通过：|The corrected model response is still invalid:)/i.test(message);
+    return correctedResponse && /(?:日期|天数|学习日|日历日|学习周期|学习次数|次数|study date|date|day count|day order|study period|study session|session count)/i.test(message);
   }
 
   function hasUnconsentedMaterials(input) {
@@ -1462,7 +1504,13 @@
       $('#createDialog').close();
       toast(t("学习计划已生成并保存。"));
     } catch (errorValue) {
-      if (sessionId === createSessionId && epoch === configEpoch) setInlineMessage(error, errorValue.message || t("生成学习计划失败，请稍后重试。"));
+      if (sessionId === createSessionId && epoch === configEpoch) {
+        const message = errorValue.message || t("生成学习计划失败，请稍后重试。");
+        const guidance = isModelPlanScheduleError(errorValue)
+          ? t`按当前设置应安排 ${input.days} 次学习（跨度 ${input.calendarDays} 天）。本次未保存新计划；如界面已显示材料读取完成，可在输入不变时重试。模型返回不完整时无需因此修改学习周期。`
+          : '';
+        setInlineMessage(error, guidance ? `${message} ${guidance}` : message);
+      }
     } finally {
       if (createActivity?.id === requestId) {
         clearDelayedLoading(createActivity);

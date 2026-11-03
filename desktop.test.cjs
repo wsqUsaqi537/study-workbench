@@ -20,6 +20,7 @@ const { app, BrowserWindow, safeStorage, dialog } = require('electron');
 Object.defineProperty(safeStorage, 'isEncryptionAvailable', { configurable: true, value: () => false });
 
 const apiRecords = [];
+const longReadingSummary = '材料片段核心概念与练习。'.repeat(400);
 let clarifyCount = 0;
 let longTutorReplies = false;
 function pngChunk(type, data) {
@@ -245,14 +246,16 @@ function makeLongTutorResponse(payload) {
 }
 
 function responseFor(purpose, payload) {
+  if (purpose === '修正材料阅读格式') return { summary: longReadingSummary, source: payload.material.name };
   if (purpose === '阅读材料片段') {
     const material = payload.material || {};
     const firstPage = material.sourcePages?.[0];
     return {
-      summary: payload.outputLanguage === 'en'
+      summary: material.name === '100000-character-study-metadata.md' ? longReadingSummary : payload.outputLanguage === 'en'
         ? 'The material introduces variables, loops, and a small practice exercise.'
         : '材料介绍变量、循环以及一个小型练习。',
-      source: [material.name || '学习材料', firstPage ? `第 ${firstPage.number} ${firstPage.unit}` : ''].filter(Boolean).join(' ')
+      source: [material.name || '学习材料', firstPage ? `第 ${firstPage.number} ${firstPage.unit}` : ''].filter(Boolean).join(' '),
+      ...(material.name === '100000-character-study-metadata.md' ? { modelNotes: 'ignored-summary-field-marker' } : {})
     };
   }
   if (payload.outputLanguage === 'en') {
@@ -293,6 +296,15 @@ function responseFor(purpose, payload) {
   if (purpose === '生成学习计划概要与知识清单') return makePlanOutline(payload);
   if (purpose === '生成学习计划每日安排') {
     const batch = makePlanBatch(payload);
+    if (payload.title === '30日隔日数量修正' && payload.sessions[0].day === 1) {
+      const sessions = Array.from({ length: payload.days }, (_, index) => ({
+        day: index + 1, date: schedule.formatDate(payload.sessions[0].date, index * 2)
+      }));
+      const result = makePlanBatch({ ...payload, sessions: sessions.filter(session => session.day !== 2) });
+      result.days.find(day => day.day === 1).title = '保留首日唯一安排';
+      result.days.reverse();
+      return result;
+    }
     if (['自动修正生成计划', 'Invalid daily plan details'].includes(payload.title)) {
       const day = batch.days.find(day => day.day === 2);
       if (day) day.source = '不存在的材料.pdf 第 999 页';
@@ -399,9 +411,14 @@ const apiServer = http.createServer(async (request, response) => {
       return;
     }
     const result = responseFor(purpose, payload || {});
+    let modelContent = JSON.stringify(result);
+    if (purpose === '阅读材料片段' && payload.material.name === '100000-character-study-metadata.md') {
+      if (payload.material.segment === 1) modelContent = '\uFEFF```json\n' + modelContent + '\n```';
+      if (payload.material.segment === 2) modelContent = modelContent.slice(0, -1) + ',}';
+    }
     if (response.destroyed) return;
     response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(result) } }] }));
+    response.end(JSON.stringify({ choices: [{ message: { content: modelContent } }] }));
   } catch (error) {
     if (response.destroyed) return;
     response.writeHead(500, { 'Content-Type': 'application/json' });
@@ -2362,6 +2379,11 @@ async function run() {
   assert.deepEqual(longTask.plan.days.map(day => day.date), schedule.learningDates({ startDate: longTask.startDate, calendarDays: 60, cadence: { mode: 'daily' } }));
   const longPlannerRecords = apiRecords.slice(longPlanRequestStart).filter(record => ['生成学习计划概要与知识清单', '生成学习计划每日安排'].includes(record.purpose));
   const longReaderRecords = apiRecords.slice(longPlanRequestStart).filter(record => record.purpose === '阅读材料片段');
+  const materialFormatRepairs = apiRecords.slice(longPlanRequestStart).filter(record => record.purpose === '修正材料阅读格式');
+  assert.equal(materialFormatRepairs.length, 1, '完整JSON围栏本地处理，仅第二段语法错误触发一次格式修正');
+  assert.equal(materialFormatRepairs[0].payload.segment, 2);
+  assert.ok(!JSON.stringify(materialFormatRepairs[0].payload).includes(longMetadata), '格式修正不重新发送材料原文');
+  assert.equal(materialFormatRepairs[0].requestBody.max_tokens, undefined);
   const outlineRecords = longPlannerRecords.filter(record => record.purpose === '生成学习计划概要与知识清单');
   const dayBatchRecords = longPlannerRecords.filter(record => record.purpose === '生成学习计划每日安排');
   assert.ok(longReaderRecords.length >= 2, '100000 字材料应经多个片段请求完整阅读');
@@ -2376,6 +2398,8 @@ async function run() {
   assert.equal(outlineRecords.length, 1, '大材料应只发起一次计划概要请求');
   assert.equal(dayBatchRecords.length, Math.ceil(60 / 7), '60 个学习日应按每批最多 7 日生成');
   const outlineRequest = outlineRecords[0].requestBody.messages[1].content;
+  assert.ok(longReadingSummary.length > 1200 && outlineRequest.includes(longReadingSummary), '超过1200字并附带额外字段的摘要应完整进入规划上下文');
+  assert.ok(!outlineRequest.includes('ignored-summary-field-marker'), '摘要额外字段不应进入后续规划请求');
   assert.ok(outlineRequest.length < 100000 && !outlineRequest.includes(longMetadata), '100000 字符原文应由分片提要取代后再生成计划概要');
   const requestedSessions = dayBatchRecords.flatMap(record => record.payload.sessions);
   assert.equal(requestedSessions.length, 60);
@@ -2625,6 +2649,41 @@ async function run() {
     await setValue(window, '#createForm [name="days"]', 2);
     return testLocalDate();
   }
+
+  currentStage = '日期设置不合适时原位给出双语调整建议且不调用模型';
+  const beforeDateGuidance = apiRecords.length;
+  for (const language of ['zh-CN', 'en']) {
+    await setUiLanguage(window, language);
+    for (const kind of ['alternate', 'weekly-empty', 'weekly-zero', 'start', 'span', 'minutes']) {
+      await openCreateFixture('日期设置建议 ' + language + ' ' + kind);
+      if (kind === 'alternate') await setValue(window, '#createForm [name="cadenceMode"]', 'alternate');
+      if (kind.startsWith('weekly')) {
+        await setValue(window, '#createForm [name="cadenceMode"]', 'weekly');
+        if (kind === 'weekly-zero') {
+          const absentWeekday = (new Date(testLocalDate() + 'T00:00:00Z').getUTCDay() + 3) % 7;
+          await click(window, `#createForm [name="cadenceWeekday"][value="${absentWeekday}"]`, '选择周期之外的星期');
+        }
+      }
+      if (kind === 'start') await setValue(window, '#createForm [name="startDate"]', '');
+      if (kind === 'span') await setValue(window, '#createForm [name="days"]', 181);
+      if (kind === 'minutes') await setValue(window, '#createForm [name="minutesPerDay"]', 14);
+      await click(window, '#createSubmit', '显示日期设置建议 ' + kind);
+      await waitForJS(window, '!document.querySelector("#createError").hidden', '建议显示在生成按钮前');
+      const guidance = await inspectInlineAlert(window, '#createError', '#createForm', '#createSubmit');
+      assert.ok(guidance.visibleInDialog && guidance.beforeAnchor);
+      if (kind === 'alternate') assert.match(guidance.text, /3/);
+      if (kind === 'weekly-empty') assert.match(guidance.text, language === 'en' ? /weekday|day of the week/i : /星期/);
+      if (kind === 'weekly-zero') assert.match(guidance.text, /0/);
+      if (kind === 'start') assert.match(guidance.text, language === 'en' ? /date/i : /日期/);
+      if (kind === 'span') assert.match(guidance.text, /180/);
+      if (kind === 'minutes') assert.match(guidance.text, /480/);
+      if (language === 'en') assert.doesNotMatch(guidance.text, /[\u3400-\u9fff]/);
+      await click(window, '#createDialog [data-close="createDialog"]', '关闭日期建议测试');
+      await waitForJS(window, '!document.querySelector("#createDialog")?.open', '日期建议测试已关闭');
+    }
+  }
+  assert.equal(apiRecords.length, beforeDateGuidance);
+  await setUiLanguage(window, 'zh-CN');
 
   async function dropMaterial(filePath, zone, host, fileName) {
     const result = await dispatchActualFileDrop(window, filePath, zone);
@@ -2891,6 +2950,7 @@ async function run() {
     assert.equal(createPlanAlert.visibleInDialog, true);
     assert.equal(createPlanAlert.beforeAnchor, true, '计划生成错误应位于提交按钮之前');
     assert.ok(createPlanAlert.anchorGap >= 0 && createPlanAlert.anchorGap < 120, '计划生成错误应紧邻提交按钮');
+    assert.doesNotMatch(createPlanAlert.text, /按当前设置应安排|With the current settings/i, 'HTTP错误不应误报为日期设置问题');
     await captureScreenshot(window, `plan-generation-error-${imageLanguage}.png`);
     if (language === 'en') {
       assert.match(createPlanAlert.text, /API request failed \(HTTP 500\)\. Check the model name and API key\./);
@@ -2931,6 +2991,8 @@ async function run() {
   assert.equal(repairAlert.beforeAnchor, true);
   assert.match(repairAlert.text, /2/);
   assert.match(repairAlert.text, /source/i);
+  assert.match(repairAlert.text, /8/);
+  assert.match(repairAlert.text, /study sessions|learning sessions/i, '模型响应错误应给出当前学习次数与下一步建议');
   assert.doesNotMatch(repairAlert.text, /[\u3400-\u9fff]/);
   assert.equal(apiRecords.slice(invalidRepairStart).filter(record => record.purpose === '修正学习计划每日安排').length, 1);
   assert.equal((await readState(window)).tasks.some(task => task.title === 'Invalid daily plan details'), false);
@@ -2938,6 +3000,30 @@ async function run() {
   await click(window, '#createDialog [data-close="createDialog"]', '关闭英文修正错误测试');
   await waitForJS(window, '!document.querySelector("#createDialog")?.open', '英文修正错误测试已清理');
   await setUiLanguage(window, 'zh-CN');
+
+  currentStage = '30个日历日隔日学习按15次对齐并只补缺失日';
+  await openCreateFixture('30日隔日数量修正');
+  await setValue(window, '#createForm [name="days"]', 30);
+  await setValue(window, '#createForm [name="cadenceMode"]', 'alternate');
+  const countRepairStart = apiRecords.length;
+  await click(window, '#createSubmit', '生成30日隔日计划并自动补缺失日期');
+  await waitForJS(window, '!document.querySelector("#createDialog")?.open', '15次隔日学习计划完整生成');
+  const countTask = (await readState(window)).tasks.find(task => task.title === '30日隔日数量修正');
+  assert.ok(countTask);
+  assert.equal(countTask.calendarDays, 30);
+  assert.equal(countTask.days, 15);
+  assert.deepEqual(countTask.plan.days.map(day => day.date), schedule.learningDates(countTask));
+  assert.equal(countTask.plan.days[0].title, '保留首日唯一安排');
+  const countRequests = apiRecords.slice(countRepairStart);
+  const countBatches = countRequests.filter(record => record.purpose === '生成学习计划每日安排');
+  assert.deepEqual(countBatches.map(record => record.payload.sessions.length), [7, 7, 1]);
+  assert.ok(countBatches.every(record => record.payload.days === 15 && record.payload.calendarDays === 30));
+  assert.ok(countBatches.every(record => record.payload.requestedSessionCount === record.payload.sessions.length));
+  const countRepairs = countRequests.filter(record => record.purpose === '修正学习计划每日安排');
+  assert.equal(countRepairs.length, 1);
+  assert.deepEqual(countRepairs[0].payload.sessions.map(session => session.day), [2]);
+  assert.equal(countRepairs[0].payload.requestedSessionCount, 1);
+  assert.ok(countTask.plan.days.at(-1).tasks.some(task => /10.*周期测验/.test(task)));
 
   currentStage = '验证多批材料达到10份后编辑删1再新增，并拒绝第11份';
   await openCreateFixture('考纲材料10份编辑边界');
@@ -3578,9 +3664,9 @@ async function captureDialog(name, selector, language, width) {
   const planFailureMocks = apiRecords.filter(record => record.mockFailure);
   assert.equal(planFailureMocks.length, 2, '双语计划失败位置测试应各触发一次显式注入的本地 mock 失败');
   assert.deepEqual(planFailureMocks.map(record => record.payload.outputLanguage), ['zh-CN', 'en']);
-  const repairTestTitles = new Set(['自动修正生成计划', 'Invalid daily plan details']);
+  const repairTestTitles = new Set(['自动修正生成计划', 'Invalid daily plan details', '30日隔日数量修正']);
   const baselineApiRecords = apiRecords.filter(record => !regressionAdjustmentRequests.includes(record) && !record.mockFailure && !repairTestTitles.has(record.payload?.title));
-  assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈', '阅读材料片段'].includes(purpose)), [
+  assert.deepEqual(baselineApiRecords.filter(record => record.payload?.outputLanguage !== 'en').map(record => record.purpose).filter(purpose => !['讲解当前日学习内容', '解释当前测验题和评分反馈', '阅读材料片段', '修正材料阅读格式'].includes(purpose)), [
     '连接测试',
     '生成周期测验',
     '按材料和评分标准评阅学习测验',

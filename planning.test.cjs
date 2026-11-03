@@ -101,6 +101,29 @@ function response(content, finishReason = 'stop') {
   };
 }
 
+function rawResponse(content, finishReason = 'stop') {
+  return {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({
+      choices: [{ finish_reason: finishReason, message: { content } }]
+    })
+  };
+}
+
+function twoSegmentMaterialInput() {
+  const prefix = '【第 1 页】RAW_MATERIAL_SECRET';
+  const text = prefix + 'x'.repeat(70000 - prefix.length);
+  return {
+    marker: 'RAW_MATERIAL_SECRET',
+    data: input({
+      days: 2,
+      calendarDays: 2,
+      materials: [{ id: 'm1', name: 'lesson.pdf', units: 1, chars: text.length, text }]
+    })
+  };
+}
+
 function legacyPlan(data) {
   const dates = schedule.learningDates(data);
   const source = guide(data).knowledge[0].source;
@@ -167,6 +190,267 @@ test('英文短计划分段完整阅读超长附件，不再把已覆盖全文�
   assert.equal(materialRequests.map(request => request.payload.material.text).join(''), text);
   assert.equal(requests.filter(request => request.payload.purpose === '生成学习计划概要与知识清单').length, 1);
   assert.ok(requests.every(request => !Object.hasOwn(request.body, 'max_tokens')));
+});
+
+test('5000 字材料片段提要可续接并进入规划上下文', async t => {
+  const marker = '【第 1 页】';
+  const text = marker + 'x'.repeat(70000 - marker.length);
+  const summary = 'S'.repeat(5000);
+  const data = input({
+    materials: [{ id: 'm1', name: '课程.pdf', units: 1, chars: text.length, text }]
+  });
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const responder = requests => createMockFetch(({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      return response({ summary, source: '课程.pdf 第 1 页', warning: 'ignored-reader-field-sentinel' });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    return response({ days: generatedDays(payload) });
+  }, requests);
+
+  const firstRequests = [];
+  global.fetch = responder(firstRequests);
+  const controller = new AbortController();
+  let checkpoint;
+  await assert.rejects(service.generatePlan(data, settings, {
+    signal: controller.signal,
+    onCheckpoint: value => {
+      if (value.stage === 'materials') {
+        checkpoint = value;
+        if (value.notes.length === 1) controller.abort();
+      }
+    }
+  }), error => error.name === 'AbortError');
+
+  assert.equal(checkpoint.notes[0].summary, summary);
+  assert.deepEqual(Object.keys(checkpoint.notes[0]).sort(), [
+    'end', 'materialId', 'source', 'sourcePages', 'start', 'summary'
+  ]);
+  assert.equal(firstRequests.filter(request => request.payload.purpose === '阅读材料片段').length, 1);
+
+  const resumedRequests = [];
+  global.fetch = responder(resumedRequests);
+  const plan = await service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  });
+
+  assert.equal(plan.days.length, data.days);
+  const resumedReads = resumedRequests.filter(request => request.payload.purpose === '阅读材料片段');
+  assert.equal(resumedReads.length, Math.ceil(text.length / 40000) - 1);
+  assert.ok(resumedReads.every(request => request.payload.material.segment !== 1));
+  const outline = resumedRequests.find(request => request.payload.purpose === '生成学习计划概要与知识清单');
+  assert.ok(outline.payload.materials[0].text.includes(summary));
+  assert.ok(!JSON.stringify(resumedRequests.map(request => request.payload)).includes('ignored-reader-field-sentinel'));
+  assert.ok(firstRequests.concat(resumedRequests).every(request => !Object.hasOwn(request.body, 'max_tokens')));
+});
+
+test('材料片段提要忽略额外字段但仍校验必需字段和真实来源', async t => {
+  const marker = '【第 1 页】';
+  const text = marker + 'x'.repeat(70000 - marker.length);
+  const data = input({
+    materials: [{ id: 'm1', name: '课程.pdf', units: 1, chars: text.length, text }]
+  });
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const run = materialNote => {
+    global.fetch = createMockFetch(({ payload }) => {
+      if (payload.purpose === '阅读材料片段') return response(materialNote);
+      if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+      return response({ days: generatedDays(payload) });
+    });
+    return service.generatePlan(data, settings);
+  };
+
+  await assert.rejects(run({ source: '课程.pdf 第 1 页' }), /材料片段提要/);
+  await assert.rejects(run({ summary: '有效摘要' }), /材料片段提要/);
+  await assert.rejects(
+    run({ summary: 42, source: '课程.pdf 第 1 页' }),
+    /材料片段提要必须是文字/
+  );
+  await assert.rejects(
+    run({ summary: '有效摘要', source: 42 }),
+    /材料片段来源必须是文字/
+  );
+  await assert.rejects(run([{ summary: '有效摘要', source: '课程.pdf 第 1 页' }]), /材料片段提要/);
+  await assert.rejects(
+    run({ summary: '有效摘要', source: '课程.pdf 第 999 页', warning: 'extra field' }),
+    /材料片段来源.*不存在的页码或幻灯片/
+  );
+});
+
+test('材料片段提要接受单字符并拒绝空摘要和纯空白摘要', async t => {
+  const marker = '【第 1 页】';
+  const text = marker + 'x'.repeat(70000 - marker.length);
+  const data = input({
+    materials: [{ id: 'm1', name: '课程.pdf', units: 1, chars: text.length, text }]
+  });
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const run = async summary => {
+    global.fetch = createMockFetch(({ payload }) => {
+      if (payload.purpose === '阅读材料片段') {
+        return response({ summary, source: '课程.pdf 第 1 页' });
+      }
+      if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+      return response({ days: generatedDays(payload) });
+    });
+    return service.generatePlan(data, settings);
+  };
+
+  const plan = await run('x');
+  assert.equal(plan.days.length, data.days);
+  await assert.rejects(run(''), /材料片段提要.*(没有可用文字|长度必须)/);
+  await assert.rejects(run(' \n\t'), /材料片段提要.*(没有可用文字|长度必须)/);
+});
+
+test('材料阅读可剥离 BOM 与完整 JSON 围栏，语法错误只定向修正一次', async t => {
+  const { data, marker } = twoSegmentMaterialInput();
+  const malformed = '{"summary":"unfinished"';
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      if (payload.material.segment === 1) {
+        return rawResponse('\uFEFF```json\n{"summary":"片段一摘要","source":"lesson.pdf 第 1 页"}\n```');
+      }
+      return rawResponse(malformed);
+    }
+    if (payload.purpose === '修正材料阅读格式') {
+      return response({ summary: '已修正片段摘要', source: 'lesson.pdf 第 1 页' });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    return response({ days: generatedDays(payload) });
+  });
+
+  const plan = await service.generatePlan(data, settings);
+
+  const reads = requests.filter(request => request.payload.purpose === '阅读材料片段');
+  const repairs = requests.filter(request => request.payload.purpose === '修正材料阅读格式');
+  assert.equal(reads.length, 2);
+  assert.equal(repairs.length, 1, '合法的 BOM + JSON 围栏不应增加 API 请求');
+  assert.equal(repairs[0].payload.originalResponse, malformed);
+  assert.ok(/read|阅读/i.test(repairs[0].payload.stage));
+  assert.equal(repairs[0].payload.segment, 2);
+  assert.deepEqual(repairs[0].payload.material, {
+    id: 'm1', name: 'lesson.pdf', sourcePages: [{ number: 1, unit: '页' }]
+  });
+  assert.doesNotMatch(JSON.stringify(repairs[0].payload), new RegExp(marker));
+  assert.equal(plan.days.length, data.days);
+  assert.ok(requests.every(request => !Object.hasOwn(request.body, 'max_tokens')));
+  assert.ok(requests.every(request => !Object.hasOwn(request.body, 'max_completion_tokens')));
+});
+
+test('材料分段阅读本地剥离纯 BOM，合法 JSON 不触发格式修正', async t => {
+  const { data } = twoSegmentMaterialInput();
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      const segment = payload.material.segment;
+      return rawResponse('\uFEFF' + JSON.stringify({
+        summary: `片段 ${segment} 摘要`,
+        source: 'lesson.pdf 第 1 页'
+      }));
+    }
+    if (payload.purpose === '修正材料阅读格式') {
+      return response({ summary: '修正后摘要', source: 'lesson.pdf 第 1 页' });
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    return response({ days: generatedDays(payload) });
+  });
+
+  const plan = await service.generatePlan(data, settings);
+
+  assert.equal(plan.days.length, data.days);
+  assert.equal(requests.filter(request => request.payload.purpose === '阅读材料片段').length, 2);
+  assert.equal(requests.filter(request => request.payload.purpose === '修正材料阅读格式').length, 0);
+  assert.equal(requests.length, 4);
+});
+
+test('材料格式修正仍非法时保留已读检查点，恢复时不重读成功片段', async t => {
+  const { data, marker } = twoSegmentMaterialInput();
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const firstRequests = [];
+  global.fetch = createMockFetch(({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      if (payload.material.segment === 1) {
+        return rawResponse(JSON.stringify({ summary: '已读第一段', source: 'lesson.pdf 第 1 页' }));
+      }
+      return rawResponse('malformed second segment');
+    }
+    if (payload.purpose === '修正材料阅读格式') return rawResponse('still malformed');
+    return response({});
+  }, firstRequests);
+  let checkpoint;
+  await assert.rejects(service.generatePlan(data, settings, {
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  }), error => error.message.includes('lesson.pdf') &&
+    /read|阅读|材料/i.test(error.message) && /(?:第\s*2\s*段|片段\s*2|segment\s*2)/i.test(error.message) &&
+    /重试|retry|JSON/i.test(error.message));
+
+  assert.equal(checkpoint.nextChunk, 1);
+  assert.equal(checkpoint.notes.length, 1);
+  const failedRepairs = firstRequests.filter(request => request.payload.purpose === '修正材料阅读格式');
+  assert.equal(failedRepairs.length, 1);
+  assert.doesNotMatch(JSON.stringify(failedRepairs[0].payload), new RegExp(marker));
+
+  const resumedRequests = [];
+  global.fetch = createMockFetch(({ payload }) => {
+    if (payload.purpose === '阅读材料片段') {
+      return rawResponse(JSON.stringify({ summary: '已读第二段', source: 'lesson.pdf 第 1 页' }));
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    return response({ days: generatedDays(payload) });
+  }, resumedRequests);
+  const plan = await service.generatePlan(data, settings, {
+    checkpoint,
+    onCheckpoint: value => { if (value.stage === 'materials') checkpoint = value; }
+  });
+
+  assert.equal(plan.days.length, data.days);
+  const resumedReads = resumedRequests.filter(request => request.payload.purpose === '阅读材料片段');
+  assert.equal(resumedReads.length, 1);
+  assert.equal(resumedReads[0].payload.material.segment, 2);
+  assert.equal(resumedRequests.filter(request => request.payload.purpose === '修正材料阅读格式').length, 0);
+});
+
+test('材料 JSON 格式修正不拦截 HTTP、取消或超长输出错误', async t => {
+  const { data } = twoSegmentMaterialInput();
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  const httpRequests = [];
+  global.fetch = createMockFetch(() => ({ ok: false, status: 503, text: async () => '{}' }), httpRequests);
+  await assert.rejects(service.generatePlan(data, settings), /HTTP 503/);
+  assert.equal(httpRequests.length, 1);
+  assert.equal(httpRequests[0].payload.purpose, '阅读材料片段');
+
+  const cancelRequests = [];
+  let signalFetchStarted;
+  const fetchStarted = new Promise(resolve => { signalFetchStarted = resolve; });
+  global.fetch = createMockFetch(({ options }) => new Promise((_resolve, reject) => {
+    signalFetchStarted();
+    options.signal.addEventListener('abort', () => {
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      reject(error);
+    }, { once: true });
+  }), cancelRequests);
+  const controller = new AbortController();
+  const pending = service.generatePlan(data, settings, { signal: controller.signal });
+  await fetchStarted;
+  controller.abort();
+  await assert.rejects(pending, error => error.name === 'AbortError');
+  assert.equal(cancelRequests.length, 1);
+  assert.equal(cancelRequests[0].payload.purpose, '阅读材料片段');
+
+  const oversizedRequests = [];
+  const oversizedBody = JSON.stringify({
+    choices: [{ finish_reason: 'stop', message: { content: 'x'.repeat(61000) } }]
+  });
+  global.fetch = createMockFetch(() => ({ ok: true, status: 200, text: async () => oversizedBody }), oversizedRequests);
+  await assert.rejects(service.generatePlan(data, settings), error => error.code === 'MODEL_OUTPUT_SIZE');
+  assert.equal(oversizedRequests.length, 1);
+  assert.equal(oversizedRequests[0].payload.purpose, '阅读材料片段');
 });
 
 test('60 次学习与 100,000 字材料先完整分段阅读，再按七日分批生成', async t => {
@@ -268,18 +552,40 @@ test('超过 2.5M 字材料先完整阅读，再分层归纳且取消可续接�
   const allRequests = [];
   let checkpoint;
   let controller = new AbortController();
+  let malformedCompressionOnce = true;
+  const malformedCompressionResponse = '{"summary":"unfinished"';
   const createResponder = (invalidSource, requests) => createMockFetch(({ payload }) => {
     if (payload.purpose === '阅读材料片段') {
       const refs = payload.material.sourcePages.map(page => `第 ${page.number} ${page.unit}`).join(' ');
-      return response({ summary: 'R'.repeat(1200), source: [payload.material.name, refs].filter(Boolean).join(' ') });
+      return response({
+        summary: 'R'.repeat(1201),
+        source: [payload.material.name, refs].filter(Boolean).join(' '),
+        warning: 'ignored-reader-field-sentinel'
+      });
     }
     if (payload.purpose === '归纳材料提要') {
+      if (malformedCompressionOnce) {
+        malformedCompressionOnce = false;
+        return rawResponse(malformedCompressionResponse);
+      }
       if (invalidSource && invalidSource(payload)) {
-        return response({ summary: 'C'.repeat(1200), source: invalidSource(payload) });
+        return response({ summary: 'C'.repeat(1201), source: invalidSource(payload) });
       }
       const page = payload.material.sourcePages.at(-1);
       const refs = page ? `第 ${page.number} ${page.unit}` : '';
-      return response({ summary: 'C'.repeat(1200), source: [payload.material.name, refs].filter(Boolean).join(' ') });
+      return response({
+        summary: 'C'.repeat(1201),
+        source: [payload.material.name, refs].filter(Boolean).join(' '),
+        warning: 'ignored-compression-field-sentinel'
+      });
+    }
+    if (payload.purpose === '修正材料阅读格式') {
+      const page = payload.material.sourcePages.at(-1);
+      const refs = page ? `第 ${page.number} ${page.unit}` : '';
+      return response({
+        summary: 'C'.repeat(1201),
+        source: [payload.material.name, refs].filter(Boolean).join(' ')
+      });
     }
     if (payload.purpose === '生成学习计划概要与知识清单') {
       const result = guide(data);
@@ -303,6 +609,8 @@ test('超过 2.5M 字材料先完整阅读，再分层归纳且取消可续接�
   }), error => error.name === 'AbortError');
   assert.equal(checkpoint.notes.length, checkpoint.nextChunk);
   assert.equal(checkpoint.compressions.length, 1);
+  assert.ok(checkpoint.notes.every(note => !Object.hasOwn(note, 'warning')));
+  assert.ok(checkpoint.compressions.every(record => !Object.hasOwn(record, 'warning')));
 
   const rawSegments = firstRequests.filter(request => request.payload.purpose === '阅读材料片段')
     .map(request => request.payload.material.text);
@@ -310,6 +618,7 @@ test('超过 2.5M 字材料先完整阅读，再分层归纳且取消可续接�
   const firstCompression = firstRequests.find(request => request.payload.purpose === '归纳材料提要');
   assert.equal(firstCompression.payload.range.start, 0);
   assert.ok(firstCompression.body.messages.every(message => message.content.length <= 60000));
+  assert.ok(checkpoint.compressions[0].summary.length > 1200);
 
   const tampered = JSON.parse(JSON.stringify(checkpoint));
   tampered.notes[0].summary = '不同的已读提要';
@@ -360,11 +669,29 @@ test('超过 2.5M 字材料先完整阅读，再分层归纳且取消可续接�
   assert.ok(allRequests.flat().every(request => !Object.hasOwn(request.body, 'max_tokens')));
   const finalOutline = resumedRequests.find(request => request.payload.purpose === '生成学习计划概要与知识清单');
   assert.match(finalOutline.payload.materials[0].text, /第 2 页/);
+  assert.ok(finalOutline.payload.materials[0].text.includes('C'.repeat(1201)));
+  for (const purpose of ['阅读材料片段', '归纳材料提要']) {
+    const purposeRequests = allRequests.flat().filter(request => request.payload.purpose === purpose);
+    assert.ok(purposeRequests.length > 0);
+    assert.ok(purposeRequests.every(request => !/(?:1\s*至\s*1200|1\s*to\s*1200|不超过\s*1200)\s*(?:字|字符|characters?)/i
+      .test(request.body.messages[0].content)));
+  }
   const compressionStartZeroRequests = allRequests.flat()
     .filter(request => request.payload.purpose === '归纳材料提要' && request.payload.range.start === 0);
   assert.equal(compressionStartZeroRequests.length, 1);
   const retriedGroup = allRequests.flat().filter(request => request.payload.purpose === '归纳材料提要' && request.payload.range.start !== 0);
   assert.equal(retriedGroup.length, 9);
+  const formatRepairs = allRequests.flat().filter(request =>
+    request.payload.purpose === '修正材料阅读格式');
+  assert.equal(formatRepairs.length, 1);
+  assert.equal(formatRepairs[0].payload.originalResponse, malformedCompressionResponse);
+  assert.equal(formatRepairs[0].payload.material.id, 'large');
+  assert.equal(formatRepairs[0].payload.material.name, 'large.md');
+  assert.ok(Array.isArray(formatRepairs[0].payload.material.sourcePages));
+  assert.equal(Object.hasOwn(formatRepairs[0].payload.material, 'text'), false);
+  assert.ok(!JSON.stringify(allRequests.flat().map(request => request.payload)).includes('ignored-reader-field-sentinel'));
+  assert.ok(!JSON.stringify(allRequests.flat().map(request => request.payload)).includes('ignored-compression-field-sentinel'));
+  assert.ok(allRequests.flat().every(request => !Object.hasOwn(request.body, 'max_completion_tokens')));
 });
 
 test('第二轮材料提要归纳可取消续接，缺少前轮缓存时拒绝恢复', async t => {
@@ -475,6 +802,121 @@ test('分批输出 length 时缩小失败批次并完成', async t => {
   assert.ok(batches.some(request => request.payload.sessions.length === 7));
   assert.ok(batches.some(request => request.payload.sessions.length < 7));
   assert.ok(requests.every(request => !Object.hasOwn(request.body, 'max_tokens')));
+});
+
+test('30 个日历日隔日学习按日期对齐批次，忽略多返日期并只修复缺失日', async t => {
+  const data = input({
+    days: 15,
+    calendarDays: 30,
+    cadence: { mode: 'alternate', weekdays: [] }
+  });
+  const sessions = Array.from({ length: data.days }, (_, index) => ({
+    day: index + 1,
+    date: dateOffset(data.startDate, index * 2)
+  }));
+  const expectedDays = generatedDays({
+    days: data.days,
+    sessions,
+    allowedSources: [guide(data).knowledge[0].source]
+  });
+  const byDay = new Map(expectedDays.map(day => [day.day, day]));
+  const snapshots = [];
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(data));
+    if (payload.purpose === '修正学习计划每日安排') {
+      return response({ days: payload.sessions.map(session => byDay.get(session.day)) });
+    }
+    assert.equal(payload.purpose, '生成学习计划每日安排');
+    if (payload.sessions[0].day === 1) return response({ days: expectedDays });
+    if (payload.sessions[0].day === 8) {
+      return response({ days: payload.sessions
+        .filter(session => session.day !== 10)
+        .reverse()
+        .map(session => byDay.get(session.day)) });
+    }
+    return response({ days: generatedDays(payload) });
+  });
+
+  const plan = await service.generatePlan(data, settings, {
+    onCheckpoint: checkpoint => snapshots.push(checkpoint)
+  });
+
+  const batchRequests = requests.filter(request => request.payload.purpose === '生成学习计划每日安排');
+  assert.deepEqual(batchRequests.map(request => request.payload.sessions.length), [7, 7, 1]);
+  assert.ok(batchRequests.every(request => request.payload.days === 15 && request.payload.calendarDays === 30));
+  assert.ok(batchRequests.every(request =>
+    JSON.stringify(request.payload.cadence) === JSON.stringify(data.cadence)));
+  const repairs = requests.filter(request => request.payload.purpose === '修正学习计划每日安排');
+  assert.equal(repairs.length, 1);
+  assert.deepEqual(repairs[0].payload.sessions, [sessions[9]]);
+  assert.equal(repairs[0].payload.requestedSessionCount, repairs[0].payload.sessions.length);
+  assert.deepEqual(snapshots.find(checkpoint => checkpoint.days.length === 7).days.map(day => day.day),
+    [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(plan.days.map(({ day, date }) => ({ day, date })), sessions);
+  assert.match(plan.days.at(-1).tasks.join(' '), /10 题周期测验/);
+});
+
+test('重复日期只定向修正受影响学习日，修正后数量仍错误时报告具体日期', async t => {
+  const data = input({ days: 2, calendarDays: 2 });
+  const sessions = [
+    { day: 1, date: data.startDate },
+    { day: 2, date: dateOffset(data.startDate, 1) }
+  ];
+  const tasks = ['完成 5 题小测，用时 10 分钟。'];
+  const requests = installFetch(t, ({ payload }) => payload.purpose === '修正学习计划每日安排'
+    ? response({ days: [generatedDay(sessions[0], data, tasks)] })
+    : response({ days: [
+      generatedDay(sessions[0], data, tasks),
+      generatedDay(sessions[0], data, tasks)
+    ] }));
+
+  await assert.rejects(
+    service.generateDayBatches(data, settings, guide(data), sessions),
+    error => error.message.includes(sessions[0].date) && /数量/.test(error.message)
+  );
+
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].payload.sessions, sessions);
+});
+
+test('短计划旧输出天数不符时转概要分批，合法旧输出仍单请求且本地频率不符零请求', async t => {
+  let activeData = input({
+    days: 4,
+    calendarDays: 8,
+    cadence: { mode: 'alternate', weekdays: [] }
+  });
+  let legacyMode = 'wrong-count';
+  const requests = installFetch(t, ({ payload }) => {
+    if (payload.purpose === '生成学习计划') {
+      const plan = legacyPlan(activeData);
+      return response(legacyMode === 'wrong-count' ? { ...plan, days: [] } : plan);
+    }
+    if (payload.purpose === '生成学习计划概要与知识清单') return response(guide(activeData));
+    return response({ days: generatedDays(payload) });
+  });
+
+  const recovered = await service.generatePlan(activeData, settings);
+
+  assert.equal(recovered.days.length, 4);
+  assert.deepEqual(requests.map(request => request.payload.purpose), [
+    '生成学习计划', '生成学习计划概要与知识清单', '生成学习计划每日安排'
+  ]);
+
+  legacyMode = 'valid';
+  activeData = input({ days: 4, calendarDays: 4 });
+  const beforeValidShortPlan = requests.length;
+  const shortPlan = await service.generatePlan(activeData, settings);
+  assert.equal(shortPlan.days.length, 4);
+  assert.equal(requests.length, beforeValidShortPlan + 1);
+
+  const beforeInvalidLocalFrequency = requests.length;
+  const invalidData = input({
+    days: 4,
+    calendarDays: 4,
+    cadence: { mode: 'alternate', weekdays: [] }
+  });
+  await assert.rejects(service.generatePlan(invalidData, settings), /日期|天数|次数|频率/);
+  assert.equal(requests.length, beforeInvalidLocalFrequency);
 });
 
 test('英文长计划输出英语任务并验证每天及末日测验', async t => {

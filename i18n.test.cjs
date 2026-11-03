@@ -55,3 +55,16 @@ test('计划修正错误翻译保留日期并解释具体字段', () => {
   assert.match(i18n.translateError(sourceError, 'en'), /study topic and learning goal/);
   assert.doesNotMatch(i18n.translateError(sourceError, 'en'), /[\u3400-\u9fff]/);
 });
+
+test('阅读格式重试和日期调整建议可完整翻译为英文', () => {
+  const message = '材料“lesson.pdf”材料分段阅读（segment 2, characters 40001-70000, page 1）返回的内容无法安全修正为有效 JSON。已保留完成的阅读进度，请点击生成学习计划重试；无需修改学习日期。';
+  const translated = i18n.translateError(message, 'en');
+  assert.match(translated, /lesson\.pdf/);
+  assert.match(translated, /segment 2/);
+  assert.match(translated, /retry/i);
+  assert.doesNotMatch(translated, /[\u3400-\u9fff]/);
+  const t = i18n.createTranslator(() => 'en');
+  const guidance = t`按当前设置应安排 ${15} 次学习（跨度 ${30} 天）。本次未保存新计划；如界面已显示材料读取完成，可在输入不变时重试。模型返回不完整时无需因此修改学习周期。`;
+  assert.match(guidance, /15 study sessions over 30 calendar days/);
+  assert.doesNotMatch(guidance, /[\u3400-\u9fff]/);
+});
